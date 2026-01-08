@@ -32,6 +32,9 @@ class LTX2Runner(DefaultRunner):
     - DiT architecture
     - Default resolution: 1216x704 @ 30 FPS
     - Supports up to 4K resolution
+
+    Text encoder: T5EncoderModel (google/t5-v1_1-xxl)
+    VAE: AutoencoderKLLTXVideo from diffusers
     """
 
     def __init__(self, config):
@@ -55,6 +58,9 @@ class LTX2Runner(DefaultRunner):
 
         # VAE settings
         config.setdefault("vae_stride", [4, 8, 8])
+
+        # Text encoder settings
+        config.setdefault("text_len", 256)
 
         super().__init__(config)
 
@@ -84,22 +90,37 @@ class LTX2Runner(DefaultRunner):
 
     def load_text_encoder(self):
         """
-        Load text encoder (Gemma 3 for LTX-2).
+        Load text encoder (T5EncoderModel for LTX-2).
+
+        Uses T5EncoderModel from HuggingFace transformers, which is the
+        standard text encoder for LTX-Video models.
 
         Returns list of text encoders for compatibility with base class.
         """
+        from lightx2v.models.input_encoders.hf.ltx2.ltx2_text_encoder import LTX2TextEncoder
+
         text_encoder_path = self.config.get("text_encoder_path")
         if text_encoder_path is None:
-            text_encoder_path = os.path.join(self.config["model_path"], "text_encoder")
+            # Check if model_path contains text_encoder subfolder
+            model_path = self.config["model_path"]
+            if os.path.isdir(os.path.join(model_path, "text_encoder")):
+                text_encoder_path = model_path
+            else:
+                # Fall back to default T5 model
+                text_encoder_path = "google/t5-v1_1-xxl"
+                logger.info(f"No text_encoder_path specified, using default: {text_encoder_path}")
 
         logger.info(f"Loading text encoder from {text_encoder_path}")
 
-        # For now, we'll use a placeholder that expects pre-computed embeddings
-        # In production, this would load the Gemma 3 text encoder
-        text_encoder = LTX2TextEncoderWrapper(
-            self.config,
-            text_encoder_path,
-            self.init_device
+        cpu_offload = self.config.get("text_encoder_cpu_offload", self.config.get("cpu_offload", False))
+        device = torch.device("cpu") if cpu_offload else self.init_device
+
+        text_encoder = LTX2TextEncoder(
+            config=self.config,
+            checkpoint_path=text_encoder_path,
+            device=device,
+            cpu_offload=cpu_offload,
+            max_sequence_length=self.config.get("text_len", 256),
         )
 
         return [text_encoder]
@@ -113,7 +134,7 @@ class LTX2Runner(DefaultRunner):
         return None
 
     def load_vae_encoder(self):
-        """Load VAE encoder."""
+        """Load VAE encoder using AutoencoderKLLTXVideo from diffusers."""
         from lightx2v.models.video_encoders.hf.ltx2.ltx2_vae import LTX2VAE
 
         vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload", False))
@@ -121,7 +142,7 @@ class LTX2Runner(DefaultRunner):
 
         vae_path = self.config.get("vae_path")
         if vae_path is None:
-            vae_path = os.path.join(self.config["model_path"], "vae")
+            vae_path = self.config["model_path"]
 
         logger.info(f"Loading VAE from {vae_path}")
 
@@ -135,6 +156,9 @@ class LTX2Runner(DefaultRunner):
 
     def load_vae_decoder(self):
         """Load VAE decoder (same as encoder for LTX-2)."""
+        # VAE encoder and decoder are the same model
+        if hasattr(self, 'vae_encoder') and self.vae_encoder is not None:
+            return self.vae_encoder
         return self.load_vae_encoder()
 
     def load_vae(self):
@@ -144,11 +168,12 @@ class LTX2Runner(DefaultRunner):
 
     def get_latent_shape_with_target_hw(self):
         """Calculate latent shape based on target resolution."""
+        vae_stride = self.config.get("vae_stride", [4, 8, 8])
         latent_shape = [
             self.config["in_channels"],
-            (self.config["target_video_length"] - 1) // self.config["vae_stride"][0] + 1,
-            self.config["target_height"] // self.config["vae_stride"][1],
-            self.config["target_width"] // self.config["vae_stride"][2],
+            (self.config["target_video_length"] - 1) // vae_stride[0] + 1,
+            self.config["target_height"] // vae_stride[1],
+            self.config["target_width"] // vae_stride[2],
         ]
         return latent_shape
 
@@ -196,17 +221,15 @@ class LTX2Runner(DefaultRunner):
         neg_prompt = input_info.negative_prompt or ""
 
         # Get embeddings from text encoder
-        context = self.text_encoders[0].encode(prompt)
-
-        text_encoder_output = {
-            "context": context,
-        }
-
         if self.config.get("enable_cfg", False):
-            context_null = self.text_encoders[0].encode(neg_prompt)
-            text_encoder_output["context_null"] = context_null
+            result = self.text_encoders[0].encode(
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+        else:
+            result = self.text_encoders[0].encode(prompt=prompt)
 
-        return text_encoder_output
+        return result
 
     def read_image_input(self, img_path):
         """Read and preprocess input image."""
@@ -230,67 +253,8 @@ class LTX2Runner(DefaultRunner):
             transforms.Normalize([0.5], [0.5]),
         ])
 
+        # [C, H, W] -> [B, C, T, H, W] with T=1 for single image
         image_tensor = transform(image).unsqueeze(0).unsqueeze(2).to(AI_DEVICE)
 
         cond_latents = self.vae_encoder.encode(image_tensor)
         return cond_latents
-
-
-class LTX2TextEncoderWrapper:
-    """
-    Wrapper for LTX-2 text encoder (Gemma 3).
-
-    This wrapper provides a consistent interface for text encoding.
-    In production, this would load and run the actual Gemma 3 model.
-    """
-
-    def __init__(self, config, checkpoint_path, device):
-        self.config = config
-        self.checkpoint_path = checkpoint_path
-        self.device = device
-        self.cpu_offload = config.get("text_encoder_cpu_offload", config.get("cpu_offload", False))
-
-        # Placeholder for actual model loading
-        self.model = None
-        self._load_model()
-
-    def _load_model(self):
-        """Load the Gemma 3 text encoder model."""
-        # For now, this is a placeholder
-        # In production, would load from transformers:
-        # from transformers import AutoModel, AutoTokenizer
-        # self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
-        # self.model = AutoModel.from_pretrained(self.checkpoint_path)
-        logger.info(f"Text encoder initialized (placeholder) from {self.checkpoint_path}")
-
-    def encode(self, text):
-        """
-        Encode text to embeddings.
-
-        Args:
-            text: Input text string
-
-        Returns:
-            torch.Tensor: Text embeddings [1, seq_len, hidden_size]
-        """
-        # Placeholder implementation
-        # Returns dummy embeddings for testing
-        # In production, this would run the actual encoder
-        max_length = self.config.get("text_len", 256)
-        caption_channels = self.config.get("caption_channels", 4096)
-
-        # Create placeholder embeddings
-        embeddings = torch.zeros(
-            1, max_length, caption_channels,
-            dtype=torch.bfloat16,
-            device=self.device
-        )
-
-        if self.cpu_offload:
-            embeddings = embeddings.to(AI_DEVICE)
-
-        return embeddings
-
-    def infer(self, text):
-        """Alias for encode method."""
-        return self.encode(text)

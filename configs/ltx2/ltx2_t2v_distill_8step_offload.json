@@ -1,0 +1,45 @@
+{
+    "model_cls": "ltx2_distill",
+    "task": "t2v",
+
+    "infer_steps": 8,
+    "denoising_step_list": [1000, 875, 750, 625, 500, 375, 250, 125],
+
+    "target_video_length": 97,
+    "target_height": 704,
+    "target_width": 1216,
+    "fps": 30,
+
+    "hidden_size": 2048,
+    "num_heads": 32,
+    "head_dim": 64,
+    "num_layers": 48,
+    "in_channels": 128,
+    "out_channels": 128,
+    "patch_size": [1, 2, 2],
+    "freq_dim": 256,
+    "caption_channels": 4096,
+    "rope_theta": 10000.0,
+    "text_len": 256,
+
+    "vae_stride": [4, 8, 8],
+
+    "sample_shift": 3.0,
+    "sample_guide_scale": 1.0,
+    "enable_cfg": false,
+
+    "self_attn_type": "flash_attn2",
+    "cross_attn_type": "flash_attn2",
+
+    "feature_caching": "NoCaching",
+
+    "cpu_offload": true,
+    "offload_granularity": "block",
+    "vae_cpu_offload": true,
+    "text_encoder_cpu_offload": true,
+
+    "parallel": {
+        "seq_parallel": false,
+        "cfg_parallel": false
+    }
+}

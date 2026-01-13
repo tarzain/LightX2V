@@ -165,7 +165,10 @@ class OfficialLTX2Engine:
         frame_rate: float = 30.0,
         output_name: str = "ltx2_official_distilled.mp4",
     ) -> bytes:
-        """Generate video and return the MP4 bytes for local saving."""
+        """
+        Generate video using DistilledPipeline (8-step distilled with 2x upscaling).
+        Returns MP4 bytes for local saving.
+        """
         import gc
         import torch
         from ltx_pipelines.distilled import DistilledPipeline
@@ -281,6 +284,7 @@ def main(
     print("Options (defaults shown):")
     print("  --height 704 --width 1216 --num-frames 97 --frame-rate 30 --seed 42")
     print("  --output outputs/ltx2_output.mp4")
-    print("  (For smaller test: --height 512 --width 768 --num-frames 49)")
+    print("")
+    print("Pipeline: DistilledPipeline (8-step distilled + 2x spatial upscaling)")
 
 

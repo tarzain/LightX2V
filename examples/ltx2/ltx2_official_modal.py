@@ -407,6 +407,7 @@ class OfficialLTX2Engine:
         """Generate video from image + text prompt (Image-to-Video)."""
         import base64
         import io
+        import tempfile
         from PIL import Image
         
         # Decode the base64 image
@@ -416,10 +417,16 @@ class OfficialLTX2Engine:
         # Resize to target dimensions
         image = image.resize((width, height), Image.Resampling.LANCZOS)
         
-        # LTX-2 expects images as tuples: (image, frame_idx, strength)
+        # LTX-2 expects file paths, not PIL Images
+        # Save to temp file and pass the path
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            image.save(tmp.name, "PNG")
+            image_path = tmp.name
+        
+        # LTX-2 expects images as tuples: (image_path, frame_idx, strength)
         # frame_idx=0 means the image is the first frame
         # strength=1.0 means full conditioning strength
-        images_with_config = [(image, 0, 1.0)]
+        images_with_config = [(image_path, 0, 1.0)]
         
         return self._generate(
             prompt=prompt,

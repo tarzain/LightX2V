@@ -137,6 +137,11 @@ class LightX2VPipeline:
         rope_type="torch",
         resize_mode=None,
     ):
+        # Ensure registry side-effects are loaded (Conv/MM/Norm/Attn weight templates, etc.).
+        # Some deployments (e.g. Modal) can import `lightx2v` without importing `lightx2v.common.ops`,
+        # which leaves registers like `CONV3D_WEIGHT_REGISTER["Default"]` empty and causes KeyErrors.
+        import lightx2v.common.ops  # noqa: F401
+
         self.resize_mode = resize_mode
         if config_json is not None:
             self.set_infer_config_json(config_json)

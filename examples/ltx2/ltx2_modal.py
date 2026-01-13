@@ -25,7 +25,11 @@ flavor = "devel"
 operating_sys = "ubuntu22.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
-image = (
+def _get_repo_root() -> Path:
+    """Resolve repo root on the *local* machine (Modal client side)."""
+    return Path(__file__).resolve().parents[2]
+
+base_image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
     .apt_install(
         "ffmpeg", "git", "build-essential", "ninja-build", "clang", "cmake",
@@ -58,14 +62,17 @@ image = (
         "huggingface-hub==0.34.0",
         "huggingface_hub[cli]",
         "sentencepiece",  # For T5 tokenizer
+        "gguf",
         "easydict",
         "requests",
         "fastapi[standard]>=0.115.0",
         "python-multipart",
         "uvicorn[standard]",
+        "prometheus-client",
     )
     .env({
         "HF_HOME": "/models/hf_cache",
+        "PYTHONPATH": "/opt/lightx2v",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
@@ -77,61 +84,77 @@ image = (
         "LIGHTX2V_ATTN_MODE": "flash_attn2",
         "TORCH_CUDA_ARCH_LIST": "9.0",
     })
-    # Clone and install lightx2v
-    .run_commands(
-        "git clone https://github.com/ModelTC/lightx2v.git /opt/lightx2v",
-        "cd /opt/lightx2v && pip install -e .",
-    )
-    # Remove PyAV to avoid SIGABRT issues
-    .run_commands("pip uninstall -y av || true")
-    # Patch LightX2V pipeline to only import LTX2 runners
-    .run_commands(
-        "python -c \"import re; from pathlib import Path; "
-        "p=Path('/opt/lightx2v/lightx2v/pipeline.py'); "
-        "t=p.read_text(); "
-        "t=re.sub(r'^from lightx2v\\\\.models\\\\.runners\\\\..*\\\\n','',t,flags=re.M); "
-        "ins='from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner  # noqa: F401\\\\n'"
-        "'from lightx2v.models.runners.ltx2.ltx2_distill_runner import LTX2DistillRunner  # noqa: F401\\\\n\\\\n'"
-        "'import os as _os\\\\n'"
-        "'if _os.environ.get(\\\\\\\"LIGHTX2V_IMPORT_ALL_RUNNERS\\\\\\\",\\\\\\\"0\\\\\\\") == \\\\\\\"1\\\\\\\":\\\\n'"
-        "'    from lightx2v.models.runners.wan.wan_runner import WanRunner  # noqa: F401\\\\n'"
-        "'    from lightx2v.models.runners.wan.wan_distill_runner import WanDistillRunner  # noqa: F401\\\\n'; "
-        "t=t.replace('from loguru import logger\\\\n\\\\n','from loguru import logger\\\\n\\\\n'+ins+'\\\\n',1); "
-        "p.write_text(t); "
-        "print('Patched LightX2V pipeline runner imports for LTX2')\""
-    )
-    # Patch infer.py similarly
-    .run_commands(
-        "python -c \"import re; from pathlib import Path; "
-        "p=Path('/opt/lightx2v/lightx2v/infer.py'); "
-        "t=p.read_text(); "
-        "t=re.sub(r'^from lightx2v\\\\.models\\\\.runners\\\\..*\\\\n','',t,flags=re.M); "
-        "ins='from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner  # noqa: F401\\\\n'"
-        "'from lightx2v.models.runners.ltx2.ltx2_distill_runner import LTX2DistillRunner  # noqa: F401\\\\n'; "
-        "t=t.replace('from lightx2v.common.ops import *\\\\n', 'from lightx2v.common.ops import *\\\\n'+ins+'\\\\n', 1); "
-        "p.write_text(t); "
-        "print('Patched LightX2V infer runner imports for LTX2')\""
-    )
-    # Patch attention backends for lazy loading
-    .run_commands(
-        "python -c \"from pathlib import Path; "
-        "p=Path('/opt/lightx2v/lightx2v/common/ops/attn/__init__.py'); "
-        "txt='import os\\n\\n"
-        "from .torch_sdpa import TorchSDPAWeight\\n"
-        "from .ulysses_attn import Ulysses4090AttnWeight, UlyssesAttnWeight\\n"
-        "from .ring_attn import RingAttnWeight\\n\\n"
-        "if os.environ.get(\\\"LIGHTX2V_ENABLE_FLASH_ATTN\\\", \\\"0\\\") == \\\"1\\\":\\n"
-        "    from .flash_attn import FlashAttn2Weight, FlashAttn3Weight\\n\\n"
-        "if os.environ.get(\\\"LIGHTX2V_ENABLE_SAGE_ATTN\\\", \\\"0\\\") == \\\"1\\\":\\n"
-        "    from .sage_attn import SageAttn2Weight, SageAttn3Weight\\n\\n"
-        "if os.environ.get(\\\"LIGHTX2V_ENABLE_DRAFT_ATTN\\\", \\\"0\\\") == \\\"1\\\":\\n"
-        "    from .draft_attn import DraftAttnWeight\\n'; "
-        "p.write_text(txt) if p.exists() else None; "
-        "print('Patched' if p.exists() else 'Did not find', p)\""
-    )
-    # Add demo images
-    .add_local_dir("demo_images", "/root/demo_images", condition=lambda pth: Path("demo_images").exists())
 )
+
+# Use local source code (this repo) instead of cloning an upstream repo that may not include LTX2.
+# Important: this must only run on the Modal *client* (your laptop), not inside the remote container import.
+image = base_image
+if modal.is_local():
+    _repo_root = _get_repo_root()
+    image = (
+        base_image
+        .add_local_dir(str(_repo_root / "lightx2v"), "/opt/lightx2v/lightx2v", copy=True)
+        .add_local_dir(str(_repo_root / "lightx2v_platform"), "/opt/lightx2v/lightx2v_platform", copy=True)
+        .add_local_dir(str(_repo_root / "configs"), "/opt/lightx2v/configs", copy=True)
+        # Remove PyAV to avoid SIGABRT issues
+        .run_commands("pip uninstall -y av || true")
+        # Patch LightX2V pipeline to only import LTX2 runners
+        .run_commands(
+            "python -c \"import re; from pathlib import Path; "
+            "p=Path('/opt/lightx2v/lightx2v/pipeline.py'); "
+            "t=p.read_text(); "
+            "t=re.sub(r'^from lightx2v\\\\.models\\\\.runners\\\\..*\\\\n','',t,flags=re.M); "
+            "ins='from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner  # noqa: F401\\\\n'"
+            "'from lightx2v.models.runners.ltx2.ltx2_distill_runner import LTX2DistillRunner  # noqa: F401\\\\n\\\\n'"
+            "'import os as _os\\\\n'"
+            "'if _os.environ.get(\\\\\\\"LIGHTX2V_IMPORT_ALL_RUNNERS\\\\\\\",\\\\\\\"0\\\\\\\") == \\\\\\\"1\\\\\\\":\\\\n'"
+            "'    from lightx2v.models.runners.wan.wan_runner import WanRunner  # noqa: F401\\\\n'"
+            "'    from lightx2v.models.runners.wan.wan_distill_runner import WanDistillRunner  # noqa: F401\\\\n'; "
+            "t=t.replace('from loguru import logger\\\\n\\\\n','from loguru import logger\\\\n\\\\n'+ins+'\\\\n',1); "
+            "p.write_text(t); "
+            "print('Patched LightX2V pipeline runner imports for LTX2')\""
+        )
+        # Patch infer.py similarly
+        .run_commands(
+            "python -c \"import re; from pathlib import Path; "
+            "p=Path('/opt/lightx2v/lightx2v/infer.py'); "
+            "t=p.read_text(); "
+            "t=re.sub(r'^from lightx2v\\\\.models\\\\.runners\\\\..*\\\\n','',t,flags=re.M); "
+            "ins='from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner  # noqa: F401\\\\n'"
+            "'from lightx2v.models.runners.ltx2.ltx2_distill_runner import LTX2DistillRunner  # noqa: F401\\\\n'; "
+            "t=t.replace('from lightx2v.common.ops import *\\\\n', 'from lightx2v.common.ops import *\\\\n'+ins+'\\\\n', 1); "
+            "p.write_text(t); "
+            "print('Patched LightX2V infer runner imports for LTX2')\""
+        )
+        # Patch attention backends for lazy loading
+        .run_commands(
+            "python -c \"from pathlib import Path; "
+            "p=Path('/opt/lightx2v/lightx2v/common/ops/attn/__init__.py'); "
+            "txt='import os\\n\\n"
+            "from .torch_sdpa import TorchSDPAWeight\\n"
+            "from .ulysses_attn import Ulysses4090AttnWeight, UlyssesAttnWeight\\n"
+            "from .ring_attn import RingAttnWeight\\n\\n"
+            "if os.environ.get(\\\"LIGHTX2V_ENABLE_FLASH_ATTN\\\", \\\"0\\\") == \\\"1\\\":\\n"
+            "    from .flash_attn import FlashAttn2Weight, FlashAttn3Weight\\n\\n"
+            "if os.environ.get(\\\"LIGHTX2V_ENABLE_SAGE_ATTN\\\", \\\"0\\\") == \\\"1\\\":\\n"
+            "    from .sage_attn import SageAttn2Weight, SageAttn3Weight\\n\\n"
+            "if os.environ.get(\\\"LIGHTX2V_ENABLE_DRAFT_ATTN\\\", \\\"0\\\") == \\\"1\\\":\\n"
+            "    from .draft_attn import DraftAttnWeight\\n'; "
+            "p.write_text(txt) if p.exists() else None; "
+            "print('Patched' if p.exists() else 'Did not find', p)\""
+        )
+    )
+
+# Add demo images (optional): Modal's `Image.add_local_dir` API doesn't support `condition=` in newer SDKs,
+# so we do the conditional logic in Python instead.
+_demo_images_dir = None
+for _pth in (Path("demo_images"), Path(__file__).resolve().parent / "demo_images"):
+    if _pth.exists() and _pth.is_dir():
+        _demo_images_dir = _pth
+        break
+
+if _demo_images_dir is not None:
+    image = image.add_local_dir(str(_demo_images_dir), "/root/demo_images")
 
 app = modal.App("ltx2-distill", image=image)
 
@@ -257,33 +280,45 @@ class LTX2Engine:
         model_path = "/models/Lightricks/LTX-2"
         text_encoder_path = "/models/google/t5-v1_1-xxl"
 
-        # Check for distilled checkpoint
+        # Check for distilled checkpoint(s)
         import glob
         distill_ckpts = glob.glob(f"{model_path}/*distilled*.safetensors")
         distill_ckpt = None
+        lora_ckpt = None
         if distill_ckpts:
-            # Prefer non-FP8 for quality, FP8 for speed
+            # Prefer non-LoRA full distilled weights if present; otherwise fall back to a distilled LoRA adapter.
+            non_lora = [p for p in distill_ckpts if "lora" not in p.lower()]
+            lora_only = [p for p in distill_ckpts if "lora" in p.lower()]
+
             prefer_fp8 = os.environ.get("LTX2_PREFER_FP8", "0") == "1"
-            for ckpt in sorted(distill_ckpts):
-                if prefer_fp8 and "fp8" in ckpt.lower():
-                    distill_ckpt = ckpt
-                    break
-                elif not prefer_fp8 and "fp8" not in ckpt.lower():
-                    distill_ckpt = ckpt
-                    break
-            if distill_ckpt is None:
-                distill_ckpt = distill_ckpts[0]
+            candidates = sorted(non_lora) if non_lora else []
+            if candidates:
+                for ckpt in candidates:
+                    if prefer_fp8 and "fp8" in ckpt.lower():
+                        distill_ckpt = ckpt
+                        break
+                    if not prefer_fp8 and "fp8" not in ckpt.lower():
+                        distill_ckpt = ckpt
+                        break
+                if distill_ckpt is None:
+                    distill_ckpt = candidates[0]
+            elif lora_only:
+                # No full distilled weights found; use LoRA adapter on top of the base weights in `model_path`.
+                lora_ckpt = sorted(lora_only)[0]
 
         print(f"   Model path: {model_path}")
         print(f"   Text encoder: {text_encoder_path}")
         if distill_ckpt:
             print(f"   Distilled checkpoint: {distill_ckpt}")
+        if lora_ckpt:
+            print(f"   Distilled LoRA checkpoint: {lora_ckpt}")
 
-        # Build pipeline
         self.pipe = LightX2VPipeline(
             model_path=model_path,
             model_cls="ltx2_distill",
             task="t2v",
+            # Prefer loading the official distilled checkpoint directly when available.
+            # (We also normalize official key names like `patchify_proj.*` → `patch_embed.proj.*` in the loader.)
             dit_original_ckpt=distill_ckpt,
         )
 
@@ -293,12 +328,12 @@ class LTX2Engine:
         # Attention mode
         self.attn_mode = os.environ.get("LIGHTX2V_ATTN_MODE", "flash_attn2")
 
-        # Enable offload if needed (off by default on H100)
+        # Enable offload to keep peak GPU memory under control (LTX-2 19B is very close to 80GB).
         self.pipe.enable_offload(
-            cpu_offload=False,
+            cpu_offload=True,
             offload_granularity="block",
-            text_encoder_offload=False,
-            vae_offload=False,
+            text_encoder_offload=True,
+            vae_offload=True,
         )
 
         # Default generator config for LTX-2
@@ -309,7 +344,13 @@ class LTX2Engine:
             "num_frames": 97,  # ~3.2s at 30fps
             "guidance_scale": 1,  # No CFG for distilled
             "sample_shift": 3.0,
+            # Use the repo config to normalize values like `patch_size`/`vae_stride` (some upstream configs use scalars).
+            "config_json": "/opt/lightx2v/configs/ltx2/ltx2_t2v_distill_8step_offload.json",
         }
+
+        # If we only have a LoRA distilled checkpoint, apply it on top of the base weights.
+        if lora_ckpt and not distill_ckpt:
+            self.pipe.enable_lora([{"path": lora_ckpt, "strength": 1.0}])
 
         try:
             self.pipe.create_generator(attn_mode=self.attn_mode, **self._generator_cfg)

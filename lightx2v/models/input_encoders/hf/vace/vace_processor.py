@@ -128,7 +128,13 @@ class VaceVideoProcessor(object):
     def load_video_batch(self, *data_key_batch, crop_box=None, seed=2024, **kwargs):
         rng = np.random.default_rng(seed + hash(data_key_batch[0]) % 10000)
         # read video
-        import decord
+        try:
+            import decord
+        except ImportError as e:
+            raise ImportError(
+                "Missing optional dependency `decord`. Video loading requires `decord`, which is not available on all platforms "
+                "(notably macOS arm64 via PyPI). Use Linux/Windows (or Docker) to install it, or avoid video-based inputs."
+            ) from e
 
         decord.bridge.set_bridge("torch")
         readers = []

@@ -1,4 +1,4 @@
-decord
+decord; sys_platform != "darwin"
 peft
 onnxruntime
 pandas

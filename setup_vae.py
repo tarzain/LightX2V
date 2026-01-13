@@ -50,7 +50,7 @@ full_dependencies = [
     "fastapi",
     "uvicorn",
     "requests",
-    "decord",
+    "decord; sys_platform != 'darwin'",
     "torchada>=0.1.10",
 ]
 

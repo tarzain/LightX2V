@@ -15,7 +15,14 @@ except:  # noqa
     import moviepy as mpy
 
 import sam2.modeling.sam.transformer as transformer
-from decord import VideoReader
+try:
+    from decord import VideoReader
+except ImportError as e:
+    raise ImportError(
+        "`tools/preprocess/process_pipepline.py` requires optional dependency `decord` (VideoReader). "
+        "`decord` is not available on all platforms (e.g. macOS arm64 via PyPI). "
+        "Run this preprocessing on Linux/Windows (or inside Docker) where `decord` wheels exist."
+    ) from e
 from human_visualization import draw_aapose_by_meta_new
 from pose2d import Pose2d
 from pose2d_utils import AAPoseMeta

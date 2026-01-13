@@ -64,9 +64,12 @@ dependencies = [
     "alibabacloud_dypnsapi20170525==1.2.2",
     "redis==6.4.0",
     "tos",
-    "decord",
+    # `decord` doesn't publish macOS wheels (and has no sdist on PyPI), so it cannot be installed via `uv sync` on Darwin.
+    # Keep it available on platforms where wheels exist (Linux/Windows).
+    "decord; sys_platform != 'darwin'",
     "av",
     "torchada>=0.1.10",
+    "modal>=1.3.0.post1",
 ]
 
 [project.urls]

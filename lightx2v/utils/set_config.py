@@ -79,6 +79,28 @@ def set_config(args):
                     model_config = json.load(f)
                 config.update(model_config)
 
+    # Some model configs use scalar ints for fields that LightX2V expects to be (t, h, w) tuples.
+    # Normalize here to avoid runtime failures like "'int' object is not subscriptable".
+    _default_config = get_default_config()
+
+    def _normalize_triplet(value, default_triplet):
+        if isinstance(value, int):
+            return (value, default_triplet[1], default_triplet[2])
+        if isinstance(value, (list, tuple)):
+            if len(value) == 3:
+                return tuple(value)
+            if len(value) == 1:
+                return (value[0], default_triplet[1], default_triplet[2])
+        return default_triplet
+
+    config["vae_stride"] = _normalize_triplet(config.get("vae_stride"), _default_config["vae_stride"])
+    # For LTX2, some configs use scalar `patch_size=2` to mean spatial patching of (1, 2, 2).
+    patch_size = config.get("patch_size")
+    if isinstance(patch_size, int):
+        config["patch_size"] = (1, patch_size, patch_size)
+    else:
+        config["patch_size"] = _normalize_triplet(patch_size, _default_config["patch_size"])
+
     if config["task"] in ["i2v", "s2v"]:
         if config["target_video_length"] % config["vae_stride"][0] != 1:
             logger.warning(f"`num_frames - 1` has to be divisible by {config['vae_stride'][0]}. Rounding to the nearest number.")
@@ -104,26 +126,39 @@ def set_config(args):
 
 
 def set_parallel_config(config):
-    if config["parallel"]:
-        cfg_p_size = config["parallel"].get("cfg_p_size", 1)
-        seq_p_size = config["parallel"].get("seq_p_size", 1)
-        assert cfg_p_size * seq_p_size == dist.get_world_size(), f"cfg_p_size * seq_p_size must be equal to world_size"
-        config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, seq_p_size), mesh_dim_names=("cfg_p", "seq_p"))
+    parallel_cfg = config.get("parallel")
+    # Some config JSONs include a `parallel` dict even for single-process runs. Only enable
+    # distributed parallelism when the requested mesh size is > 1 and torch.distributed is initialized.
+    if not isinstance(parallel_cfg, dict):
+        return
 
-        if config["parallel"] and config["parallel"].get("seq_p_size", False) and config["parallel"]["seq_p_size"] > 1:
-            config["seq_parallel"] = True
+    cfg_p_size = parallel_cfg.get("cfg_p_size", 1)
+    seq_p_size = parallel_cfg.get("seq_p_size", 1)
+    if cfg_p_size * seq_p_size <= 1:
+        return
 
-        if config.get("enable_cfg", False) and config["parallel"] and config["parallel"].get("cfg_p_size", False) and config["parallel"]["cfg_p_size"] > 1:
-            config["cfg_parallel"] = True
-        # warmup dist
-        _a = torch.zeros([1]).to(f"{AI_DEVICE}:{dist.get_rank()}")
-        dist.all_reduce(_a)
+    if not dist.is_available() or not dist.is_initialized():
+        raise ValueError("Parallel config requests distributed execution, but torch.distributed is not initialized.")
+
+    assert cfg_p_size * seq_p_size == dist.get_world_size(), f"cfg_p_size * seq_p_size must be equal to world_size"
+    config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, seq_p_size), mesh_dim_names=("cfg_p", "seq_p"))
+
+    if parallel_cfg.get("seq_p_size", 1) > 1:
+        config["seq_parallel"] = True
+
+    if config.get("enable_cfg", False) and parallel_cfg.get("cfg_p_size", 1) > 1:
+        config["cfg_parallel"] = True
+
+    # warmup dist
+    _a = torch.zeros([1]).to(f"{AI_DEVICE}:{dist.get_rank()}")
+    dist.all_reduce(_a)
 
 
 def print_config(config):
     config_to_print = config.copy()
     config_to_print.pop("device_mesh", None)
-    if config["parallel"]:
+    # Don't assume torch.distributed is initialized just because `parallel` exists in config.
+    if dist.is_available() and dist.is_initialized():
         if dist.get_rank() == 0:
             logger.info(f"config:\n{json.dumps(config_to_print, ensure_ascii=False, indent=4)}")
     else:

@@ -6,6 +6,7 @@ Features:
 - FP8 transformer for reduced memory footprint
 - 8-step distilled inference with 2x spatial upscaling
 - Text-to-video (T2V) and Image-to-video (I2V) support
+- Audio-to-video (A2V) conditioning support
 - Web UI for easy interaction
 """
 
@@ -84,6 +85,9 @@ image = (
 )
 
 app = modal.App("ltx2-official-distilled", image=image)
+
+# Global variable for audio conditioning (survives snapshot restore)
+_AUDIO_CONDITIONING_LATENT = None
 
 
 @app.function(
@@ -226,8 +230,38 @@ class OfficialLTX2Engine:
         print("   Loading spatial upsampler...")
         self._spatial_upsampler = ledger.spatial_upsampler()
         
+        # Load audio components for A2V
+        print("   Loading audio encoder...")
+        self._audio_encoder = self._build_audio_encoder(ledger)
+        
+        print("   Loading audio decoder...")
+        self._audio_decoder = ledger.audio_decoder()
+        
+        print("   Loading vocoder...")
+        self._vocoder = ledger.vocoder()
+        
         torch.cuda.synchronize()
         print("   All models loaded!")
+    
+    def _build_audio_encoder(self, ledger):
+        """Build the audio encoder (not exposed in ModelLedger by default)."""
+        from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+        from ltx_core.model.audio_vae import (
+            AudioEncoderConfigurator,
+            AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        )
+        
+        audio_encoder_builder = Builder(
+            model_path=ledger.checkpoint_path,
+            model_class_configurator=AudioEncoderConfigurator,
+            model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            registry=ledger.registry,
+        )
+        
+        return audio_encoder_builder.build(
+            device=ledger.device,
+            dtype=ledger.dtype
+        ).to(ledger.device).eval()
         
         # Monkey-patch the ModelLedger to return our cached models instead of reloading
         print("   Patching ModelLedger to use cached models...")
@@ -248,6 +282,9 @@ class OfficialLTX2Engine:
         cached_video_encoder = self._video_encoder
         cached_video_decoder = self._video_decoder
         cached_spatial_upsampler = self._spatial_upsampler
+        cached_audio_encoder = self._audio_encoder
+        cached_audio_decoder = self._audio_decoder
+        cached_vocoder = self._vocoder
         
         def patched_text_encoder():
             return cached_text_encoder
@@ -264,12 +301,24 @@ class OfficialLTX2Engine:
         def patched_spatial_upsampler():
             return cached_spatial_upsampler
         
+        def patched_audio_encoder():
+            return cached_audio_encoder
+        
+        def patched_audio_decoder():
+            return cached_audio_decoder
+        
+        def patched_vocoder():
+            return cached_vocoder
+        
         # Apply patches
         ledger.text_encoder = patched_text_encoder
         ledger.transformer = patched_transformer
         ledger.video_encoder = patched_video_encoder
         ledger.video_decoder = patched_video_decoder
         ledger.spatial_upsampler = patched_spatial_upsampler
+        ledger.audio_encoder = patched_audio_encoder
+        ledger.audio_decoder = patched_audio_decoder
+        ledger.vocoder = patched_vocoder
         
         # Also disable cleanup_memory to prevent model unloading
         def noop_cleanup(*args, **kwargs):
@@ -332,7 +381,136 @@ class OfficialLTX2Engine:
         distilled_module.image_conditionings_by_replacing_latent = smart_conditioning
         
         print("   Conditioning function patched for FL2V support (helpers + distilled modules)!")
+        
+        # Patch pipeline for audio conditioning support
+        self._patch_pipeline_for_audio()
     
+    def _patch_pipeline_for_audio(self):
+        """
+        Patch the pipeline to support audio conditioning.
+        
+        This allows passing initial_audio_latent to denoise_audio_video,
+        which conditions the video generation on the input audio.
+        """
+        import ltx_pipelines.utils.helpers as helpers_module
+        import ltx_pipelines.distilled as distilled_module
+        
+        # Store original denoise_audio_video function
+        original_denoise_av = helpers_module.denoise_audio_video
+        
+        def patched_denoise_audio_video(
+            output_shape,
+            conditionings,
+            noiser,
+            sigmas,
+            stepper,
+            denoising_loop_fn,
+            components,
+            dtype,
+            device,
+            noise_scale=1.0,
+            initial_video_latent=None,
+            initial_audio_latent=None,
+        ):
+            # Check if we have audio latent stored in the global variable
+            # Use sys.modules to reliably access the module's global state
+            import sys
+            current_module = sys.modules.get('__main__') or sys.modules.get('ltx2_official_modal')
+            audio_latent = getattr(current_module, '_AUDIO_CONDITIONING_LATENT', None) if current_module else None
+            print(f"   [DEBUG] Audio conditioning check: module={current_module.__name__ if current_module else 'None'}, latent={'present' if audio_latent is not None else 'None'}")
+            if audio_latent is not None:
+                print(f"   A2V: Using audio conditioning! Latent shape: {audio_latent.shape}")
+                initial_audio_latent = audio_latent
+            
+            return original_denoise_av(
+                output_shape=output_shape,
+                conditionings=conditionings,
+                noiser=noiser,
+                sigmas=sigmas,
+                stepper=stepper,
+                denoising_loop_fn=denoising_loop_fn,
+                components=components,
+                dtype=dtype,
+                device=device,
+                noise_scale=noise_scale,
+                initial_video_latent=initial_video_latent,
+                initial_audio_latent=initial_audio_latent,
+            )
+        
+        # Monkey-patch in both places
+        helpers_module.denoise_audio_video = patched_denoise_audio_video
+        distilled_module.denoise_audio_video = patched_denoise_audio_video
+        
+        print("   Audio conditioning patch applied!")
+    
+    def _encode_audio(self, audio_path: str, target_duration_seconds: float):
+        """
+        Load and encode audio to latent representation.
+        
+        Args:
+            audio_path: Path to audio file (WAV, MP3, etc.)
+            target_duration_seconds: Target duration in seconds
+            
+        Returns:
+            Audio latent tensor for conditioning
+        """
+        import torch
+        import torchaudio
+        from ltx_core.model.audio_vae.ops import AudioProcessor
+        from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
+        
+        # Audio encoder parameters (from AudioEncoderConfigurator defaults)
+        sample_rate = 16000
+        mel_hop_length = 160
+        n_fft = 1024
+        mel_bins = 64
+        
+        # Create audio processor
+        audio_processor = AudioProcessor(
+            sample_rate=sample_rate,
+            mel_bins=mel_bins,
+            mel_hop_length=mel_hop_length,
+            n_fft=n_fft,
+        ).to(self.pipeline.device)
+        
+        # Load audio
+        waveform, sr = torchaudio.load(audio_path)
+        
+        # AudioEncoder expects stereo (2 channels)
+        if waveform.shape[0] == 1:
+            # Duplicate mono to stereo
+            waveform = waveform.repeat(2, 1)
+        elif waveform.shape[0] > 2:
+            # Take first 2 channels if more than stereo
+            waveform = waveform[:2]
+        
+        # Resample if needed
+        if sr != sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, sample_rate)
+            waveform = resampler(waveform)
+        
+        # Trim or pad to target duration
+        target_samples = int(target_duration_seconds * sample_rate)
+        num_channels = waveform.shape[0]  # Should be 2 (stereo)
+        if waveform.shape[1] > target_samples:
+            waveform = waveform[:, :target_samples]
+        elif waveform.shape[1] < target_samples:
+            padding = torch.zeros(num_channels, target_samples - waveform.shape[1])
+            waveform = torch.cat([waveform, padding], dim=1)
+        
+        # Add batch dimension: [1, channels, samples]
+        waveform = waveform.unsqueeze(0).to(self.pipeline.device, dtype=torch.float32)
+        
+        # Convert to mel spectrogram
+        mel = audio_processor.waveform_to_mel(waveform, sample_rate)
+        
+        # Encode to latent
+        with torch.no_grad():
+            audio_latent = self._audio_encoder(mel.to(self.pipeline.dtype))
+        
+        print(f"   Audio encoded: {audio_path} -> latent shape {audio_latent.shape}")
+        return audio_latent
+
     def _warmup(self):
         """Run a single warmup to ensure CUDA kernels are ready."""
         import torch
@@ -550,6 +728,87 @@ class OfficialLTX2Engine:
             output_name=output_name,
         )
 
+    @modal.method()
+    def generate_a2v(
+        self,
+        audio_b64: str,
+        prompt: str,
+        seed: int = 42,
+        height: int = 704,
+        width: int = 1216,
+        num_frames: int = 97,
+        frame_rate: float = 30.0,
+        output_name: str = "a2v_output.mp4",
+        image_b64: str | None = None,
+    ) -> bytes:
+        """
+        Generate video conditioned on audio (Audio-to-Video).
+        
+        The audio latent is used to condition the video generation through
+        the bidirectional audio-video cross-attention in the transformer.
+        
+        Args:
+            audio_b64: Base64-encoded audio file (WAV, MP3, etc.)
+            prompt: Text prompt describing the video
+            seed: Random seed
+            height: Video height
+            width: Video width
+            num_frames: Number of frames
+            frame_rate: Frame rate
+            output_name: Output filename
+            image_b64: Optional base64 image for I2V+A2V combined conditioning
+        """
+        import base64
+        import io
+        import tempfile
+        from PIL import Image
+        
+        # Decode audio and save to temp file
+        audio_data = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_data)
+            audio_path = tmp.name
+        
+        # Calculate video duration
+        video_duration = num_frames / frame_rate
+        
+        # Encode audio to latent
+        audio_latent = self._encode_audio(audio_path, video_duration)
+        
+        # Store in global variable for the patched denoise function to pick up
+        global _AUDIO_CONDITIONING_LATENT
+        _AUDIO_CONDITIONING_LATENT = audio_latent
+        
+        try:
+            # Handle optional image conditioning
+            images = []
+            if image_b64:
+                image_data = base64.b64decode(image_b64)
+                image = Image.open(io.BytesIO(image_data)).convert("RGB")
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+                
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    image.save(tmp.name, "PNG")
+                    image_path = tmp.name
+                
+                images = [(image_path, 0, 1.0)]
+            
+            result = self._generate(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                images=images,
+                output_name=output_name,
+            )
+        finally:
+            # Clear the audio latent after generation
+            _AUDIO_CONDITIONING_LATENT = None
+        
+        return result
+
 
 # ============================================================================
 # Web API
@@ -759,6 +1018,7 @@ def web():
             <button class="tab active" data-mode="t2v">Text to Video</button>
             <button class="tab" data-mode="i2v">Image to Video</button>
             <button class="tab" data-mode="fl2v">First + Last Frame</button>
+            <button class="tab" data-mode="a2v">Audio to Video</button>
         </div>
         
         <div class="grid">
@@ -781,6 +1041,25 @@ def web():
                         <img id="preview-last" class="hidden" />
                     </div>
                     <input type="file" id="file-last" accept="image/*" />
+                </div>
+                
+                <div id="audio-input" class="hidden">
+                    <label>Audio File (WAV, MP3)</label>
+                    <div class="dropzone" id="dropzone-audio">
+                        <p>🎵 Drop audio here or click to upload</p>
+                        <span id="audio-name" class="hidden"></span>
+                    </div>
+                    <input type="file" id="file-audio" accept="audio/*" />
+                    <p style="color: #666; font-size: 0.8rem; margin-top: 0.5rem;">Audio will be synced with the generated video</p>
+                </div>
+                
+                <div id="audio-image-input" class="hidden">
+                    <label>Optional: Starting Image</label>
+                    <div class="dropzone" id="dropzone-audio-image">
+                        <p>Drop image for I2V+A2V combined conditioning (optional)</p>
+                        <img id="preview-audio-image" class="hidden" />
+                    </div>
+                    <input type="file" id="file-audio-image" accept="image/*" />
                 </div>
                 
                 <label>Prompt</label>
@@ -825,6 +1104,8 @@ def web():
         let mode = 't2v';
         let imageData = null;
         let lastImageData = null;
+        let audioData = null;
+        let audioImageData = null;
         
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -832,8 +1113,10 @@ def web():
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 tab.classList.add('active');
                 mode = tab.dataset.mode;
-                $('image-input').classList.toggle('hidden', mode === 't2v');
+                $('image-input').classList.toggle('hidden', mode === 't2v' || mode === 'a2v');
                 $('last-image-input').classList.toggle('hidden', mode !== 'fl2v');
+                $('audio-input').classList.toggle('hidden', mode !== 'a2v');
+                $('audio-image-input').classList.toggle('hidden', mode !== 'a2v');
             });
         });
         
@@ -867,6 +1150,36 @@ def web():
         });
         fileInputLast.addEventListener('change', () => { if (fileInputLast.files.length) handleFile(fileInputLast.files[0], 'last'); });
         
+        // Audio file drag and drop
+        const dropzoneAudio = $('dropzone-audio');
+        const fileInputAudio = $('file-audio');
+        const audioName = $('audio-name');
+        
+        dropzoneAudio.addEventListener('click', () => fileInputAudio.click());
+        dropzoneAudio.addEventListener('dragover', e => { e.preventDefault(); dropzoneAudio.classList.add('dragover'); });
+        dropzoneAudio.addEventListener('dragleave', () => dropzoneAudio.classList.remove('dragover'));
+        dropzoneAudio.addEventListener('drop', e => {
+            e.preventDefault();
+            dropzoneAudio.classList.remove('dragover');
+            if (e.dataTransfer.files.length) handleAudioFile(e.dataTransfer.files[0]);
+        });
+        fileInputAudio.addEventListener('change', () => { if (fileInputAudio.files.length) handleAudioFile(fileInputAudio.files[0]); });
+        
+        // Audio optional image
+        const dropzoneAudioImage = $('dropzone-audio-image');
+        const fileInputAudioImage = $('file-audio-image');
+        const previewAudioImage = $('preview-audio-image');
+        
+        dropzoneAudioImage.addEventListener('click', () => fileInputAudioImage.click());
+        dropzoneAudioImage.addEventListener('dragover', e => { e.preventDefault(); dropzoneAudioImage.classList.add('dragover'); });
+        dropzoneAudioImage.addEventListener('dragleave', () => dropzoneAudioImage.classList.remove('dragover'));
+        dropzoneAudioImage.addEventListener('drop', e => {
+            e.preventDefault();
+            dropzoneAudioImage.classList.remove('dragover');
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], 'audio-image');
+        });
+        fileInputAudioImage.addEventListener('change', () => { if (fileInputAudioImage.files.length) handleFile(fileInputAudioImage.files[0], 'audio-image'); });
+        
         function handleFile(file, which) {
             const reader = new FileReader();
             reader.onload = e => {
@@ -876,12 +1189,28 @@ def web():
                     preview.src = e.target.result;
                     preview.classList.remove('hidden');
                     dropzone.querySelector('p').textContent = file.name;
-                } else {
+                } else if (which === 'last') {
                     lastImageData = b64;
                     previewLast.src = e.target.result;
                     previewLast.classList.remove('hidden');
                     dropzoneLast.querySelector('p').textContent = file.name;
+                } else if (which === 'audio-image') {
+                    audioImageData = b64;
+                    previewAudioImage.src = e.target.result;
+                    previewAudioImage.classList.remove('hidden');
+                    dropzoneAudioImage.querySelector('p').textContent = file.name;
                 }
+            };
+            reader.readAsDataURL(file);
+        }
+        
+        function handleAudioFile(file) {
+            const reader = new FileReader();
+            reader.onload = e => {
+                audioData = e.target.result.split(',')[1];
+                audioName.textContent = '🎵 ' + file.name;
+                audioName.classList.remove('hidden');
+                dropzoneAudio.querySelector('p').textContent = file.name;
             };
             reader.readAsDataURL(file);
         }
@@ -911,7 +1240,20 @@ def web():
                 const t0 = performance.now();
                 let resp;
                 
-                if (mode === 'fl2v') {
+                if (mode === 'a2v') {
+                    if (!audioData) throw new Error('Please upload an audio file');
+                    const fd = new FormData();
+                    fd.append('audio', await fetch(`data:audio/wav;base64,${audioData}`).then(r => r.blob()), 'audio.wav');
+                    if (audioImageData) {
+                        fd.append('image', await fetch(`data:image/png;base64,${audioImageData}`).then(r => r.blob()), 'image.png');
+                    }
+                    fd.append('prompt', params.prompt);
+                    fd.append('width', params.width);
+                    fd.append('height', params.height);
+                    fd.append('num_frames', params.num_frames);
+                    fd.append('seed', params.seed);
+                    resp = await fetch('/api/a2v', { method: 'POST', body: fd });
+                } else if (mode === 'fl2v') {
                     if (!imageData) throw new Error('Please upload a first frame image');
                     if (!lastImageData) throw new Error('Please upload a last frame image');
                     const fd = new FormData();
@@ -1042,6 +1384,44 @@ def web():
                 width=width,
                 num_frames=num_frames,
                 frame_rate=30.0,
+            )
+            return Response(content=video_bytes, media_type="video/mp4")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @web_app.post("/api/a2v")
+    async def api_a2v(
+        audio: UploadFile = File(...),
+        prompt: str = Form(...),
+        width: int = Form(768),
+        height: int = Form(512),
+        num_frames: int = Form(97),
+        seed: int = Form(42),
+        image: UploadFile = File(None),
+    ):
+        """Audio-to-Video API endpoint."""
+        try:
+            import base64
+            audio_data = await audio.read()
+            audio_b64 = base64.b64encode(audio_data).decode()
+            
+            # Optional image for combined I2V+A2V
+            image_b64 = None
+            if image:
+                image_data = await image.read()
+                if image_data:
+                    image_b64 = base64.b64encode(image_data).decode()
+            
+            engine = OfficialLTX2Engine()
+            video_bytes = engine.generate_a2v.remote(
+                audio_b64=audio_b64,
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=30.0,
+                image_b64=image_b64,
             )
             return Response(content=video_bytes, media_type="video/mp4")
         except Exception as e:

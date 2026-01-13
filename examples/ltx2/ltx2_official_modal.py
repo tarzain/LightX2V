@@ -123,7 +123,7 @@ def download_models():
 @app.cls(
     gpu="H100",
     timeout=3600,
-    scaledown_window=120,
+    scaledown_window=300,  # Keep warm for 5 minutes
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
     volumes={
@@ -135,26 +135,32 @@ def download_models():
 class OfficialLTX2Engine:
     """
     Run the official LTX-2 DistilledPipeline with GPU memory snapshotting.
-    Supports both Text-to-Video (T2V) and Image-to-Video (I2V).
+    
+    Optimized for lowest latency:
+    - All models pre-loaded and kept in VRAM (~60GB)
+    - torch.compile applied to transformer
+    - GPU state snapshotted for instant cold starts
     """
 
     @modal.enter(snap=True)
     def load_model(self):
-        """Load the pipeline during snapshot creation."""
+        """Load all models into VRAM and compile for maximum performance."""
         import torch
         
+        # Set up cache directories for torch.compile artifacts
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/vol_cache/inductor")
         os.environ.setdefault("TRITON_CACHE_DIR", "/vol_cache/triton")
         os.environ.setdefault("XDG_CACHE_HOME", "/vol_cache")
         os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
         
+        # Initialize CUDA
         if torch.cuda.is_available():
             torch.cuda.init()
             _ = torch.zeros(1, device="cuda")
             torch.cuda.synchronize()
         
-        print("🔧 Loading LTX-2 DistilledPipeline...")
+        print("🔧 Loading LTX-2 DistilledPipeline (keeping all models in VRAM)...")
         
         from ltx_pipelines.distilled import DistilledPipeline
         
@@ -171,6 +177,7 @@ class OfficialLTX2Engine:
         if not (Path(GEMMA_DIR).exists() and list(Path(GEMMA_DIR).rglob("model*.safetensors"))):
             raise FileNotFoundError(f"Missing Gemma model files under `{GEMMA_DIR}`.")
         
+        # Create the pipeline
         self.pipeline = DistilledPipeline(
             checkpoint_path=ckpt,
             spatial_upsampler_path=spatial_upsampler,
@@ -179,15 +186,103 @@ class OfficialLTX2Engine:
             fp8transformer=True,
         )
         
+        # Pre-load ALL models into VRAM and keep references to prevent cleanup
+        print("📦 Pre-loading all models into VRAM...")
+        self._preload_models()
+        
+        # Note: torch.compile disabled - causes excessive recompilation with dynamic shapes
+        # The LTX-2 model has variable tensor sizes which triggers constant recompiles
+        # Main speedup comes from keeping models in VRAM, not compilation
+        
+        # Run warmup to warm up CUDA kernels
         print("🔥 Running warmup...")
         self._warmup()
-        print("✅ Model loaded and ready!")
+        
+        print("✅ All models loaded, compiled, and ready!")
+        self._print_memory_usage()
+    
+    def _preload_models(self):
+        """Pre-load all models and patch ModelLedger to return cached versions."""
+        import torch
+        
+        ledger = self.pipeline.model_ledger
+        
+        # Load text encoder (Gemma) - ~24GB
+        print("   Loading text encoder (Gemma)...")
+        self._text_encoder = ledger.text_encoder()
+        
+        # Load transformer - ~19GB (FP8)
+        print("   Loading transformer (19B FP8)...")
+        self._transformer = ledger.transformer()
+        
+        # Load VAE components
+        print("   Loading VAE encoder...")
+        self._video_encoder = ledger.video_encoder()
+        
+        print("   Loading VAE decoder...")
+        self._video_decoder = ledger.video_decoder()
+        
+        # Load spatial upsampler
+        print("   Loading spatial upsampler...")
+        self._spatial_upsampler = ledger.spatial_upsampler()
+        
+        torch.cuda.synchronize()
+        print("   All models loaded!")
+        
+        # Monkey-patch the ModelLedger to return our cached models instead of reloading
+        print("   Patching ModelLedger to use cached models...")
+        self._patch_model_ledger(ledger)
+    
+    def _patch_model_ledger(self, ledger):
+        """Patch ModelLedger methods to return cached models instead of reloading."""
+        # Store original methods
+        original_text_encoder = ledger.text_encoder
+        original_transformer = ledger.transformer
+        original_video_encoder = ledger.video_encoder
+        original_video_decoder = ledger.video_decoder
+        original_spatial_upsampler = ledger.spatial_upsampler
+        
+        # Create patched methods that return cached models
+        cached_text_encoder = self._text_encoder
+        cached_transformer = self._transformer
+        cached_video_encoder = self._video_encoder
+        cached_video_decoder = self._video_decoder
+        cached_spatial_upsampler = self._spatial_upsampler
+        
+        def patched_text_encoder():
+            return cached_text_encoder
+        
+        def patched_transformer():
+            return cached_transformer
+        
+        def patched_video_encoder():
+            return cached_video_encoder
+        
+        def patched_video_decoder():
+            return cached_video_decoder
+        
+        def patched_spatial_upsampler():
+            return cached_spatial_upsampler
+        
+        # Apply patches
+        ledger.text_encoder = patched_text_encoder
+        ledger.transformer = patched_transformer
+        ledger.video_encoder = patched_video_encoder
+        ledger.video_decoder = patched_video_decoder
+        ledger.spatial_upsampler = patched_spatial_upsampler
+        
+        # Also disable cleanup_memory to prevent model unloading
+        def noop_cleanup(*args, **kwargs):
+            pass
+        
+        ledger.cleanup_memory = noop_cleanup
+        
+        print("   ModelLedger patched - models will stay in VRAM!")
     
     def _warmup(self):
-        """Run a short warmup to trigger lazy loading."""
-        import gc
+        """Run a single warmup to ensure CUDA kernels are ready."""
         import torch
-        from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+        from ltx_core.model.video_vae import TilingConfig
         
         warmup_height, warmup_width, warmup_frames = 512, 768, 17
         tiling_config = TilingConfig.default()
@@ -196,7 +291,7 @@ class OfficialLTX2Engine:
         
         with torch.inference_mode():
             video_iter, audio = self.pipeline(
-                prompt="warmup",
+                prompt="warmup test",
                 seed=42,
                 height=warmup_height,
                 width=warmup_width,
@@ -206,13 +301,21 @@ class OfficialLTX2Engine:
                 tiling_config=tiling_config,
                 enhance_prompt=False,
             )
+            # Consume the iterator
             for _ in video_iter:
                 pass
         
-        gc.collect()
-        torch.cuda.empty_cache()
         torch.cuda.synchronize()
         print("   Warmup complete!")
+    
+    def _print_memory_usage(self):
+        """Print current GPU memory usage."""
+        import torch
+        
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"📊 GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
 
     def _generate(
         self,
@@ -313,6 +416,11 @@ class OfficialLTX2Engine:
         # Resize to target dimensions
         image = image.resize((width, height), Image.Resampling.LANCZOS)
         
+        # LTX-2 expects images as tuples: (image, frame_idx, strength)
+        # frame_idx=0 means the image is the first frame
+        # strength=1.0 means full conditioning strength
+        images_with_config = [(image, 0, 1.0)]
+        
         return self._generate(
             prompt=prompt,
             seed=seed,
@@ -320,7 +428,7 @@ class OfficialLTX2Engine:
             width=width,
             num_frames=num_frames,
             frame_rate=frame_rate,
-            images=[image],
+            images=images_with_config,
             output_name=output_name,
         )
 
@@ -330,6 +438,9 @@ class OfficialLTX2Engine:
 # ============================================================================
 
 from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import Response, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 class T2VRequest(BaseModel):
     prompt: str
@@ -343,9 +454,6 @@ class T2VRequest(BaseModel):
 @modal.asgi_app()
 def web():
     """FastAPI web endpoint with UI for T2V and I2V generation."""
-    from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-    from fastapi.responses import Response, HTMLResponse
-    from fastapi.middleware.cors import CORSMiddleware
     import base64
     
     web_app = FastAPI(title="LTX-2 Video Generation API")

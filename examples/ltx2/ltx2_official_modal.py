@@ -278,6 +278,60 @@ class OfficialLTX2Engine:
         ledger.cleanup_memory = noop_cleanup
         
         print("   ModelLedger patched - models will stay in VRAM!")
+        
+        # Patch the pipeline to support FL2V (first+last frame conditioning)
+        self._patch_pipeline_for_fl2v()
+    
+    def _patch_pipeline_for_fl2v(self):
+        """
+        Patch the conditioning function to use image_conditionings_by_adding_guiding_latent
+        when multiple images are provided (for FL2V support).
+        
+        The DistilledPipeline uses image_conditionings_by_replacing_latent internally,
+        which only supports single-frame conditioning. For FL2V (first+last frames),
+        we need to use image_conditionings_by_adding_guiding_latent instead.
+        """
+        import ltx_pipelines.utils.helpers as helpers_module
+        import ltx_pipelines.distilled as distilled_module
+        
+        # Get the guiding latent function
+        guiding_fn = helpers_module.image_conditionings_by_adding_guiding_latent
+        
+        # Store original function from the distilled module (this is what actually gets called)
+        original_replacing = distilled_module.image_conditionings_by_replacing_latent
+        
+        def smart_conditioning(images, height, width, video_encoder, dtype, device, **kwargs):
+            """
+            Smart conditioning that uses guiding latent for multiple images,
+            and replacing latent for single image.
+            """
+            if len(images) > 1:
+                print(f"   FL2V: Using guiding latent conditioning for {len(images)} keyframes")
+                # Use guiding latent for multiple images (FL2V)
+                return guiding_fn(
+                    images=images,
+                    height=height,
+                    width=width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                # Use original replacing latent for single image (I2V)
+                return original_replacing(
+                    images=images,
+                    height=height,
+                    width=width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=device,
+                )
+        
+        # Monkey-patch in BOTH places to ensure it's applied
+        helpers_module.image_conditionings_by_replacing_latent = smart_conditioning
+        distilled_module.image_conditionings_by_replacing_latent = smart_conditioning
+        
+        print("   Conditioning function patched for FL2V support (helpers + distilled modules)!")
     
     def _warmup(self):
         """Run a single warmup to ensure CUDA kernels are ready."""
@@ -427,6 +481,63 @@ class OfficialLTX2Engine:
         # frame_idx=0 means the image is the first frame
         # strength=1.0 means full conditioning strength
         images_with_config = [(image_path, 0, 1.0)]
+        
+        return self._generate(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            images=images_with_config,
+            output_name=output_name,
+        )
+
+    @modal.method()
+    def generate_fl2v(
+        self,
+        first_image_b64: str,
+        last_image_b64: str,
+        prompt: str,
+        seed: int = 42,
+        height: int = 704,
+        width: int = 1216,
+        num_frames: int = 97,
+        frame_rate: float = 30.0,
+        output_name: str = "fl2v_output.mp4",
+    ) -> bytes:
+        """Generate video from first + last frame images (First-Last-to-Video)."""
+        import base64
+        import io
+        import tempfile
+        from PIL import Image
+        
+        # Decode first image
+        first_data = base64.b64decode(first_image_b64)
+        first_image = Image.open(io.BytesIO(first_data)).convert("RGB")
+        first_image = first_image.resize((width, height), Image.Resampling.LANCZOS)
+        
+        # Decode last image
+        last_data = base64.b64decode(last_image_b64)
+        last_image = Image.open(io.BytesIO(last_data)).convert("RGB")
+        last_image = last_image.resize((width, height), Image.Resampling.LANCZOS)
+        
+        # Save to temp files
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            first_image.save(tmp.name, "PNG")
+            first_path = tmp.name
+        
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            last_image.save(tmp.name, "PNG")
+            last_path = tmp.name
+        
+        # LTX-2 expects images as tuples: (image_path, frame_idx, strength)
+        # With our patched conditioning function, both images will be used
+        # as guiding latents throughout the generation
+        images_with_config = [
+            (first_path, 0, 1.0),                 # First frame keyframe
+            (last_path, num_frames - 1, 1.0),    # Last frame keyframe
+        ]
         
         return self._generate(
             prompt=prompt,
@@ -647,6 +758,7 @@ def web():
         <div class="tabs">
             <button class="tab active" data-mode="t2v">Text to Video</button>
             <button class="tab" data-mode="i2v">Image to Video</button>
+            <button class="tab" data-mode="fl2v">First + Last Frame</button>
         </div>
         
         <div class="grid">
@@ -660,6 +772,15 @@ def web():
                         <img id="preview" class="hidden" />
                     </div>
                     <input type="file" id="file" accept="image/*" />
+                </div>
+                
+                <div id="last-image-input" class="hidden">
+                    <label>Ending Image</label>
+                    <div class="dropzone" id="dropzone-last">
+                        <p>Drop last frame image here</p>
+                        <img id="preview-last" class="hidden" />
+                    </div>
+                    <input type="file" id="file-last" accept="image/*" />
                 </div>
                 
                 <label>Prompt</label>
@@ -703,6 +824,7 @@ def web():
         const $ = id => document.getElementById(id);
         let mode = 't2v';
         let imageData = null;
+        let lastImageData = null;
         
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -711,10 +833,11 @@ def web():
                 tab.classList.add('active');
                 mode = tab.dataset.mode;
                 $('image-input').classList.toggle('hidden', mode === 't2v');
+                $('last-image-input').classList.toggle('hidden', mode !== 'fl2v');
             });
         });
         
-        // Drag and drop
+        // First image drag and drop
         const dropzone = $('dropzone');
         const fileInput = $('file');
         const preview = $('preview');
@@ -725,17 +848,40 @@ def web():
         dropzone.addEventListener('drop', e => {
             e.preventDefault();
             dropzone.classList.remove('dragover');
-            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], 'first');
         });
-        fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+        fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0], 'first'); });
         
-        function handleFile(file) {
+        // Last image drag and drop
+        const dropzoneLast = $('dropzone-last');
+        const fileInputLast = $('file-last');
+        const previewLast = $('preview-last');
+        
+        dropzoneLast.addEventListener('click', () => fileInputLast.click());
+        dropzoneLast.addEventListener('dragover', e => { e.preventDefault(); dropzoneLast.classList.add('dragover'); });
+        dropzoneLast.addEventListener('dragleave', () => dropzoneLast.classList.remove('dragover'));
+        dropzoneLast.addEventListener('drop', e => {
+            e.preventDefault();
+            dropzoneLast.classList.remove('dragover');
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], 'last');
+        });
+        fileInputLast.addEventListener('change', () => { if (fileInputLast.files.length) handleFile(fileInputLast.files[0], 'last'); });
+        
+        function handleFile(file, which) {
             const reader = new FileReader();
             reader.onload = e => {
-                imageData = e.target.result.split(',')[1];
-                preview.src = e.target.result;
-                preview.classList.remove('hidden');
-                dropzone.querySelector('p').textContent = file.name;
+                const b64 = e.target.result.split(',')[1];
+                if (which === 'first') {
+                    imageData = b64;
+                    preview.src = e.target.result;
+                    preview.classList.remove('hidden');
+                    dropzone.querySelector('p').textContent = file.name;
+                } else {
+                    lastImageData = b64;
+                    previewLast.src = e.target.result;
+                    previewLast.classList.remove('hidden');
+                    dropzoneLast.querySelector('p').textContent = file.name;
+                }
             };
             reader.readAsDataURL(file);
         }
@@ -765,7 +911,19 @@ def web():
                 const t0 = performance.now();
                 let resp;
                 
-                if (mode === 'i2v') {
+                if (mode === 'fl2v') {
+                    if (!imageData) throw new Error('Please upload a first frame image');
+                    if (!lastImageData) throw new Error('Please upload a last frame image');
+                    const fd = new FormData();
+                    fd.append('first_image', await fetch(`data:image/png;base64,${imageData}`).then(r => r.blob()), 'first.png');
+                    fd.append('last_image', await fetch(`data:image/png;base64,${lastImageData}`).then(r => r.blob()), 'last.png');
+                    fd.append('prompt', params.prompt);
+                    fd.append('width', params.width);
+                    fd.append('height', params.height);
+                    fd.append('num_frames', params.num_frames);
+                    fd.append('seed', params.seed);
+                    resp = await fetch('/api/fl2v', { method: 'POST', body: fd });
+                } else if (mode === 'i2v') {
                     if (!imageData) throw new Error('Please upload an image first');
                     const fd = new FormData();
                     fd.append('image', await fetch(`data:image/png;base64,${imageData}`).then(r => r.blob()), 'image.png');
@@ -845,6 +1003,39 @@ def web():
             engine = OfficialLTX2Engine()
             video_bytes = engine.generate_i2v.remote(
                 image_b64=image_b64,
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=30.0,
+            )
+            return Response(content=video_bytes, media_type="video/mp4")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @web_app.post("/api/fl2v")
+    async def api_fl2v(
+        first_image: UploadFile = File(...),
+        last_image: UploadFile = File(...),
+        prompt: str = Form(...),
+        width: int = Form(768),
+        height: int = Form(512),
+        num_frames: int = Form(97),
+        seed: int = Form(42),
+    ):
+        """First+Last Frame to Video API endpoint."""
+        try:
+            import base64
+            first_data = await first_image.read()
+            last_data = await last_image.read()
+            first_b64 = base64.b64encode(first_data).decode()
+            last_b64 = base64.b64encode(last_data).decode()
+            
+            engine = OfficialLTX2Engine()
+            video_bytes = engine.generate_fl2v.remote(
+                first_image_b64=first_b64,
+                last_image_b64=last_b64,
                 prompt=prompt,
                 seed=seed,
                 height=height,

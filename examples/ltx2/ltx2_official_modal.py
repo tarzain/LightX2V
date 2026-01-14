@@ -856,6 +856,96 @@ class OfficialLTX2Engine:
         return video_bytes
 
     @modal.method()
+    def generate(
+        self,
+        prompt: str,
+        seed: int = 42,
+        height: int = 704,
+        width: int = 1216,
+        num_frames: int = 97,
+        frame_rate: float = 30.0,
+        output_name: str = "output.mp4",
+        first_frame_b64: str | None = None,
+        last_frame_b64: str | None = None,
+        audio_b64: str | None = None,
+        audio_conditioning_strength: float = 0.3,
+    ) -> bytes:
+        """
+        Unified generation method supporting all conditioning combinations:
+        - Text only (T2V)
+        - Text + first frame (I2V)
+        - Text + first + last frame (FL2V)
+        - Text + audio (A2V)
+        - Text + first frame + audio (I2V+A2V)
+        - Any combination!
+        """
+        import base64
+        import io
+        import tempfile
+        from PIL import Image
+        
+        images = []
+        
+        # Process first frame if provided
+        if first_frame_b64:
+            first_data = base64.b64decode(first_frame_b64)
+            first_image = Image.open(io.BytesIO(first_data)).convert("RGB")
+            first_image = first_image.resize((width, height), Image.Resampling.LANCZOS)
+            
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                first_image.save(tmp.name, "PNG")
+                first_path = tmp.name
+            
+            images.append((first_path, 0, 1.0))
+        
+        # Process last frame if provided
+        if last_frame_b64:
+            last_data = base64.b64decode(last_frame_b64)
+            last_image = Image.open(io.BytesIO(last_data)).convert("RGB")
+            last_image = last_image.resize((width, height), Image.Resampling.LANCZOS)
+            
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                last_image.save(tmp.name, "PNG")
+                last_path = tmp.name
+            
+            images.append((last_path, num_frames - 1, 1.0))
+        
+        # If audio is provided, use audio-conditioned generation
+        if audio_b64:
+            audio_data = base64.b64decode(audio_b64)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(audio_data)
+                audio_path = tmp.name
+            
+            video_duration = num_frames / frame_rate
+            audio_latent = self._encode_audio(audio_path, video_duration)
+            
+            return self._generate_with_audio(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                images=images,
+                audio_latent=audio_latent,
+                output_name=output_name,
+                audio_conditioning_strength=audio_conditioning_strength,
+            )
+        else:
+            # Standard generation without audio
+            return self._generate(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                images=images,
+                output_name=output_name,
+            )
+
+    @modal.method()
     def generate_t2v(
         self,
         prompt: str,
@@ -866,7 +956,7 @@ class OfficialLTX2Engine:
         frame_rate: float = 30.0,
         output_name: str = "t2v_output.mp4",
     ) -> bytes:
-        """Generate video from text prompt (Text-to-Video)."""
+        """Generate video from text prompt (Text-to-Video). [DEPRECATED: Use generate() instead]"""
         return self._generate(
             prompt=prompt,
             seed=seed,
@@ -1079,7 +1169,7 @@ class T2VRequest(BaseModel):
 @app.function(timeout=900)
 @modal.asgi_app()
 def web():
-    """FastAPI web endpoint with UI for T2V and I2V generation."""
+    """FastAPI web endpoint with unified UI for video generation."""
     import base64
     
     web_app = FastAPI(title="LTX-2 Video Generation API")
@@ -1093,7 +1183,7 @@ def web():
 
     @web_app.get("/", response_class=HTMLResponse)
     async def index():
-        """Serve the web UI."""
+        """Serve the unified web UI."""
         return HTMLResponse("""
 <!DOCTYPE html>
 <html lang="en">
@@ -1110,10 +1200,7 @@ def web():
             color: #e0e0e0;
             padding: 2rem;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+        .container { max-width: 1200px; margin: 0 auto; }
         h1 {
             font-size: 2.5rem;
             font-weight: 700;
@@ -1122,32 +1209,7 @@ def web():
             -webkit-text-fill-color: transparent;
             margin-bottom: 0.5rem;
         }
-        .subtitle {
-            color: #888;
-            margin-bottom: 2rem;
-            font-size: 1.1rem;
-        }
-        .tabs {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 2rem;
-        }
-        .tab {
-            padding: 0.75rem 1.5rem;
-            border: 2px solid #333;
-            border-radius: 12px;
-            background: transparent;
-            color: #888;
-            cursor: pointer;
-            font-size: 1rem;
-            transition: all 0.2s;
-        }
-        .tab:hover { border-color: #555; color: #fff; }
-        .tab.active {
-            border-color: #7b2fff;
-            background: rgba(123, 47, 255, 0.15);
-            color: #fff;
-        }
+        .subtitle { color: #888; margin-bottom: 2rem; font-size: 1.1rem; }
         .grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -1160,20 +1222,11 @@ def web():
             border-radius: 16px;
             padding: 1.5rem;
         }
-        .card h2 {
-            font-size: 1.25rem;
-            margin-bottom: 1.5rem;
-            color: #fff;
-        }
-        label {
-            display: block;
-            font-size: 0.875rem;
-            color: #888;
-            margin-bottom: 0.5rem;
-            margin-top: 1rem;
-        }
+        .card h2 { font-size: 1.25rem; margin-bottom: 1rem; color: #fff; }
+        .card h3 { font-size: 1rem; margin: 1.5rem 0 0.75rem; color: #7b2fff; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+        label { display: block; font-size: 0.875rem; color: #888; margin-bottom: 0.5rem; margin-top: 1rem; }
         label:first-of-type { margin-top: 0; }
-        input[type="text"], input[type="number"], textarea, select {
+        input[type="text"], input[type="number"], textarea {
             width: 100%;
             padding: 0.75rem 1rem;
             border: 1px solid #333;
@@ -1181,33 +1234,28 @@ def web():
             background: rgba(0, 0, 0, 0.3);
             color: #fff;
             font-size: 1rem;
-            transition: border-color 0.2s;
         }
-        input:focus, textarea:focus, select:focus {
-            outline: none;
-            border-color: #7b2fff;
-        }
-        textarea { resize: vertical; min-height: 100px; }
+        input:focus, textarea:focus { outline: none; border-color: #7b2fff; }
+        textarea { resize: vertical; min-height: 80px; }
         .row { display: flex; gap: 1rem; }
         .row > * { flex: 1; }
         .dropzone {
             border: 2px dashed #333;
             border-radius: 12px;
-            padding: 2rem;
+            padding: 1.5rem;
             text-align: center;
             cursor: pointer;
             transition: all 0.2s;
             margin-top: 0.5rem;
+            min-height: 100px;
         }
         .dropzone:hover { border-color: #7b2fff; background: rgba(123, 47, 255, 0.05); }
         .dropzone.dragover { border-color: #00d4ff; background: rgba(0, 212, 255, 0.1); }
-        .dropzone img {
-            max-width: 100%;
-            max-height: 200px;
-            border-radius: 8px;
-            margin-top: 1rem;
-        }
-        .dropzone p { color: #666; }
+        .dropzone.has-file { border-color: #00ff88; border-style: solid; }
+        .dropzone img { max-width: 100%; max-height: 120px; border-radius: 8px; margin-top: 0.5rem; }
+        .dropzone p { color: #666; font-size: 0.9rem; }
+        .dropzone .filename { color: #00ff88; font-size: 0.85rem; margin-top: 0.5rem; }
+        .dropzone .clear { color: #ff4444; font-size: 0.75rem; cursor: pointer; margin-top: 0.25rem; }
         input[type="file"] { display: none; }
         button.generate {
             width: 100%;
@@ -1237,12 +1285,7 @@ def web():
         .status.visible { display: block; }
         .status.error { border-left: 3px solid #ff4444; }
         .status.success { border-left: 3px solid #00ff88; }
-        video {
-            width: 100%;
-            border-radius: 12px;
-            background: #000;
-            margin-top: 1rem;
-        }
+        video { width: 100%; border-radius: 12px; background: #000; margin-top: 1rem; }
         .download {
             display: inline-block;
             margin-top: 1rem;
@@ -1252,10 +1295,24 @@ def web():
             color: #00d4ff;
             text-decoration: none;
             font-weight: 500;
-            transition: background 0.2s;
         }
         .download:hover { background: rgba(0, 212, 255, 0.3); }
         .hidden { display: none !important; }
+        .optional-tag { color: #666; font-size: 0.75rem; font-weight: normal; }
+        .conditioning-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        @media (max-width: 600px) { .conditioning-row { grid-template-columns: 1fr; } }
+        .slider-container { margin-top: 1rem; }
+        .slider-container input[type="range"] { width: 100%; margin-top: 0.5rem; }
+        .slider-hint { color: #666; font-size: 0.75rem; margin-top: 0.25rem; }
+        .mode-indicator {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            background: rgba(123, 47, 255, 0.2);
+            border-radius: 20px;
+            font-size: 0.8rem;
+            color: #7b2fff;
+            margin-bottom: 1rem;
+        }
     </style>
 </head>
 <body>
@@ -1263,63 +1320,53 @@ def web():
         <h1>LTX-2 Video Generation</h1>
         <p class="subtitle">19B parameter model • 8-step distilled • FP8 inference on H100</p>
         
-        <div class="tabs">
-            <button class="tab active" data-mode="t2v">Text to Video</button>
-            <button class="tab" data-mode="i2v">Image to Video</button>
-            <button class="tab" data-mode="fl2v">First + Last Frame</button>
-            <button class="tab" data-mode="a2v">Audio to Video</button>
-        </div>
-        
         <div class="grid">
             <div class="card">
-                <h2>Input</h2>
+                <h2>Generation Settings</h2>
+                <div class="mode-indicator" id="mode-indicator">Text-to-Video</div>
                 
-                <div id="image-input" class="hidden">
-                    <label>Starting Image</label>
-                    <div class="dropzone" id="dropzone">
-                        <p>Drop image here or click to upload</p>
-                        <img id="preview" class="hidden" />
-                    </div>
-                    <input type="file" id="file" accept="image/*" />
-                </div>
-                
-                <div id="last-image-input" class="hidden">
-                    <label>Ending Image</label>
-                    <div class="dropzone" id="dropzone-last">
-                        <p>Drop last frame image here</p>
-                        <img id="preview-last" class="hidden" />
-                    </div>
-                    <input type="file" id="file-last" accept="image/*" />
-                </div>
-                
-                <div id="audio-input" class="hidden">
-                    <label>Audio File (WAV, MP3)</label>
-                    <div class="dropzone" id="dropzone-audio">
-                        <p>🎵 Drop audio here or click to upload</p>
-                        <span id="audio-name" class="hidden"></span>
-                    </div>
-                    <input type="file" id="file-audio" accept="audio/*" />
-                    <p style="color: #666; font-size: 0.8rem; margin-top: 0.5rem;">Audio will be synced with the generated video</p>
-                </div>
-                
-                <div id="audio-image-input" class="hidden">
-                    <label>Optional: Starting Image</label>
-                    <div class="dropzone" id="dropzone-audio-image">
-                        <p>Drop image for I2V+A2V combined conditioning (optional)</p>
-                        <img id="preview-audio-image" class="hidden" />
-                    </div>
-                    <input type="file" id="file-audio-image" accept="image/*" />
-                </div>
-                
-                <div id="audio-strength-input" class="hidden">
-                    <label>Audio Conditioning Strength: <span id="strength-value">0.3</span></label>
-                    <input type="range" id="audio-strength" min="0" max="1" step="0.1" value="0.3" style="width: 100%;" />
-                    <p style="color: #666; font-size: 0.75rem; margin-top: 0.25rem;">0.0 = preserve audio exactly (weak conditioning) • 1.0 = full diffusion (may have artifacts)</p>
-                </div>
-                
-                <label>Prompt</label>
+                <label>Prompt <span style="color: #ff2daa;">*</span></label>
                 <textarea id="prompt" placeholder="Describe the video you want to generate...">A majestic eagle soaring through a golden sunset sky, cinematic lighting, smooth motion</textarea>
                 
+                <h3>🖼️ Image Conditioning <span class="optional-tag">(optional)</span></h3>
+                <div class="conditioning-row">
+                    <div>
+                        <label>First Frame</label>
+                        <div class="dropzone" id="dropzone-first">
+                            <p>Drop image or click</p>
+                            <img id="preview-first" class="hidden" />
+                            <div class="filename hidden" id="filename-first"></div>
+                            <div class="clear hidden" id="clear-first">✕ Remove</div>
+                        </div>
+                        <input type="file" id="file-first" accept="image/*" />
+                    </div>
+                    <div>
+                        <label>Last Frame</label>
+                        <div class="dropzone" id="dropzone-last">
+                            <p>Drop image or click</p>
+                            <img id="preview-last" class="hidden" />
+                            <div class="filename hidden" id="filename-last"></div>
+                            <div class="clear hidden" id="clear-last">✕ Remove</div>
+                        </div>
+                        <input type="file" id="file-last" accept="image/*" />
+                    </div>
+                </div>
+                
+                <h3>🎵 Audio Conditioning <span class="optional-tag">(optional)</span></h3>
+                <div class="dropzone" id="dropzone-audio">
+                    <p>🎵 Drop audio file (WAV, MP3) or click</p>
+                    <div class="filename hidden" id="filename-audio"></div>
+                    <div class="clear hidden" id="clear-audio">✕ Remove</div>
+                </div>
+                <input type="file" id="file-audio" accept="audio/*" />
+                
+                <div class="slider-container hidden" id="audio-strength-container">
+                    <label>Audio Conditioning Strength: <span id="strength-value">0.3</span></label>
+                    <input type="range" id="audio-strength" min="0" max="1" step="0.1" value="0.3" />
+                    <div class="slider-hint">0.0 = preserve audio (weak conditioning) → 1.0 = full diffusion (may have artifacts)</div>
+                </div>
+                
+                <h3>⚙️ Video Settings</h3>
                 <div class="row">
                     <div>
                         <label>Width</label>
@@ -1330,7 +1377,6 @@ def web():
                         <input type="number" id="height" value="512" step="64" min="256" max="1080" />
                     </div>
                 </div>
-                
                 <div class="row">
                     <div>
                         <label>Frames</label>
@@ -1356,126 +1402,90 @@ def web():
     
     <script>
         const $ = id => document.getElementById(id);
-        let mode = 't2v';
-        let imageData = null;
-        let lastImageData = null;
+        
+        // State
+        let firstFrameData = null;
+        let lastFrameData = null;
         let audioData = null;
-        let audioImageData = null;
         
-        // Tab switching
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                tab.classList.add('active');
-                mode = tab.dataset.mode;
-                $('image-input').classList.toggle('hidden', mode === 't2v' || mode === 'a2v');
-                $('last-image-input').classList.toggle('hidden', mode !== 'fl2v');
-                $('audio-input').classList.toggle('hidden', mode !== 'a2v');
-                $('audio-image-input').classList.toggle('hidden', mode !== 'a2v');
-                $('audio-strength-input').classList.toggle('hidden', mode !== 'a2v');
+        // Update mode indicator based on what's selected
+        function updateMode() {
+            const hasFirst = !!firstFrameData;
+            const hasLast = !!lastFrameData;
+            const hasAudio = !!audioData;
+            
+            let mode = 'Text-to-Video';
+            if (hasAudio && hasFirst) mode = 'Image + Audio → Video';
+            else if (hasAudio) mode = 'Audio-to-Video';
+            else if (hasFirst && hasLast) mode = 'First + Last Frame → Video';
+            else if (hasFirst) mode = 'Image-to-Video';
+            
+            $('mode-indicator').textContent = mode;
+            
+            // Show/hide audio strength slider
+            $('audio-strength-container').classList.toggle('hidden', !hasAudio);
+        }
+        
+        // Generic dropzone setup
+        function setupDropzone(dropzoneId, fileInputId, previewId, filenameId, clearId, type, onData) {
+            const dropzone = $(dropzoneId);
+            const fileInput = $(fileInputId);
+            const preview = previewId ? $(previewId) : null;
+            const filename = $(filenameId);
+            const clear = $(clearId);
+            
+            dropzone.addEventListener('click', (e) => {
+                if (e.target !== clear) fileInput.click();
             });
-        });
-        
-        // First image drag and drop
-        const dropzone = $('dropzone');
-        const fileInput = $('file');
-        const preview = $('preview');
-        
-        dropzone.addEventListener('click', () => fileInput.click());
-        dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
-        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
-        dropzone.addEventListener('drop', e => {
-            e.preventDefault();
-            dropzone.classList.remove('dragover');
-            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], 'first');
-        });
-        fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0], 'first'); });
-        
-        // Last image drag and drop
-        const dropzoneLast = $('dropzone-last');
-        const fileInputLast = $('file-last');
-        const previewLast = $('preview-last');
-        
-        dropzoneLast.addEventListener('click', () => fileInputLast.click());
-        dropzoneLast.addEventListener('dragover', e => { e.preventDefault(); dropzoneLast.classList.add('dragover'); });
-        dropzoneLast.addEventListener('dragleave', () => dropzoneLast.classList.remove('dragover'));
-        dropzoneLast.addEventListener('drop', e => {
-            e.preventDefault();
-            dropzoneLast.classList.remove('dragover');
-            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], 'last');
-        });
-        fileInputLast.addEventListener('change', () => { if (fileInputLast.files.length) handleFile(fileInputLast.files[0], 'last'); });
-        
-        // Audio file drag and drop
-        const dropzoneAudio = $('dropzone-audio');
-        const fileInputAudio = $('file-audio');
-        const audioName = $('audio-name');
-        
-        dropzoneAudio.addEventListener('click', () => fileInputAudio.click());
-        dropzoneAudio.addEventListener('dragover', e => { e.preventDefault(); dropzoneAudio.classList.add('dragover'); });
-        dropzoneAudio.addEventListener('dragleave', () => dropzoneAudio.classList.remove('dragover'));
-        dropzoneAudio.addEventListener('drop', e => {
-            e.preventDefault();
-            dropzoneAudio.classList.remove('dragover');
-            if (e.dataTransfer.files.length) handleAudioFile(e.dataTransfer.files[0]);
-        });
-        fileInputAudio.addEventListener('change', () => { if (fileInputAudio.files.length) handleAudioFile(fileInputAudio.files[0]); });
-        
-        // Audio optional image
-        const dropzoneAudioImage = $('dropzone-audio-image');
-        const fileInputAudioImage = $('file-audio-image');
-        const previewAudioImage = $('preview-audio-image');
-        
-        dropzoneAudioImage.addEventListener('click', () => fileInputAudioImage.click());
-        dropzoneAudioImage.addEventListener('dragover', e => { e.preventDefault(); dropzoneAudioImage.classList.add('dragover'); });
-        dropzoneAudioImage.addEventListener('dragleave', () => dropzoneAudioImage.classList.remove('dragover'));
-        dropzoneAudioImage.addEventListener('drop', e => {
-            e.preventDefault();
-            dropzoneAudioImage.classList.remove('dragover');
-            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], 'audio-image');
-        });
-        fileInputAudioImage.addEventListener('change', () => { if (fileInputAudioImage.files.length) handleFile(fileInputAudioImage.files[0], 'audio-image'); });
-        
-        function handleFile(file, which) {
-            const reader = new FileReader();
-            reader.onload = e => {
-                const b64 = e.target.result.split(',')[1];
-                if (which === 'first') {
-                    imageData = b64;
-                    preview.src = e.target.result;
-                    preview.classList.remove('hidden');
-                    dropzone.querySelector('p').textContent = file.name;
-                } else if (which === 'last') {
-                    lastImageData = b64;
-                    previewLast.src = e.target.result;
-                    previewLast.classList.remove('hidden');
-                    dropzoneLast.querySelector('p').textContent = file.name;
-                } else if (which === 'audio-image') {
-                    audioImageData = b64;
-                    previewAudioImage.src = e.target.result;
-                    previewAudioImage.classList.remove('hidden');
-                    dropzoneAudioImage.querySelector('p').textContent = file.name;
-                }
-            };
-            reader.readAsDataURL(file);
+            dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+            dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+            dropzone.addEventListener('drop', e => {
+                e.preventDefault();
+                dropzone.classList.remove('dragover');
+                if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+            });
+            fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+            
+            clear.addEventListener('click', (e) => {
+                e.stopPropagation();
+                onData(null);
+                dropzone.classList.remove('has-file');
+                dropzone.querySelector('p').classList.remove('hidden');
+                if (preview) { preview.classList.add('hidden'); preview.src = ''; }
+                filename.classList.add('hidden');
+                clear.classList.add('hidden');
+                fileInput.value = '';
+                updateMode();
+            });
+            
+            function handleFile(file) {
+                const reader = new FileReader();
+                reader.onload = e => {
+                    const b64 = e.target.result.split(',')[1];
+                    onData(b64);
+                    dropzone.classList.add('has-file');
+                    dropzone.querySelector('p').classList.add('hidden');
+                    if (preview && type === 'image') {
+                        preview.src = e.target.result;
+                        preview.classList.remove('hidden');
+                    }
+                    filename.textContent = (type === 'audio' ? '🎵 ' : '') + file.name;
+                    filename.classList.remove('hidden');
+                    clear.classList.remove('hidden');
+                    updateMode();
+                };
+                reader.readAsDataURL(file);
+            }
         }
         
-        function handleAudioFile(file) {
-            const reader = new FileReader();
-            reader.onload = e => {
-                audioData = e.target.result.split(',')[1];
-                audioName.textContent = '🎵 ' + file.name;
-                audioName.classList.remove('hidden');
-                dropzoneAudio.querySelector('p').textContent = file.name;
-            };
-            reader.readAsDataURL(file);
-        }
+        // Setup all dropzones
+        setupDropzone('dropzone-first', 'file-first', 'preview-first', 'filename-first', 'clear-first', 'image', d => firstFrameData = d);
+        setupDropzone('dropzone-last', 'file-last', 'preview-last', 'filename-last', 'clear-last', 'image', d => lastFrameData = d);
+        setupDropzone('dropzone-audio', 'file-audio', null, 'filename-audio', 'clear-audio', 'audio', d => audioData = d);
         
         // Audio strength slider
-        const audioStrength = $('audio-strength');
-        const strengthValue = $('strength-value');
-        audioStrength.addEventListener('input', () => {
-            strengthValue.textContent = audioStrength.value;
+        $('audio-strength').addEventListener('input', () => {
+            $('strength-value').textContent = $('audio-strength').value;
         });
         
         // Generate
@@ -1485,67 +1495,41 @@ def web():
             const video = $('video');
             const dl = $('download');
             
+            if (!$('prompt').value.trim()) {
+                status.className = 'status visible error';
+                status.textContent = 'Error: Please enter a prompt';
+                return;
+            }
+            
             btn.disabled = true;
             status.className = 'status visible';
             status.textContent = 'Starting generation...';
             video.removeAttribute('src');
             dl.classList.add('hidden');
             
-            const params = {
-                prompt: $('prompt').value,
-                width: parseInt($('width').value),
-                height: parseInt($('height').value),
-                num_frames: parseInt($('frames').value),
-                seed: parseInt($('seed').value),
-            };
-            
             try {
                 const t0 = performance.now();
-                let resp;
                 
-                if (mode === 'a2v') {
-                    if (!audioData) throw new Error('Please upload an audio file');
-                    const fd = new FormData();
-                    fd.append('audio', await fetch(`data:audio/wav;base64,${audioData}`).then(r => r.blob()), 'audio.wav');
-                    if (audioImageData) {
-                        fd.append('image', await fetch(`data:image/png;base64,${audioImageData}`).then(r => r.blob()), 'image.png');
-                    }
-                    fd.append('prompt', params.prompt);
-                    fd.append('width', params.width);
-                    fd.append('height', params.height);
-                    fd.append('num_frames', params.num_frames);
-                    fd.append('seed', params.seed);
-                    fd.append('audio_conditioning_strength', $('audio-strength').value);
-                    resp = await fetch('/api/a2v', { method: 'POST', body: fd });
-                } else if (mode === 'fl2v') {
-                    if (!imageData) throw new Error('Please upload a first frame image');
-                    if (!lastImageData) throw new Error('Please upload a last frame image');
-                    const fd = new FormData();
-                    fd.append('first_image', await fetch(`data:image/png;base64,${imageData}`).then(r => r.blob()), 'first.png');
-                    fd.append('last_image', await fetch(`data:image/png;base64,${lastImageData}`).then(r => r.blob()), 'last.png');
-                    fd.append('prompt', params.prompt);
-                    fd.append('width', params.width);
-                    fd.append('height', params.height);
-                    fd.append('num_frames', params.num_frames);
-                    fd.append('seed', params.seed);
-                    resp = await fetch('/api/fl2v', { method: 'POST', body: fd });
-                } else if (mode === 'i2v') {
-                    if (!imageData) throw new Error('Please upload an image first');
-                    const fd = new FormData();
-                    fd.append('image', await fetch(`data:image/png;base64,${imageData}`).then(r => r.blob()), 'image.png');
-                    fd.append('prompt', params.prompt);
-                    fd.append('width', params.width);
-                    fd.append('height', params.height);
-                    fd.append('num_frames', params.num_frames);
-                    fd.append('seed', params.seed);
-                    resp = await fetch('/api/i2v', { method: 'POST', body: fd });
-                } else {
-                    resp = await fetch('/api/t2v', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(params)
-                    });
+                // Build form data with all conditionings
+                const fd = new FormData();
+                fd.append('prompt', $('prompt').value);
+                fd.append('width', $('width').value);
+                fd.append('height', $('height').value);
+                fd.append('num_frames', $('frames').value);
+                fd.append('seed', $('seed').value);
+                
+                if (firstFrameData) {
+                    fd.append('first_frame', await fetch(`data:image/png;base64,${firstFrameData}`).then(r => r.blob()), 'first.png');
                 }
+                if (lastFrameData) {
+                    fd.append('last_frame', await fetch(`data:image/png;base64,${lastFrameData}`).then(r => r.blob()), 'last.png');
+                }
+                if (audioData) {
+                    fd.append('audio', await fetch(`data:audio/wav;base64,${audioData}`).then(r => r.blob()), 'audio.wav');
+                    fd.append('audio_conditioning_strength', $('audio-strength').value);
+                }
+                
+                const resp = await fetch('/api/generate', { method: 'POST', body: fd });
                 
                 if (!resp.ok) {
                     const err = await resp.text();
@@ -1555,13 +1539,14 @@ def web():
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const dt = ((performance.now() - t0) / 1000).toFixed(1);
+                const numFrames = parseInt($('frames').value);
                 
                 video.src = url;
                 dl.href = url;
                 dl.classList.remove('hidden');
                 
                 status.className = 'status visible success';
-                status.textContent = `Done in ${dt}s • ${params.num_frames} frames @ ${(params.num_frames / parseFloat(dt)).toFixed(1)} fps`;
+                status.textContent = `Done in ${dt}s • ${numFrames} frames @ ${(numFrames / parseFloat(dt)).toFixed(1)} fps`;
             } catch (e) {
                 status.className = 'status visible error';
                 status.textContent = 'Error: ' + e.message;
@@ -1574,9 +1559,64 @@ def web():
 </html>
         """)
 
+    @web_app.post("/api/generate")
+    async def api_generate(
+        prompt: str = Form(...),
+        width: int = Form(768),
+        height: int = Form(512),
+        num_frames: int = Form(97),
+        seed: int = Form(42),
+        first_frame: UploadFile = File(None),
+        last_frame: UploadFile = File(None),
+        audio: UploadFile = File(None),
+        audio_conditioning_strength: float = Form(0.3),
+    ):
+        """Unified video generation endpoint supporting all conditioning combinations."""
+        try:
+            import base64
+            
+            # Process optional first frame
+            first_frame_b64 = None
+            if first_frame:
+                data = await first_frame.read()
+                if data:
+                    first_frame_b64 = base64.b64encode(data).decode()
+            
+            # Process optional last frame
+            last_frame_b64 = None
+            if last_frame:
+                data = await last_frame.read()
+                if data:
+                    last_frame_b64 = base64.b64encode(data).decode()
+            
+            # Process optional audio
+            audio_b64 = None
+            if audio:
+                data = await audio.read()
+                if data:
+                    audio_b64 = base64.b64encode(data).decode()
+            
+            engine = OfficialLTX2Engine()
+            video_bytes = engine.generate.remote(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=30.0,
+                first_frame_b64=first_frame_b64,
+                last_frame_b64=last_frame_b64,
+                audio_b64=audio_b64,
+                audio_conditioning_strength=audio_conditioning_strength,
+            )
+            return Response(content=video_bytes, media_type="video/mp4")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Legacy endpoints (kept for backwards compatibility)
     @web_app.post("/api/t2v")
     async def api_t2v(req: T2VRequest):
-        """Text-to-Video API endpoint."""
+        """Text-to-Video API endpoint. [DEPRECATED: Use /api/generate instead]"""
         try:
             engine = OfficialLTX2Engine()
             video_bytes = engine.generate_t2v.remote(

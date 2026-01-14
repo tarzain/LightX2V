@@ -86,8 +86,8 @@ image = (
 
 app = modal.App("ltx2-official-distilled", image=image)
 
-# Global variable for audio conditioning (survives snapshot restore)
-_AUDIO_CONDITIONING_LATENT = None
+# Global state for conditioning (using a dict for reliable access)
+_CONDITIONING_STATE = {"audio_latent": None}
 
 
 @app.function(
@@ -387,61 +387,10 @@ class OfficialLTX2Engine:
     
     def _patch_pipeline_for_audio(self):
         """
-        Patch the pipeline to support audio conditioning.
-        
-        This allows passing initial_audio_latent to denoise_audio_video,
-        which conditions the video generation on the input audio.
+        Audio conditioning is now handled directly in _generate_with_audio.
+        This method is kept for compatibility but doesn't patch anything.
         """
-        import ltx_pipelines.utils.helpers as helpers_module
-        import ltx_pipelines.distilled as distilled_module
-        
-        # Store original denoise_audio_video function
-        original_denoise_av = helpers_module.denoise_audio_video
-        
-        def patched_denoise_audio_video(
-            output_shape,
-            conditionings,
-            noiser,
-            sigmas,
-            stepper,
-            denoising_loop_fn,
-            components,
-            dtype,
-            device,
-            noise_scale=1.0,
-            initial_video_latent=None,
-            initial_audio_latent=None,
-        ):
-            # Check if we have audio latent stored in the global variable
-            # Use sys.modules to reliably access the module's global state
-            import sys
-            current_module = sys.modules.get('__main__') or sys.modules.get('ltx2_official_modal')
-            audio_latent = getattr(current_module, '_AUDIO_CONDITIONING_LATENT', None) if current_module else None
-            print(f"   [DEBUG] Audio conditioning check: module={current_module.__name__ if current_module else 'None'}, latent={'present' if audio_latent is not None else 'None'}")
-            if audio_latent is not None:
-                print(f"   A2V: Using audio conditioning! Latent shape: {audio_latent.shape}")
-                initial_audio_latent = audio_latent
-            
-            return original_denoise_av(
-                output_shape=output_shape,
-                conditionings=conditionings,
-                noiser=noiser,
-                sigmas=sigmas,
-                stepper=stepper,
-                denoising_loop_fn=denoising_loop_fn,
-                components=components,
-                dtype=dtype,
-                device=device,
-                noise_scale=noise_scale,
-                initial_video_latent=initial_video_latent,
-                initial_audio_latent=initial_audio_latent,
-            )
-        
-        # Monkey-patch in both places
-        helpers_module.denoise_audio_video = patched_denoise_audio_video
-        distilled_module.denoise_audio_video = patched_denoise_audio_video
-        
-        print("   Audio conditioning patch applied!")
+        print("   Audio conditioning: Using direct injection method")
     
     def _encode_audio(self, audio_path: str, target_duration_seconds: float):
         """
@@ -601,6 +550,311 @@ class OfficialLTX2Engine:
         
         return video_bytes
 
+    def _generate_with_audio(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list,
+        audio_latent,
+        output_name: str,
+        audio_conditioning_strength: float = 0.3,
+    ) -> bytes:
+        """
+        Generation with audio conditioning.
+        
+        This method directly calls the internal pipeline components to inject
+        the audio latent into the denoising process.
+        """
+        import gc
+        import torch
+        from ltx_core.components.diffusion_steps import EulerDiffusionStep
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+        from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+        from ltx_core.model.upsampler import upsample_video
+        from ltx_core.text_encoders.gemma import encode_text
+        from ltx_core.types import VideoPixelShape
+        from ltx_pipelines.utils.constants import (
+            AUDIO_SAMPLE_RATE,
+            DISTILLED_SIGMA_VALUES,
+            STAGE_2_DISTILLED_SIGMA_VALUES,
+        )
+        from ltx_pipelines.utils.helpers import (
+            denoise_audio_video,
+            euler_denoising_loop,
+            image_conditionings_by_replacing_latent,
+            noise_video_state,
+            noise_audio_state,
+            simple_denoising_func,
+        )
+        from ltx_pipelines.utils.media_io import encode_video
+
+        print(f"   A2V: Generating with audio conditioning, latent shape: {audio_latent.shape}")
+        print(f"   A2V: Audio conditioning strength: {audio_conditioning_strength} (0.0=preserve, 1.0=full diffusion)")
+        
+        tiling_config = TilingConfig.default()
+        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+        
+        with torch.inference_mode():
+            device = self.pipeline.device
+            dtype = torch.bfloat16
+            
+            generator = torch.Generator(device=device).manual_seed(seed)
+            noiser = GaussianNoiser(generator=generator)
+            stepper = EulerDiffusionStep()
+            
+            # Use cached models (preloaded during snapshot)
+            text_encoder = self._text_encoder
+            video_encoder = self._video_encoder
+            transformer = self._transformer
+            
+            # Encode text
+            context_p = encode_text(text_encoder, prompts=[prompt])[0]
+            video_context, audio_context = context_p
+            
+            # Stage 1: Generate at half resolution with audio conditioning
+            stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            
+            def denoising_loop(sigmas, video_state, audio_state, stepper):
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=video_context,
+                        audio_context=audio_context,
+                        transformer=transformer,
+                    ),
+                )
+            
+            stage_1_output_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width // 2,
+                height=height // 2,
+                fps=frame_rate,
+            )
+            
+            # Image conditioning (only if we have images)
+            if len(images) > 0:
+                stage_1_conditionings = image_conditionings_by_replacing_latent(
+                    images=images,
+                    height=height // 2,
+                    width=width // 2,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                stage_1_conditionings = ()  # Empty tuple for no conditioning
+            
+            # Compute expected audio latent shape and resize if needed
+            from ltx_core.types import AudioLatentShape
+            expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_1_output_shape)
+            expected_frames = expected_audio_shape.frames
+            actual_frames = audio_latent.shape[2]
+            
+            if actual_frames != expected_frames:
+                print(f"   A2V: Resizing audio latent from {actual_frames} to {expected_frames} frames")
+                # Audio latent shape is [B, C, T, H] = [1, 8, 251, 16]
+                # We need to resize T (dimension 2) from 251 to 250
+                # interpolate works on last 2 dims, so we need to reshape
+                B, C, T, H = audio_latent.shape
+                # Reshape to [B*C, 1, T, H] for 2D interpolation
+                audio_flat = audio_latent.reshape(B * C, 1, T, H)
+                audio_resized = torch.nn.functional.interpolate(
+                    audio_flat,
+                    size=(expected_frames, H),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                audio_latent_resized = audio_resized.reshape(B, C, expected_frames, H)
+            else:
+                audio_latent_resized = audio_latent
+            
+            # Stage 1 denoising WITH audio latent
+            # Use different noise scales for video and audio:
+            # - Video: noise_scale=1.0 (generated from scratch, full noise)
+            # - Audio: noise_scale=audio_conditioning_strength (0.0=preserve, 1.0=full diffusion)
+            # Lower values preserve more of the original audio but may have weaker conditioning.
+            # Higher values allow stronger audio-video synchronization but may introduce artifacts.
+            print(f"   A2V: Stage 1 - Initializing video (noise_scale=1.0) and audio (noise_scale={audio_conditioning_strength})...")
+            
+            # Initialize video state with full noise (generated from scratch)
+            video_state, video_tools = noise_video_state(
+                output_shape=stage_1_output_shape,
+                noiser=noiser,
+                conditionings=stage_1_conditionings,
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=1.0,  # Full noise for video
+                initial_latent=None,  # Start from pure noise
+            )
+            
+            # Initialize audio state with configurable noise level
+            audio_state, audio_tools = noise_audio_state(
+                output_shape=stage_1_output_shape,
+                noiser=noiser,
+                conditionings=[],  # No audio conditionings
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=audio_conditioning_strength,  # Configurable: 0.0=preserve, 1.0=full noise
+                initial_latent=audio_latent_resized,  # Our encoded audio
+            )
+            
+            print(f"   A2V: Stage 1 - Running denoising loop with preserved audio...")
+            # Run the denoising loop
+            video_state, audio_state = denoising_loop(
+                stage_1_sigmas,
+                video_state,
+                audio_state,
+                stepper,
+            )
+            
+            # Clear conditioning and unpatchify (same as denoise_audio_video does)
+            video_state = video_tools.clear_conditioning(video_state)
+            video_state = video_tools.unpatchify(video_state)
+            audio_state = audio_tools.clear_conditioning(audio_state)
+            audio_state = audio_tools.unpatchify(audio_state)
+            
+            # Stage 2: Upsample and refine
+            print("   A2V: Stage 2 upsampling...")
+            spatial_upsampler = self._spatial_upsampler
+            stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+            
+            stage_2_output_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width,
+                height=height,
+                fps=frame_rate,
+            )
+            
+            # Upsample video latent
+            upsampled_video = upsample_video(
+                latent=video_state.latent[:1],
+                video_encoder=video_encoder,
+                upsampler=spatial_upsampler,
+            )
+            
+            if len(images) > 0:
+                stage_2_conditionings = image_conditionings_by_replacing_latent(
+                    images=images,
+                    height=height,
+                    width=width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                stage_2_conditionings = ()  # Empty tuple for no conditioning
+            
+            # Stage 2: Continue with consistent noise scales
+            # - Video: noise_scale=stage_2_sigmas[0] (partial noise for refinement)
+            # - Audio: noise_scale based on conditioning strength (scaled down for refinement stage)
+            stage_2_audio_noise = audio_conditioning_strength * float(stage_2_sigmas[0].item())
+            print(f"   A2V: Stage 2 - Initializing upsampled video and audio (noise_scale={stage_2_audio_noise:.3f})...")
+            
+            video_state_2, video_tools_2 = noise_video_state(
+                output_shape=stage_2_output_shape,
+                noiser=noiser,
+                conditionings=stage_2_conditionings,
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=float(stage_2_sigmas[0].item()),  # Partial noise for refinement
+                initial_latent=upsampled_video,
+            )
+            
+            audio_state_2, audio_tools_2 = noise_audio_state(
+                output_shape=stage_2_output_shape,
+                noiser=noiser,
+                conditionings=[],
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=stage_2_audio_noise,  # Scaled noise for refinement
+                initial_latent=audio_state.latent,  # Audio from stage 1
+            )
+            
+            print(f"   A2V: Stage 2 - Running refinement denoising loop...")
+            video_state, audio_state = denoising_loop(
+                stage_2_sigmas,
+                video_state_2,
+                audio_state_2,
+                stepper,
+            )
+            
+            video_state = video_tools_2.clear_conditioning(video_state)
+            video_state = video_tools_2.unpatchify(video_state)
+            audio_state = audio_tools_2.clear_conditioning(audio_state)
+            audio_state = audio_tools_2.unpatchify(audio_state)
+            
+            # Decode video (returns a generator yielding frame batches)
+            print("   A2V: Decoding video...")
+            video_generator = vae_decode_video(
+                video_state.latent,
+                self._video_decoder,
+                tiling_config=tiling_config,
+            )
+            
+            # Decode audio based on conditioning strength
+            # - strength=0: Use original audio (no artifacts, weaker conditioning)
+            # - strength>0: Blend original and denoised for balance
+            if audio_conditioning_strength < 0.1:
+                # Very low strength: use original to avoid artifacts
+                print("   A2V: Decoding original input audio (strength < 0.1)...")
+                final_audio_latent = audio_latent_resized
+            else:
+                # Blend original and denoised audio latents for balance
+                # Higher strength = more denoised (better sync but more artifacts)
+                blend_factor = min(audio_conditioning_strength, 0.7)  # Cap at 0.7 to avoid severe artifacts
+                print(f"   A2V: Blending audio latents (original:{1-blend_factor:.1f} + denoised:{blend_factor:.1f})...")
+                final_audio_latent = (1 - blend_factor) * audio_latent_resized + blend_factor * audio_state.latent
+            
+            decoded_audio = vae_decode_audio(
+                final_audio_latent,
+                self._audio_decoder,
+                self._vocoder,
+            )
+            
+            # Use official encode_video function which handles color conversion correctly
+            out_path = f"/outputs/{output_name}"
+            
+            print("   A2V: Encoding video with audio...")
+            # encode_video expects:
+            # - video: generator yielding frame tensors
+            # - audio: tensor [C, samples]
+            # - output_path: str
+            # - fps: float
+            # - audio_sample_rate: int
+            encode_video(
+                video=video_generator,
+                audio=decoded_audio.squeeze(0),  # Remove batch dim
+                output_path=out_path,
+                fps=frame_rate,
+                audio_sample_rate=AUDIO_SAMPLE_RATE,
+                video_chunks_number=video_chunks_number,
+            )
+        
+        # Read the encoded video file
+        with open(out_path, "rb") as f:
+            video_bytes = f.read()
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        print("   A2V: Generation complete!")
+        return video_bytes
+
     @modal.method()
     def generate_t2v(
         self,
@@ -728,6 +982,7 @@ class OfficialLTX2Engine:
             output_name=output_name,
         )
 
+    # A2V method - version 3 with configurable audio conditioning strength
     @modal.method()
     def generate_a2v(
         self,
@@ -740,6 +995,7 @@ class OfficialLTX2Engine:
         frame_rate: float = 30.0,
         output_name: str = "a2v_output.mp4",
         image_b64: str | None = None,
+        audio_conditioning_strength: float = 0.3,  # 0.0 = preserve audio exactly, 1.0 = full diffusion
     ) -> bytes:
         """
         Generate video conditioned on audio (Audio-to-Video).
@@ -775,39 +1031,32 @@ class OfficialLTX2Engine:
         # Encode audio to latent
         audio_latent = self._encode_audio(audio_path, video_duration)
         
-        # Store in global variable for the patched denoise function to pick up
-        global _AUDIO_CONDITIONING_LATENT
-        _AUDIO_CONDITIONING_LATENT = audio_latent
-        
-        try:
-            # Handle optional image conditioning
-            images = []
-            if image_b64:
-                image_data = base64.b64decode(image_b64)
-                image = Image.open(io.BytesIO(image_data)).convert("RGB")
-                image = image.resize((width, height), Image.Resampling.LANCZOS)
-                
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    image.save(tmp.name, "PNG")
-                    image_path = tmp.name
-                
-                images = [(image_path, 0, 1.0)]
+        # Handle optional image conditioning
+        images = []
+        if image_b64:
+            image_data = base64.b64decode(image_b64)
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
             
-            result = self._generate(
-                prompt=prompt,
-                seed=seed,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                images=images,
-                output_name=output_name,
-            )
-        finally:
-            # Clear the audio latent after generation
-            _AUDIO_CONDITIONING_LATENT = None
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                image.save(tmp.name, "PNG")
+                image_path = tmp.name
+            
+            images = [(image_path, 0, 1.0)]
         
-        return result
+        # Use custom generation path that passes audio latent directly
+        return self._generate_with_audio(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            images=images,
+            audio_latent=audio_latent,
+            output_name=output_name,
+            audio_conditioning_strength=audio_conditioning_strength,
+        )
 
 
 # ============================================================================
@@ -1062,6 +1311,12 @@ def web():
                     <input type="file" id="file-audio-image" accept="image/*" />
                 </div>
                 
+                <div id="audio-strength-input" class="hidden">
+                    <label>Audio Conditioning Strength: <span id="strength-value">0.3</span></label>
+                    <input type="range" id="audio-strength" min="0" max="1" step="0.1" value="0.3" style="width: 100%;" />
+                    <p style="color: #666; font-size: 0.75rem; margin-top: 0.25rem;">0.0 = preserve audio exactly (weak conditioning) • 1.0 = full diffusion (may have artifacts)</p>
+                </div>
+                
                 <label>Prompt</label>
                 <textarea id="prompt" placeholder="Describe the video you want to generate...">A majestic eagle soaring through a golden sunset sky, cinematic lighting, smooth motion</textarea>
                 
@@ -1117,6 +1372,7 @@ def web():
                 $('last-image-input').classList.toggle('hidden', mode !== 'fl2v');
                 $('audio-input').classList.toggle('hidden', mode !== 'a2v');
                 $('audio-image-input').classList.toggle('hidden', mode !== 'a2v');
+                $('audio-strength-input').classList.toggle('hidden', mode !== 'a2v');
             });
         });
         
@@ -1215,6 +1471,13 @@ def web():
             reader.readAsDataURL(file);
         }
         
+        // Audio strength slider
+        const audioStrength = $('audio-strength');
+        const strengthValue = $('strength-value');
+        audioStrength.addEventListener('input', () => {
+            strengthValue.textContent = audioStrength.value;
+        });
+        
         // Generate
         $('generate').addEventListener('click', async () => {
             const btn = $('generate');
@@ -1252,6 +1515,7 @@ def web():
                     fd.append('height', params.height);
                     fd.append('num_frames', params.num_frames);
                     fd.append('seed', params.seed);
+                    fd.append('audio_conditioning_strength', $('audio-strength').value);
                     resp = await fetch('/api/a2v', { method: 'POST', body: fd });
                 } else if (mode === 'fl2v') {
                     if (!imageData) throw new Error('Please upload a first frame image');
@@ -1398,6 +1662,7 @@ def web():
         num_frames: int = Form(97),
         seed: int = Form(42),
         image: UploadFile = File(None),
+        audio_conditioning_strength: float = Form(0.3),
     ):
         """Audio-to-Video API endpoint."""
         try:
@@ -1422,6 +1687,7 @@ def web():
                 num_frames=num_frames,
                 frame_rate=30.0,
                 image_b64=image_b64,
+                audio_conditioning_strength=audio_conditioning_strength,
             )
             return Response(content=video_bytes, media_type="video/mp4")
         except Exception as e:

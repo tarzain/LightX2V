@@ -242,6 +242,10 @@ class OfficialLTX2Engine:
         
         torch.cuda.synchronize()
         print("   All models loaded!")
+        
+        # Apply patches after all models are loaded
+        print("   Patching ModelLedger to use cached models...")
+        self._patch_model_ledger(ledger)
     
     def _build_audio_encoder(self, ledger):
         """Build the audio encoder (not exposed in ModelLedger by default)."""
@@ -262,10 +266,6 @@ class OfficialLTX2Engine:
             device=ledger.device,
             dtype=ledger.dtype
         ).to(ledger.device).eval()
-        
-        # Monkey-patch the ModelLedger to return our cached models instead of reloading
-        print("   Patching ModelLedger to use cached models...")
-        self._patch_model_ledger(ledger)
     
     def _patch_model_ledger(self, ledger):
         """Patch ModelLedger methods to return cached models instead of reloading."""

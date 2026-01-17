@@ -1765,6 +1765,7 @@ class OfficialLTX2Engine:
             
             # Concatenate all segment videos using ffmpeg
             import subprocess
+            import os
             
             out_path = f"/outputs/{output_name}"
             
@@ -1774,44 +1775,56 @@ class OfficialLTX2Engine:
                 shutil.copy(segment_video_paths[0], out_path)
             else:
                 # Create concat file for ffmpeg
+                # First, trim each segment after the first to remove overlap
+                trimmed_paths = []
+                for i, path in enumerate(segment_video_paths):
+                    if i == 0:
+                        # First segment: use full video
+                        trimmed_paths.append(path)
+                    else:
+                        # Subsequent segments: skip overlap frames at the start
+                        trim_seconds = overlap_frames / frame_rate
+                        trimmed_path = f"/tmp/rolling_segment_{i}_trimmed.mp4"
+                        # Re-encode to ensure clean timestamps
+                        result = subprocess.run([
+                            "ffmpeg", "-y", "-i", path,
+                            "-ss", str(trim_seconds),
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                            "-c:a", "aac", "-b:a", "128k",
+                            "-r", str(int(frame_rate)),  # Force frame rate
+                            trimmed_path
+                        ], capture_output=True)
+                        if result.returncode != 0:
+                            print(f"   Rolling: Warning - trim failed: {result.stderr.decode()[:200]}")
+                        trimmed_paths.append(trimmed_path)
+                
+                # Write concat file
                 concat_file = "/tmp/rolling_concat.txt"
                 with open(concat_file, "w") as f:
-                    for i, path in enumerate(segment_video_paths):
-                        if i == 0:
-                            # First segment: use full video
-                            f.write(f"file '{path}'\n")
-                        else:
-                            # Subsequent segments: skip overlap frames
-                            # We need to trim the start of each segment
-                            trim_seconds = overlap_frames / frame_rate
-                            trimmed_path = f"/tmp/rolling_segment_{i}_trimmed.mp4"
-                            subprocess.run([
-                                "ffmpeg", "-y", "-i", path,
-                                "-ss", str(trim_seconds),
-                                "-c", "copy",
-                                trimmed_path
-                            ], capture_output=True)
-                            f.write(f"file '{trimmed_path}'\n")
+                    for path in trimmed_paths:
+                        f.write(f"file '{path}'\n")
                 
-                # Concatenate
-                subprocess.run([
+                # Concatenate with re-encoding to fix timestamps
+                target_duration = num_frames / frame_rate
+                result = subprocess.run([
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                     "-i", concat_file,
-                    "-c", "copy",
+                    "-t", str(target_duration),  # Trim to exact duration
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-r", str(int(frame_rate)),  # Force frame rate
+                    "-movflags", "+faststart",  # Enable streaming
                     out_path
                 ], capture_output=True)
+                if result.returncode != 0:
+                    print(f"   Rolling: Warning - concat failed: {result.stderr.decode()[:500]}")
                 
-                # Trim to exact duration if needed
-                target_duration = num_frames / frame_rate
-                final_trimmed = f"/outputs/{output_name}"
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", out_path,
-                    "-t", str(target_duration),
-                    "-c", "copy",
-                    final_trimmed + ".tmp.mp4"
-                ], capture_output=True)
-                import shutil
-                shutil.move(final_trimmed + ".tmp.mp4", out_path)
+                # Cleanup trimmed files
+                for path in trimmed_paths[1:]:  # Skip first (original)
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
         
         with open(out_path, "rb") as f:
             video_bytes = f.read()

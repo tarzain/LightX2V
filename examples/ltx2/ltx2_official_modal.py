@@ -132,8 +132,8 @@ def download_models():
     gpu="H200",
     timeout=3600,
     scaledown_window=300,  # Keep warm for 5 minutes
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
+    enable_memory_snapshot=False,  # Disabled for debugging
+    # experimental_options={"enable_gpu_snapshot": True},
     volumes={
         MODELS_DIR: model_volume,
         "/outputs": outputs_volume,
@@ -150,7 +150,7 @@ class OfficialLTX2Engine:
     - GPU state snapshotted for instant cold starts
     """
 
-    @modal.enter(snap=True)
+    @modal.enter()  # snap=True disabled for debugging
     def load_model(self):
         """Load all models into VRAM and compile for maximum performance."""
         import torch
@@ -1074,6 +1074,7 @@ class OfficialLTX2Engine:
         audio_b64: str | None = None,
         audio_conditioning_strength: float = 0.3,
         skip_upscaling: bool | None = None,
+        extend_video_b64: str | None = None,
     ) -> bytes:
         """
         Unified generation method supporting all conditioning combinations:
@@ -1082,6 +1083,7 @@ class OfficialLTX2Engine:
         - Text + first + last frame (FL2V)
         - Text + audio (A2V)
         - Text + first frame + audio (I2V+A2V)
+        - Video extension (extend existing video)
         - Any combination!
         """
         import base64
@@ -1090,6 +1092,14 @@ class OfficialLTX2Engine:
         from PIL import Image
         
         images = []
+        extend_video_path = None
+        
+        # Process video to extend if provided
+        if extend_video_b64:
+            video_data = base64.b64decode(extend_video_b64)
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(video_data)
+                extend_video_path = tmp.name
         
         # Process first frame if provided
         if first_frame_b64:
@@ -1117,6 +1127,20 @@ class OfficialLTX2Engine:
         
         # Use default skip_upscaling if not specified
         do_skip = skip_upscaling if skip_upscaling is not None else self.skip_upscaling
+        
+        # If video extension is requested
+        if extend_video_path:
+            return self._generate_video_extension(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                extend_video_path=extend_video_path,
+                output_name=output_name,
+                skip_upscaling=do_skip,
+            )
         
         # If audio is provided, use audio-conditioned generation
         if audio_b64:
@@ -1154,6 +1178,298 @@ class OfficialLTX2Engine:
                 output_name=output_name,
                 skip_upscaling=do_skip,
             )
+
+    def _generate_video_extension(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        extend_video_path: str,
+        output_name: str,
+        skip_upscaling: bool = True,
+    ) -> bytes:
+        """
+        Extend an existing video by conditioning on its frames.
+        
+        Uses VideoConditionByKeyframeIndex to condition generation on the
+        encoded latents from the input video, then generates new frames
+        that continue the sequence.
+        """
+        import gc
+        import torch
+        import av
+        import numpy as np
+        from PIL import Image
+        from ltx_core.components.diffusion_steps import EulerDiffusionStep
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.conditioning import VideoConditionByKeyframeIndex
+        from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+        from ltx_core.text_encoders.gemma import encode_text
+        from ltx_core.types import VideoPixelShape, AudioLatentShape
+        import torchaudio
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, AUDIO_SAMPLE_RATE
+        from ltx_pipelines.utils import helpers as ltx_helpers
+        from ltx_pipelines.utils.helpers import (
+            euler_denoising_loop,
+            noise_video_state,
+            noise_audio_state,
+            simple_denoising_func,
+        )
+        from ltx_pipelines.utils.media_io import encode_video
+        
+        print(f"   Video Extension: Loading input video from {extend_video_path}")
+        
+        # Load video frames and audio
+        container = av.open(extend_video_path)
+        video_stream = container.streams.video[0]
+        
+        # Check if video has audio
+        has_audio = len(container.streams.audio) > 0
+        audio_samples = []
+        input_sample_rate = None
+        
+        frames = []
+        for frame in container.decode(video=0):
+            img = frame.to_image().convert("RGB")
+            img = img.resize((width, height), Image.Resampling.LANCZOS)
+            frames.append(np.array(img))
+        
+        # Extract audio if present
+        if has_audio:
+            container.seek(0)  # Reset to beginning
+            audio_stream = container.streams.audio[0]
+            input_sample_rate = audio_stream.rate
+            for frame in container.decode(audio=0):
+                audio_samples.append(frame.to_ndarray())
+        
+        container.close()
+        
+        input_num_frames = len(frames)
+        print(f"   Video Extension: Loaded {input_num_frames} frames from input video")
+        if has_audio:
+            print(f"   Video Extension: Found audio track at {input_sample_rate}Hz")
+        
+        # Convert frames to tensor [B, C, T, H, W] format
+        # frames is list of [H, W, C] numpy arrays
+        frames_array = np.stack(frames, axis=0)  # [T, H, W, C]
+        frames_tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2)  # [T, C, H, W]
+        frames_tensor = frames_tensor.unsqueeze(0)  # [1, T, C, H, W]
+        frames_tensor = frames_tensor.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+        frames_tensor = frames_tensor.float() / 127.5 - 1.0  # Normalize to [-1, 1]
+        
+        device = self.pipeline.device
+        dtype = torch.bfloat16
+        frames_tensor = frames_tensor.to(device=device, dtype=dtype)
+        
+        print(f"   Video Extension: Encoding input video to latent space...")
+        
+        # Encode the input video to latents using VAE
+        video_encoder = self._video_encoder
+        video_decoder = self._video_decoder
+        text_encoder = self._text_encoder
+        transformer = self._transformer
+        
+        with torch.inference_mode():
+            # Encode video frames to latent using the VAE encoder directly
+            # VideoEncoder is called directly: encoder(video) -> latent
+            video_conditioning_latent = video_encoder(frames_tensor)
+            
+            print(f"   Video Extension: Video conditioning latent shape: {video_conditioning_latent.shape}")
+            
+            # Encode audio if present
+            audio_conditioning_latent = None
+            if has_audio and len(audio_samples) > 0:
+                print(f"   Video Extension: Encoding input audio to latent space...")
+                
+                # Concatenate audio samples
+                audio_array = np.concatenate(audio_samples, axis=1)  # [channels, samples]
+                audio_waveform = torch.from_numpy(audio_array).float()
+                
+                # Ensure stereo (2 channels)
+                if audio_waveform.shape[0] == 1:
+                    audio_waveform = audio_waveform.repeat(2, 1)
+                elif audio_waveform.shape[0] > 2:
+                    audio_waveform = audio_waveform[:2]
+                
+                # Resample to expected sample rate if needed
+                if input_sample_rate != AUDIO_SAMPLE_RATE:
+                    audio_waveform = torchaudio.functional.resample(
+                        audio_waveform, input_sample_rate, AUDIO_SAMPLE_RATE
+                    )
+                
+                # Convert to mel spectrogram
+                mel_transform = torchaudio.transforms.MelSpectrogram(
+                    sample_rate=AUDIO_SAMPLE_RATE,
+                    n_fft=1024,
+                    hop_length=256,
+                    n_mels=128,
+                ).to(device)
+                
+                audio_waveform = audio_waveform.to(device)
+                mel_spec = mel_transform(audio_waveform)  # [2, 128, T]
+                mel_spec = mel_spec.unsqueeze(0)  # [1, 2, 128, T]
+                mel_spec = mel_spec.to(dtype)
+                
+                # Encode to latent using the audio encoder directly
+                audio_encoder = self._audio_encoder
+                audio_conditioning_latent = audio_encoder(mel_spec)
+                print(f"   Video Extension: Audio conditioning latent shape: {audio_conditioning_latent.shape}")
+            
+            # Set up generation
+            generator = torch.Generator(device=device).manual_seed(seed)
+            noiser = GaussianNoiser(generator=generator)
+            stepper = EulerDiffusionStep()
+            
+            # Encode text
+            context_p = encode_text(text_encoder, prompts=[prompt])[0]
+            video_context, audio_context = context_p
+            
+            # Sigmas for denoising
+            stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            
+            def denoising_loop(sigmas, video_state, audio_state, stepper):
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=video_context,
+                        audio_context=audio_context,
+                        transformer=transformer,
+                    ),
+                )
+            
+            # Total frames = conditioning frames + new frames
+            total_frames = input_num_frames + num_frames
+            print(f"   Video Extension: Generating {num_frames} new frames (total: {total_frames})")
+            
+            output_shape = VideoPixelShape(
+                batch=1,
+                frames=total_frames,
+                width=width,
+                height=height,
+                fps=frame_rate,
+            )
+            
+            # Create conditioning from the input video latent
+            # frame_idx=0 means the conditioning starts at frame 0
+            # strength=1.0 means denoise_mask=0 (don't denoise these frames, keep them frozen)
+            video_conditioning = VideoConditionByKeyframeIndex(
+                keyframes=video_conditioning_latent,
+                frame_idx=0,
+                strength=1.0,  # Keep conditioning frames frozen
+            )
+            
+            # Initialize video state with the conditioning
+            video_state, video_tools = noise_video_state(
+                output_shape=output_shape,
+                noiser=noiser,
+                conditionings=[video_conditioning],
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=1.0,
+                initial_latent=None,
+            )
+            
+            # Handle audio from input video
+            audio_initial_latent = None
+            audio_noise_scale = 1.0  # Default: generate fresh audio
+            
+            if audio_conditioning_latent is not None:
+                # Resize audio latent to match total output frames
+                expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+                expected_frames = expected_audio_shape.frames
+                actual_frames = audio_conditioning_latent.shape[2]
+                
+                print(f"   Video Extension: Audio latent frames: {actual_frames}, expected: {expected_frames}")
+                
+                if actual_frames != expected_frames:
+                    # Resize audio latent to match output shape
+                    B, C, T, H = audio_conditioning_latent.shape
+                    audio_flat = audio_conditioning_latent.reshape(B * C, 1, T, H)
+                    audio_resized = torch.nn.functional.interpolate(
+                        audio_flat,
+                        size=(expected_frames, H),
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    audio_conditioning_latent = audio_resized.reshape(B, C, expected_frames, H)
+                
+                audio_initial_latent = audio_conditioning_latent
+                # Use low noise scale to preserve most of input audio while allowing some adaptation
+                audio_noise_scale = 0.3  # Preserve 70% of original audio
+                print(f"   Video Extension: Using input audio as conditioning (noise_scale={audio_noise_scale})")
+            
+            # Initialize audio state
+            audio_state, audio_tools = noise_audio_state(
+                output_shape=output_shape,
+                noiser=noiser,
+                conditionings=[],
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=audio_noise_scale,
+                initial_latent=audio_initial_latent,
+            )
+            
+            print(f"   Video Extension: Running denoising loop...")
+            
+            # Run denoising
+            video_state, audio_state = denoising_loop(
+                stage_1_sigmas,
+                video_state,
+                audio_state,
+                stepper,
+            )
+            
+            # Clear conditioning and unpatchify
+            video_state = video_tools.clear_conditioning(video_state)
+            video_state = video_tools.unpatchify(video_state)
+            audio_state = audio_tools.clear_conditioning(audio_state)
+            audio_state = audio_tools.unpatchify(audio_state)
+            
+            print(f"   Video Extension: Decoding video and audio...")
+            
+            # Decode video
+            video_iterator = vae_decode_video(
+                video_decoder=video_decoder,
+                latent=video_state.latent[:1],
+            )
+            
+            # Decode audio
+            audio_decoder = self._audio_decoder
+            vocoder = self._vocoder
+            audio = vae_decode_audio(
+                audio_decoder=audio_decoder,
+                vocoder=vocoder,
+                latent=audio_state.latent[:1],
+            )
+            
+            # Encode output video
+            out_path = f"/outputs/{output_name}"
+            encode_video(
+                video=video_iterator,
+                fps=frame_rate,
+                audio=audio,
+                audio_sample_rate=AUDIO_SAMPLE_RATE,
+                output_path=out_path,
+                video_chunks_number=1,
+            )
+        
+        with open(out_path, "rb") as f:
+            video_bytes = f.read()
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        print(f"   Video Extension: Complete! Output: {out_path}")
+        return video_bytes
 
     @modal.method()
     def generate_t2v(
@@ -1576,6 +1892,16 @@ def web():
                     <div class="slider-hint">0.0 = preserve audio (weak conditioning) → 1.0 = full diffusion (may have artifacts)</div>
                 </div>
                 
+                <h3>🎬 Video Extension <span class="optional-tag">(optional)</span></h3>
+                <div class="dropzone" id="dropzone-video">
+                    <p>🎬 Drop video to extend (MP4) or click</p>
+                    <video id="preview-video" class="hidden" style="max-height: 120px; max-width: 100%;" muted></video>
+                    <div class="filename hidden" id="filename-video"></div>
+                    <div class="clear hidden" id="clear-video">✕ Remove</div>
+                </div>
+                <input type="file" id="file-video" accept="video/*" />
+                <div class="slider-hint">Upload a video clip to continue/extend it with new frames</div>
+                
                 <h3>⚙️ Video Settings</h3>
                 <div class="row">
                     <div>
@@ -1623,15 +1949,18 @@ def web():
         let firstFrameData = null;
         let lastFrameData = null;
         let audioData = null;
+        let videoData = null;
         
         // Update mode indicator based on what's selected
         function updateMode() {
             const hasFirst = !!firstFrameData;
             const hasLast = !!lastFrameData;
             const hasAudio = !!audioData;
+            const hasVideo = !!videoData;
             
             let mode = 'Text-to-Video';
-            if (hasAudio && hasFirst) mode = 'Image + Audio → Video';
+            if (hasVideo) mode = 'Video Extension';
+            else if (hasAudio && hasFirst) mode = 'Image + Audio → Video';
             else if (hasAudio) mode = 'Audio-to-Video';
             else if (hasFirst && hasLast) mode = 'First + Last Frame → Video';
             else if (hasFirst) mode = 'Image-to-Video';
@@ -1685,7 +2014,12 @@ def web():
                         preview.src = e.target.result;
                         preview.classList.remove('hidden');
                     }
-                    filename.textContent = (type === 'audio' ? '🎵 ' : '') + file.name;
+                    if (preview && type === 'video') {
+                        preview.src = e.target.result;
+                        preview.classList.remove('hidden');
+                    }
+                    const icon = type === 'audio' ? '🎵 ' : (type === 'video' ? '🎬 ' : '');
+                    filename.textContent = icon + file.name;
                     filename.classList.remove('hidden');
                     clear.classList.remove('hidden');
                     updateMode();
@@ -1698,6 +2032,7 @@ def web():
         setupDropzone('dropzone-first', 'file-first', 'preview-first', 'filename-first', 'clear-first', 'image', d => firstFrameData = d);
         setupDropzone('dropzone-last', 'file-last', 'preview-last', 'filename-last', 'clear-last', 'image', d => lastFrameData = d);
         setupDropzone('dropzone-audio', 'file-audio', null, 'filename-audio', 'clear-audio', 'audio', d => audioData = d);
+        setupDropzone('dropzone-video', 'file-video', 'preview-video', 'filename-video', 'clear-video', 'video', d => videoData = d);
         
         // Audio strength slider
         $('audio-strength').addEventListener('input', () => {
@@ -1745,6 +2080,9 @@ def web():
                     fd.append('audio', await fetch(`data:audio/wav;base64,${audioData}`).then(r => r.blob()), 'audio.wav');
                     fd.append('audio_conditioning_strength', $('audio-strength').value);
                 }
+                if (videoData) {
+                    fd.append('extend_video', await fetch(`data:video/mp4;base64,${videoData}`).then(r => r.blob()), 'extend.mp4');
+                }
                 
                 const resp = await fetch('/api/generate', { method: 'POST', body: fd });
                 
@@ -1788,6 +2126,7 @@ def web():
         last_frame: UploadFile = File(None),
         audio: UploadFile = File(None),
         audio_conditioning_strength: float = Form(0.3),
+        extend_video: UploadFile = File(None),
     ):
         """Unified video generation endpoint supporting all conditioning combinations."""
         try:
@@ -1814,6 +2153,13 @@ def web():
                 if data:
                     audio_b64 = base64.b64encode(data).decode()
             
+            # Process optional video to extend
+            extend_video_b64 = None
+            if extend_video:
+                data = await extend_video.read()
+                if data:
+                    extend_video_b64 = base64.b64encode(data).decode()
+            
             # Parse skip_upscaling (comes as string from form)
             do_skip_upscaling = skip_upscaling.lower() == "true"
             
@@ -1830,6 +2176,7 @@ def web():
                 audio_b64=audio_b64,
                 audio_conditioning_strength=audio_conditioning_strength,
                 skip_upscaling=do_skip_upscaling,
+                extend_video_b64=extend_video_b64,
             )
             return Response(content=video_bytes, media_type="video/mp4")
         except Exception as e:

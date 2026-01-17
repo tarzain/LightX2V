@@ -1075,6 +1075,8 @@ class OfficialLTX2Engine:
         audio_conditioning_strength: float = 0.3,
         skip_upscaling: bool | None = None,
         extend_video_b64: str | None = None,
+        rolling_mode: bool = False,
+        segment_seconds: float = 5.0,
     ) -> bytes:
         """
         Unified generation method supporting all conditioning combinations:
@@ -1084,6 +1086,7 @@ class OfficialLTX2Engine:
         - Text + audio (A2V)
         - Text + first frame + audio (I2V+A2V)
         - Video extension (extend existing video)
+        - Rolling generation (autoregressive multi-segment)
         - Any combination!
         """
         import base64
@@ -1140,6 +1143,21 @@ class OfficialLTX2Engine:
                 extend_video_path=extend_video_path,
                 output_name=output_name,
                 skip_upscaling=do_skip,
+            )
+        
+        # If rolling mode is enabled, use autoregressive generation
+        if rolling_mode:
+            return self._generate_rolling(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                first_frame_image=Image.open(io.BytesIO(base64.b64decode(first_frame_b64))).convert("RGB") if first_frame_b64 else None,
+                output_name=output_name,
+                skip_upscaling=do_skip,
+                segment_seconds=segment_seconds,
             )
         
         # If audio is provided, use audio-conditioned generation
@@ -1469,6 +1487,348 @@ class OfficialLTX2Engine:
         torch.cuda.empty_cache()
         
         print(f"   Video Extension: Complete! Output: {out_path}")
+        return video_bytes
+
+    def _generate_rolling(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        first_frame_image,  # PIL Image or None
+        output_name: str,
+        skip_upscaling: bool = True,
+        segment_seconds: float = 5.0,
+        overlap_frames: int = 8,  # Frames to overlap between segments for conditioning
+    ) -> bytes:
+        """
+        Rolling/autoregressive video generation.
+        
+        Generates video in segments, using the last frames of each segment
+        as conditioning for the next segment (similar to video extension).
+        This allows generating arbitrarily long videos while maintaining
+        temporal coherence.
+        
+        Args:
+            prompt: Text prompt
+            seed: Random seed
+            height, width: Video dimensions
+            num_frames: Total number of frames to generate
+            frame_rate: Frame rate
+            first_frame_image: Optional PIL Image for the first frame
+            output_name: Output filename
+            skip_upscaling: Skip 2-stage pipeline
+            segment_seconds: Duration of each segment in seconds
+            overlap_frames: Number of frames to use as conditioning overlap
+        """
+        import gc
+        import torch
+        import numpy as np
+        import tempfile
+        from PIL import Image
+        from ltx_core.components.diffusion_steps import EulerDiffusionStep
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.conditioning import VideoConditionByKeyframeIndex
+        from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+        from ltx_core.text_encoders.gemma import encode_text
+        from ltx_core.types import VideoPixelShape
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, AUDIO_SAMPLE_RATE
+        from ltx_pipelines.utils import helpers as ltx_helpers
+        from ltx_pipelines.utils.helpers import (
+            euler_denoising_loop,
+            noise_video_state,
+            noise_audio_state,
+            simple_denoising_func,
+        )
+        from ltx_pipelines.utils.media_io import encode_video
+        
+        # Cap segment frames to avoid OOM - max ~97 frames (3.2s at 30fps) works reliably
+        MAX_SEGMENT_FRAMES = 97
+        segment_frames = min(int(segment_seconds * frame_rate), MAX_SEGMENT_FRAMES)
+        actual_segment_seconds = segment_frames / frame_rate
+        total_duration = num_frames / frame_rate
+        
+        # Calculate number of segments needed
+        # Each segment after the first adds (segment_frames - overlap_frames) new frames
+        first_segment_new = segment_frames
+        subsequent_segment_new = segment_frames - overlap_frames
+        
+        if num_frames <= segment_frames:
+            # Single segment - no rolling needed
+            num_segments = 1
+        else:
+            # First segment contributes segment_frames, each subsequent contributes (segment_frames - overlap)
+            remaining_after_first = num_frames - segment_frames
+            num_segments = 1 + max(0, (remaining_after_first + subsequent_segment_new - 1) // subsequent_segment_new)
+        
+        print(f"   Rolling: Total {total_duration:.1f}s ({num_frames} frames) -> {num_segments} segments")
+        print(f"   Rolling: Segment size: {actual_segment_seconds:.1f}s ({segment_frames} frames, capped at {MAX_SEGMENT_FRAMES})")
+        print(f"   Rolling: Overlap: {overlap_frames} frames, new frames per segment: {subsequent_segment_new}")
+        
+        device = self.pipeline.device
+        dtype = torch.bfloat16
+        
+        # Clear memory before starting
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        with torch.inference_mode():
+            # Pre-encode text (shared across all segments)
+            text_encoder = self._text_encoder
+            video_encoder = self._video_encoder
+            video_decoder = self._video_decoder
+            transformer = self._transformer
+            
+            context_p = encode_text(text_encoder, prompts=[prompt])[0]
+            video_context, audio_context = context_p
+            
+            # Sigmas for denoising
+            stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            
+            def denoising_loop(sigmas, video_state, audio_state, stepper):
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=video_context,
+                        audio_context=audio_context,
+                        transformer=transformer,
+                    ),
+                )
+            
+            segment_video_paths = []  # Paths to segment video files
+            
+            previous_segment_latent = None
+            
+            for seg_idx in range(num_segments):
+                seg_seed = seed + seg_idx  # Vary seed slightly for each segment
+                generator = torch.Generator(device=device).manual_seed(seg_seed)
+                noiser = GaussianNoiser(generator=generator)
+                stepper = EulerDiffusionStep()
+                
+                # Determine how many frames this segment generates
+                if seg_idx == 0:
+                    # First segment: no overlap conditioning
+                    this_segment_total_frames = segment_frames
+                    conditioning_frames = 0
+                else:
+                    # Subsequent segments: use overlap_frames from previous as conditioning
+                    this_segment_total_frames = segment_frames
+                    conditioning_frames = overlap_frames
+                
+                print(f"   Rolling: Segment {seg_idx + 1}/{num_segments} - generating {this_segment_total_frames} frames (conditioning: {conditioning_frames})")
+                
+                output_shape = VideoPixelShape(
+                    batch=1,
+                    frames=this_segment_total_frames,
+                    width=width,
+                    height=height,
+                    fps=frame_rate,
+                )
+                
+                conditionings = []
+                
+                # First segment: use input image if provided
+                if seg_idx == 0 and first_frame_image is not None:
+                    # Save image to temp file for conditioning
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        first_frame_image.resize((width, height), Image.Resampling.LANCZOS).save(tmp.name, "PNG")
+                        first_path = tmp.name
+                    
+                    # Use I2V conditioning for first frame
+                    conditionings = ltx_helpers.image_conditionings_by_replacing_latent(
+                        images=[(first_path, 0, 1.0)],
+                        height=height,
+                        width=width,
+                        video_encoder=video_encoder,
+                        dtype=dtype,
+                        device=device,
+                    )
+                
+                # Subsequent segments: condition on previous segment's last frames (as latent)
+                if seg_idx > 0 and previous_segment_latent is not None:
+                    # previous_segment_latent is [B, C, T, H, W]
+                    # Take the last overlap_frames worth of latents
+                    # Note: latent temporal dimension is frames / temporal_compression
+                    # For LTX-2, temporal compression is typically 8
+                    latent_temporal = previous_segment_latent.shape[2]
+                    
+                    # Calculate how many latent frames correspond to overlap_frames
+                    # Roughly: latent_frames = ceil(pixel_frames / 8)
+                    overlap_latent_frames = max(1, overlap_frames // 8)
+                    
+                    # Get the last N latent frames
+                    conditioning_latent = previous_segment_latent[:, :, -overlap_latent_frames:, :, :]
+                    
+                    print(f"   Rolling: Using {overlap_latent_frames} latent frames (from {latent_temporal} total) as conditioning")
+                    
+                    # Create conditioning that freezes these frames at the start
+                    video_conditioning = VideoConditionByKeyframeIndex(
+                        keyframes=conditioning_latent,
+                        frame_idx=0,
+                        strength=1.0,  # Freeze conditioning frames
+                    )
+                    conditionings = [video_conditioning]
+                
+                # Initialize video state
+                video_state, video_tools = noise_video_state(
+                    output_shape=output_shape,
+                    noiser=noiser,
+                    conditionings=conditionings,
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=1.0,
+                    initial_latent=None,
+                )
+                
+                # Initialize audio state
+                audio_state, audio_tools = noise_audio_state(
+                    output_shape=output_shape,
+                    noiser=noiser,
+                    conditionings=[],
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=1.0,
+                    initial_latent=None,
+                )
+                
+                # Run denoising
+                video_state, audio_state = denoising_loop(
+                    stage_1_sigmas,
+                    video_state,
+                    audio_state,
+                    stepper,
+                )
+                
+                # Save the latent for next segment's conditioning (before unpatchify!)
+                # We need the latent AFTER denoising but BEFORE clearing conditioning
+                # Actually, we need to get it before clear_conditioning changes it
+                # The latent shape here is still in patchified form, so we need to unpatchify first
+                video_state = video_tools.clear_conditioning(video_state)
+                video_state = video_tools.unpatchify(video_state)
+                audio_state = audio_tools.clear_conditioning(audio_state)
+                audio_state = audio_tools.unpatchify(audio_state)
+                
+                # Store latent for next segment (unpatchified, [B, C, T, H, W])
+                previous_segment_latent = video_state.latent.clone()
+                
+                print(f"   Rolling: Segment {seg_idx + 1} latent shape: {previous_segment_latent.shape}")
+                
+                # Decode video using encode_video (handles spatial tiling correctly)
+                video_iterator = vae_decode_video(
+                    video_decoder=video_decoder,
+                    latent=video_state.latent[:1],
+                )
+                
+                # Decode audio
+                audio_decoder = self._audio_decoder
+                vocoder = self._vocoder
+                audio = vae_decode_audio(
+                    audio_decoder=audio_decoder,
+                    vocoder=vocoder,
+                    latent=audio_state.latent[:1],
+                )
+                
+                # Encode segment to temp file (encode_video handles tile merging!)
+                segment_path = f"/tmp/rolling_segment_{seg_idx}.mp4"
+                encode_video(
+                    video=video_iterator,
+                    fps=frame_rate,
+                    audio=audio,
+                    audio_sample_rate=AUDIO_SAMPLE_RATE,
+                    output_path=segment_path,
+                    video_chunks_number=1,
+                )
+                
+                segment_video_paths.append(segment_path)
+                print(f"   Rolling: Segment {seg_idx + 1} saved to {segment_path}")
+                
+                # Aggressive memory cleanup between segments
+                del video_state, audio_state, video_iterator, audio
+                del video_tools, audio_tools
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            print(f"   Rolling: All {num_segments} segments complete, concatenating...")
+            
+            # Free the last segment latent
+            del previous_segment_latent
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # Concatenate all segment videos using ffmpeg
+            import subprocess
+            
+            out_path = f"/outputs/{output_name}"
+            
+            if len(segment_video_paths) == 1:
+                # Single segment, just copy
+                import shutil
+                shutil.copy(segment_video_paths[0], out_path)
+            else:
+                # Create concat file for ffmpeg
+                concat_file = "/tmp/rolling_concat.txt"
+                with open(concat_file, "w") as f:
+                    for i, path in enumerate(segment_video_paths):
+                        if i == 0:
+                            # First segment: use full video
+                            f.write(f"file '{path}'\n")
+                        else:
+                            # Subsequent segments: skip overlap frames
+                            # We need to trim the start of each segment
+                            trim_seconds = overlap_frames / frame_rate
+                            trimmed_path = f"/tmp/rolling_segment_{i}_trimmed.mp4"
+                            subprocess.run([
+                                "ffmpeg", "-y", "-i", path,
+                                "-ss", str(trim_seconds),
+                                "-c", "copy",
+                                trimmed_path
+                            ], capture_output=True)
+                            f.write(f"file '{trimmed_path}'\n")
+                
+                # Concatenate
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", concat_file,
+                    "-c", "copy",
+                    out_path
+                ], capture_output=True)
+                
+                # Trim to exact duration if needed
+                target_duration = num_frames / frame_rate
+                final_trimmed = f"/outputs/{output_name}"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", out_path,
+                    "-t", str(target_duration),
+                    "-c", "copy",
+                    final_trimmed + ".tmp.mp4"
+                ], capture_output=True)
+                import shutil
+                shutil.move(final_trimmed + ".tmp.mp4", out_path)
+        
+        with open(out_path, "rb") as f:
+            video_bytes = f.read()
+        
+        # Cleanup temp files
+        import os
+        for path in segment_video_paths:
+            try:
+                os.remove(path)
+            except:
+                pass
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        total_duration = num_frames / frame_rate
+        print(f"   Rolling: Complete! Output: {out_path} ({num_frames} frames, {total_duration:.1f}s)")
         return video_bytes
 
     @modal.method()
@@ -1930,6 +2290,18 @@ def web():
                 </label>
                 <div class="slider-hint">Unchecked = 12 steps with 2x upscaling (slower, higher quality)</div>
                 
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 1rem; cursor: pointer;">
+                    <input type="checkbox" id="rolling-mode" style="width: auto;" />
+                    <span>🔄 Rolling mode (autoregressive long video)</span>
+                </label>
+                <div class="slider-hint">Generate in segments for videos longer than ~3s with better coherence</div>
+                
+                <div id="rolling-options" style="display: none; margin-top: 0.5rem; padding: 0.75rem; background: rgba(255,255,255,0.05); border-radius: 8px;">
+                    <label>Segment Duration (seconds)</label>
+                    <input type="range" id="segment-duration" min="2" max="5" step="0.5" value="3" />
+                    <div class="slider-hint">Each segment: <span id="segment-value">3.0</span>s (capped at ~3.2s for memory)</div>
+                </div>
+                
                 <button class="generate" id="generate">Generate Video</button>
                 <div class="status" id="status"></div>
             </div>
@@ -2039,6 +2411,16 @@ def web():
             $('strength-value').textContent = $('audio-strength').value;
         });
         
+        // Rolling mode toggle
+        $('rolling-mode').addEventListener('change', () => {
+            $('rolling-options').style.display = $('rolling-mode').checked ? 'block' : 'none';
+        });
+        
+        // Segment duration slider
+        $('segment-duration').addEventListener('input', () => {
+            $('segment-value').textContent = parseFloat($('segment-duration').value).toFixed(1);
+        });
+        
         // Generate
         $('generate').addEventListener('click', async () => {
             const btn = $('generate');
@@ -2069,6 +2451,8 @@ def web():
                 fd.append('num_frames', $('frames').value);
                 fd.append('seed', $('seed').value);
                 fd.append('skip_upscaling', $('skip-upscaling').checked ? 'true' : 'false');
+                fd.append('rolling_mode', $('rolling-mode').checked ? 'true' : 'false');
+                fd.append('segment_seconds', $('segment-duration').value);
                 
                 if (firstFrameData) {
                     fd.append('first_frame', await fetch(`data:image/png;base64,${firstFrameData}`).then(r => r.blob()), 'first.png');
@@ -2122,6 +2506,8 @@ def web():
         num_frames: int = Form(97),
         seed: int = Form(42),
         skip_upscaling: str = Form("true"),
+        rolling_mode: str = Form("false"),
+        segment_seconds: float = Form(3.0),
         first_frame: UploadFile = File(None),
         last_frame: UploadFile = File(None),
         audio: UploadFile = File(None),
@@ -2162,6 +2548,7 @@ def web():
             
             # Parse skip_upscaling (comes as string from form)
             do_skip_upscaling = skip_upscaling.lower() == "true"
+            do_rolling_mode = rolling_mode.lower() == "true"
             
             engine = OfficialLTX2Engine()
             video_bytes = engine.generate.remote(
@@ -2177,6 +2564,8 @@ def web():
                 audio_conditioning_strength=audio_conditioning_strength,
                 skip_upscaling=do_skip_upscaling,
                 extend_video_b64=extend_video_b64,
+                rolling_mode=do_rolling_mode,
+                segment_seconds=segment_seconds,
             )
             return Response(content=video_bytes, media_type="video/mp4")
         except Exception as e:

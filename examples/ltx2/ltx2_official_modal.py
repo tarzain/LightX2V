@@ -40,6 +40,10 @@ LTX2_MODELS_DIR = f"{MODELS_DIR}/Lightricks/LTX-2"
 GEMMA_DIR = f"{MODELS_DIR}/gemma"
 DEFAULT_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 
+# Pipeline configuration
+USE_FP8 = False  # False = BF16 checkpoint (~38GB), True = FP8 checkpoint (~19GB)
+SKIP_UPSCALING = True  # True = generate at full res, skip stage 2 (faster), False = 2-stage with upscaling
+
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
     .apt_install(
@@ -125,7 +129,7 @@ def download_models():
 
 
 @app.cls(
-    gpu="H100",
+    gpu="H200",
     timeout=3600,
     scaledown_window=300,  # Keep warm for 5 minutes
     enable_memory_snapshot=True,
@@ -164,14 +168,29 @@ class OfficialLTX2Engine:
             _ = torch.zeros(1, device="cuda")
             torch.cuda.synchronize()
         
-        print("🔧 Loading LTX-2 DistilledPipeline (keeping all models in VRAM)...")
+        # Store configuration
+        self.use_fp8 = USE_FP8
+        self.skip_upscaling = SKIP_UPSCALING
         
-        from ltx_pipelines.distilled import DistilledPipeline
+        # Select checkpoint based on configuration
+        if USE_FP8:
+            ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-distilled-fp8.safetensors"
+            print(f"🔧 Loading LTX-2 DistilledPipeline with FP8 (~19GB)...")
+        else:
+            ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-distilled.safetensors"
+            print(f"🔧 Loading LTX-2 DistilledPipeline with BF16 (~38GB)...")
         
-        ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-distilled-fp8.safetensors"
+        if SKIP_UPSCALING:
+            print(f"   Audio mode: Will skip stage 2 upscaling (skip_upscaling=True)")
+        else:
+            print(f"   Audio mode: Full two-stage with upscaling")
+        
         spatial_upsampler = f"{LTX2_MODELS_DIR}/ltx-2-spatial-upscaler-x2-1.0.safetensors"
         
-        missing = [p for p in (ckpt, spatial_upsampler) if not os.path.exists(p)]
+        # Check for required files (always require upsampler for runtime toggling)
+        required_files = [ckpt, spatial_upsampler]
+        
+        missing = [p for p in required_files if not os.path.exists(p)]
         if missing:
             raise FileNotFoundError(
                 "Missing required LTX-2 files. Run `--download` first.\n"
@@ -181,13 +200,14 @@ class OfficialLTX2Engine:
         if not (Path(GEMMA_DIR).exists() and list(Path(GEMMA_DIR).rglob("model*.safetensors"))):
             raise FileNotFoundError(f"Missing Gemma model files under `{GEMMA_DIR}`.")
         
-        # Create the pipeline
+        # Create the distilled pipeline (always load upsampler for runtime toggling)
+        from ltx_pipelines.distilled import DistilledPipeline
         self.pipeline = DistilledPipeline(
             checkpoint_path=ckpt,
             spatial_upsampler_path=spatial_upsampler,
             gemma_root=GEMMA_DIR,
             loras=[],
-            fp8transformer=True,
+            fp8transformer=USE_FP8,
         )
         
         # Pre-load ALL models into VRAM and keep references to prevent cleanup
@@ -226,7 +246,7 @@ class OfficialLTX2Engine:
         print("   Loading VAE decoder...")
         self._video_decoder = ledger.video_decoder()
         
-        # Load spatial upsampler
+        # Always load spatial upsampler (for runtime toggling)
         print("   Loading spatial upsampler...")
         self._spatial_upsampler = ledger.spatial_upsampler()
         
@@ -471,17 +491,30 @@ class OfficialLTX2Engine:
         print(f"   Warmup: {warmup_height}x{warmup_width}, {warmup_frames} frames...")
         
         with torch.inference_mode():
-            video_iter, audio = self.pipeline(
-                prompt="warmup test",
-                seed=42,
-                height=warmup_height,
-                width=warmup_width,
-                num_frames=warmup_frames,
-                frame_rate=30.0,
-                images=[],
-                tiling_config=tiling_config,
-                enhance_prompt=False,
-            )
+            if self.skip_upscaling:
+                # Use skip_upscaling path for warmup
+                video_iter, audio = self._generate_skip_upscaling(
+                    prompt="warmup test",
+                    seed=42,
+                    height=warmup_height,
+                    width=warmup_width,
+                    num_frames=warmup_frames,
+                    frame_rate=30.0,
+                    images=[],
+                )
+            else:
+                # Full 2-stage pipeline warmup
+                video_iter, audio = self.pipeline(
+                    prompt="warmup test",
+                    seed=42,
+                    height=warmup_height,
+                    width=warmup_width,
+                    num_frames=warmup_frames,
+                    frame_rate=30.0,
+                    images=[],
+                    tiling_config=tiling_config,
+                    enhance_prompt=False,
+                )
             # Consume the iterator
             for _ in video_iter:
                 pass
@@ -508,8 +541,9 @@ class OfficialLTX2Engine:
         frame_rate: float,
         images: list,
         output_name: str,
+        skip_upscaling: bool = True,
     ) -> bytes:
-        """Internal generation method supporting both T2V and I2V."""
+        """Internal generation method using DistilledPipeline."""
         import gc
         import torch
         from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -517,20 +551,34 @@ class OfficialLTX2Engine:
         from ltx_pipelines.utils.media_io import encode_video
 
         tiling_config = TilingConfig.default()
-        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
 
         with torch.inference_mode():
-            video_iter, audio = self.pipeline(
-                prompt=prompt,
-                seed=seed,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                images=images,
-                tiling_config=tiling_config,
-                enhance_prompt=False,
-            )
+            if skip_upscaling:
+                # Custom logic: Generate at full resolution in stage 1, skip stage 2
+                video_iter, audio = self._generate_skip_upscaling(
+                    prompt=prompt,
+                    seed=seed,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    images=images,
+                )
+                video_chunks_number = 1
+            else:
+                # Normal 2-stage pipeline
+                video_iter, audio = self.pipeline(
+                    prompt=prompt,
+                    seed=seed,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    images=images,
+                    tiling_config=tiling_config,
+                    enhance_prompt=False,
+                )
+                video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
 
             out_path = f"/outputs/{output_name}"
             encode_video(
@@ -549,6 +597,148 @@ class OfficialLTX2Engine:
         torch.cuda.empty_cache()
         
         return video_bytes
+    
+    def _generate_skip_upscaling(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list,
+    ):
+        """
+        Generate video at full resolution using only stage 1 (skip upscaling and stage 2).
+        This is faster but produces slightly lower quality output.
+        """
+        import torch
+        from ltx_core.components.diffusion_steps import EulerDiffusionStep
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+        from ltx_core.text_encoders.gemma import encode_text
+        from ltx_core.types import VideoPixelShape
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils import helpers as ltx_helpers  # Use module to get patched FL2V function
+        from ltx_pipelines.utils.helpers import (
+            euler_denoising_loop,
+            noise_video_state,
+            noise_audio_state,
+            simple_denoising_func,
+        )
+
+        device = self.pipeline.device
+        dtype = torch.bfloat16
+        
+        generator = torch.Generator(device=device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        stepper = EulerDiffusionStep()
+        
+        # Use cached models
+        text_encoder = self._text_encoder
+        video_encoder = self._video_encoder
+        video_decoder = self._video_decoder
+        transformer = self._transformer
+        
+        # Encode text
+        context_p = encode_text(text_encoder, prompts=[prompt])[0]
+        video_context, audio_context = context_p
+        
+        # Stage 1 sigmas (only 8 steps!)
+        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+        
+        def denoising_loop(sigmas, video_state, audio_state, stepper):
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper,
+                denoise_fn=simple_denoising_func(
+                    video_context=video_context,
+                    audio_context=audio_context,
+                    transformer=transformer,
+                ),
+            )
+        
+        print(f"   Skip-upscale: Generating at full resolution {width}x{height} (8 steps only)")
+        
+        output_shape = VideoPixelShape(
+            batch=1,
+            frames=num_frames,
+            width=width,
+            height=height,
+            fps=frame_rate,
+        )
+        
+        # Image conditioning (use module reference to get patched FL2V function)
+        if len(images) > 0:
+            conditionings = ltx_helpers.image_conditionings_by_replacing_latent(
+                images=images,
+                height=height,
+                width=width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            conditionings = ()
+        
+        # Initialize video state from noise
+        video_state, video_tools = noise_video_state(
+            output_shape=output_shape,
+            noiser=noiser,
+            conditionings=conditionings,
+            components=self.pipeline.pipeline_components,
+            dtype=dtype,
+            device=device,
+            noise_scale=1.0,
+            initial_latent=None,
+        )
+        
+        # Initialize empty audio state (no audio input)
+        audio_state, audio_tools = noise_audio_state(
+            output_shape=output_shape,
+            noiser=noiser,
+            conditionings=[],
+            components=self.pipeline.pipeline_components,
+            dtype=dtype,
+            device=device,
+            noise_scale=1.0,
+            initial_latent=None,
+        )
+        
+        # Run stage 1 denoising only
+        video_state, audio_state = denoising_loop(
+            stage_1_sigmas,
+            video_state,
+            audio_state,
+            stepper,
+        )
+        
+        # Clear conditioning and unpatchify
+        video_state = video_tools.clear_conditioning(video_state)
+        video_state = video_tools.unpatchify(video_state)
+        audio_state = audio_tools.clear_conditioning(audio_state)
+        audio_state = audio_tools.unpatchify(audio_state)
+        
+        # Decode video directly (skip upscaling and stage 2!)
+        print("   Skip-upscale: Decoding video and audio (skipping upscale and stage 2)")
+        video_iterator = vae_decode_video(
+            video_decoder=video_decoder,
+            latent=video_state.latent[:1],
+        )
+        
+        # Also decode audio (LTX-2 generates both simultaneously)
+        audio_decoder = self._audio_decoder
+        vocoder = self._vocoder
+        audio = vae_decode_audio(
+            audio_decoder=audio_decoder,
+            vocoder=vocoder,
+            latent=audio_state.latent[:1],
+        )
+        
+        return video_iterator, audio
 
     def _generate_with_audio(
         self,
@@ -562,6 +752,7 @@ class OfficialLTX2Engine:
         audio_latent,
         output_name: str,
         audio_conditioning_strength: float = 0.3,
+        skip_upscaling: bool = True,
     ) -> bytes:
         """
         Generation with audio conditioning.
@@ -584,10 +775,10 @@ class OfficialLTX2Engine:
             DISTILLED_SIGMA_VALUES,
             STAGE_2_DISTILLED_SIGMA_VALUES,
         )
+        from ltx_pipelines.utils import helpers as ltx_helpers  # Use module to get patched FL2V function
         from ltx_pipelines.utils.helpers import (
             denoise_audio_video,
             euler_denoising_loop,
-            image_conditionings_by_replacing_latent,
             noise_video_state,
             noise_audio_state,
             simple_denoising_func,
@@ -598,7 +789,11 @@ class OfficialLTX2Engine:
         print(f"   A2V: Audio conditioning strength: {audio_conditioning_strength} (0.0=preserve, 1.0=full diffusion)")
         
         tiling_config = TilingConfig.default()
-        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+        # When skipping upscaling, use 1 chunk (no tiling needed at lower res)
+        if skip_upscaling:
+            video_chunks_number = 1
+        else:
+            video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
         
         with torch.inference_mode():
             device = self.pipeline.device
@@ -633,20 +828,28 @@ class OfficialLTX2Engine:
                     ),
                 )
             
+            # If skip_upscaling, generate at full resolution in stage 1
+            if skip_upscaling:
+                stage_1_width, stage_1_height = width, height
+                print(f"   A2V: Skipping upscaling - generating at full resolution {width}x{height}")
+            else:
+                stage_1_width, stage_1_height = width // 2, height // 2
+                print(f"   A2V: Stage 1 at {stage_1_width}x{stage_1_height}, will upscale to {width}x{height}")
+            
             stage_1_output_shape = VideoPixelShape(
                 batch=1,
                 frames=num_frames,
-                width=width // 2,
-                height=height // 2,
+                width=stage_1_width,
+                height=stage_1_height,
                 fps=frame_rate,
             )
             
-            # Image conditioning (only if we have images)
+            # Image conditioning (use module reference to get patched FL2V function)
             if len(images) > 0:
-                stage_1_conditionings = image_conditionings_by_replacing_latent(
+                stage_1_conditionings = ltx_helpers.image_conditionings_by_replacing_latent(
                     images=images,
-                    height=height // 2,
-                    width=width // 2,
+                    height=stage_1_height,
+                    width=stage_1_width,
                     video_encoder=video_encoder,
                     dtype=dtype,
                     device=device,
@@ -725,78 +928,79 @@ class OfficialLTX2Engine:
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
             
-            # Stage 2: Upsample and refine
-            print("   A2V: Stage 2 upsampling...")
-            spatial_upsampler = self._spatial_upsampler
-            stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
-            
-            stage_2_output_shape = VideoPixelShape(
-                batch=1,
-                frames=num_frames,
-                width=width,
-                height=height,
-                fps=frame_rate,
-            )
-            
-            # Upsample video latent
-            upsampled_video = upsample_video(
-                latent=video_state.latent[:1],
-                video_encoder=video_encoder,
-                upsampler=spatial_upsampler,
-            )
-            
-            if len(images) > 0:
-                stage_2_conditionings = image_conditionings_by_replacing_latent(
-                    images=images,
-                    height=height,
+            # Stage 2: Upsample and refine (skip if skip_upscaling is True)
+            if not skip_upscaling:
+                print("   A2V: Stage 2 upsampling...")
+                spatial_upsampler = self._spatial_upsampler
+                stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+                
+                stage_2_output_shape = VideoPixelShape(
+                    batch=1,
+                    frames=num_frames,
                     width=width,
+                    height=height,
+                    fps=frame_rate,
+                )
+                
+                # Upsample video latent
+                upsampled_video = upsample_video(
+                    latent=video_state.latent[:1],
                     video_encoder=video_encoder,
+                    upsampler=spatial_upsampler,
+                )
+                
+                if len(images) > 0:
+                    stage_2_conditionings = ltx_helpers.image_conditionings_by_replacing_latent(
+                        images=images,
+                        height=height,
+                        width=width,
+                        video_encoder=video_encoder,
+                        dtype=dtype,
+                        device=device,
+                    )
+                else:
+                    stage_2_conditionings = ()  # Empty tuple for no conditioning
+                
+                # Stage 2: Continue with consistent noise scales
+                stage_2_audio_noise = audio_conditioning_strength * float(stage_2_sigmas[0].item())
+                print(f"   A2V: Stage 2 - Initializing upsampled video and audio (noise_scale={stage_2_audio_noise:.3f})...")
+                
+                video_state_2, video_tools_2 = noise_video_state(
+                    output_shape=stage_2_output_shape,
+                    noiser=noiser,
+                    conditionings=stage_2_conditionings,
+                    components=self.pipeline.pipeline_components,
                     dtype=dtype,
                     device=device,
+                    noise_scale=float(stage_2_sigmas[0].item()),
+                    initial_latent=upsampled_video,
                 )
+                
+                audio_state_2, audio_tools_2 = noise_audio_state(
+                    output_shape=stage_2_output_shape,
+                    noiser=noiser,
+                    conditionings=[],
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=stage_2_audio_noise,
+                    initial_latent=audio_state.latent,
+                )
+                
+                print(f"   A2V: Stage 2 - Running refinement denoising loop...")
+                video_state, audio_state = denoising_loop(
+                    stage_2_sigmas,
+                    video_state_2,
+                    audio_state_2,
+                    stepper,
+                )
+                
+                video_state = video_tools_2.clear_conditioning(video_state)
+                video_state = video_tools_2.unpatchify(video_state)
+                audio_state = audio_tools_2.clear_conditioning(audio_state)
+                audio_state = audio_tools_2.unpatchify(audio_state)
             else:
-                stage_2_conditionings = ()  # Empty tuple for no conditioning
-            
-            # Stage 2: Continue with consistent noise scales
-            # - Video: noise_scale=stage_2_sigmas[0] (partial noise for refinement)
-            # - Audio: noise_scale based on conditioning strength (scaled down for refinement stage)
-            stage_2_audio_noise = audio_conditioning_strength * float(stage_2_sigmas[0].item())
-            print(f"   A2V: Stage 2 - Initializing upsampled video and audio (noise_scale={stage_2_audio_noise:.3f})...")
-            
-            video_state_2, video_tools_2 = noise_video_state(
-                output_shape=stage_2_output_shape,
-                noiser=noiser,
-                conditionings=stage_2_conditionings,
-                components=self.pipeline.pipeline_components,
-                dtype=dtype,
-                device=device,
-                noise_scale=float(stage_2_sigmas[0].item()),  # Partial noise for refinement
-                initial_latent=upsampled_video,
-            )
-            
-            audio_state_2, audio_tools_2 = noise_audio_state(
-                output_shape=stage_2_output_shape,
-                noiser=noiser,
-                conditionings=[],
-                components=self.pipeline.pipeline_components,
-                dtype=dtype,
-                device=device,
-                noise_scale=stage_2_audio_noise,  # Scaled noise for refinement
-                initial_latent=audio_state.latent,  # Audio from stage 1
-            )
-            
-            print(f"   A2V: Stage 2 - Running refinement denoising loop...")
-            video_state, audio_state = denoising_loop(
-                stage_2_sigmas,
-                video_state_2,
-                audio_state_2,
-                stepper,
-            )
-            
-            video_state = video_tools_2.clear_conditioning(video_state)
-            video_state = video_tools_2.unpatchify(video_state)
-            audio_state = audio_tools_2.clear_conditioning(audio_state)
-            audio_state = audio_tools_2.unpatchify(audio_state)
+                print("   A2V: Skipping Stage 2 (skip_upscaling=True)")
             
             # Decode video (returns a generator yielding frame batches)
             print("   A2V: Decoding video...")
@@ -869,6 +1073,7 @@ class OfficialLTX2Engine:
         last_frame_b64: str | None = None,
         audio_b64: str | None = None,
         audio_conditioning_strength: float = 0.3,
+        skip_upscaling: bool | None = None,
     ) -> bytes:
         """
         Unified generation method supporting all conditioning combinations:
@@ -910,6 +1115,9 @@ class OfficialLTX2Engine:
             
             images.append((last_path, num_frames - 1, 1.0))
         
+        # Use default skip_upscaling if not specified
+        do_skip = skip_upscaling if skip_upscaling is not None else self.skip_upscaling
+        
         # If audio is provided, use audio-conditioned generation
         if audio_b64:
             audio_data = base64.b64decode(audio_b64)
@@ -931,6 +1139,7 @@ class OfficialLTX2Engine:
                 audio_latent=audio_latent,
                 output_name=output_name,
                 audio_conditioning_strength=audio_conditioning_strength,
+                skip_upscaling=do_skip,
             )
         else:
             # Standard generation without audio
@@ -943,6 +1152,7 @@ class OfficialLTX2Engine:
                 frame_rate=frame_rate,
                 images=images,
                 output_name=output_name,
+                skip_upscaling=do_skip,
             )
 
     @modal.method()
@@ -1388,6 +1598,12 @@ def web():
                     </div>
                 </div>
                 
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 1rem; cursor: pointer;">
+                    <input type="checkbox" id="skip-upscaling" checked style="width: auto;" />
+                    <span>Skip upscaling (8 steps only, faster)</span>
+                </label>
+                <div class="slider-hint">Unchecked = 12 steps with 2x upscaling (slower, higher quality)</div>
+                
                 <button class="generate" id="generate">Generate Video</button>
                 <div class="status" id="status"></div>
             </div>
@@ -1517,6 +1733,7 @@ def web():
                 fd.append('height', $('height').value);
                 fd.append('num_frames', $('frames').value);
                 fd.append('seed', $('seed').value);
+                fd.append('skip_upscaling', $('skip-upscaling').checked ? 'true' : 'false');
                 
                 if (firstFrameData) {
                     fd.append('first_frame', await fetch(`data:image/png;base64,${firstFrameData}`).then(r => r.blob()), 'first.png');
@@ -1566,6 +1783,7 @@ def web():
         height: int = Form(512),
         num_frames: int = Form(97),
         seed: int = Form(42),
+        skip_upscaling: str = Form("true"),
         first_frame: UploadFile = File(None),
         last_frame: UploadFile = File(None),
         audio: UploadFile = File(None),
@@ -1596,6 +1814,9 @@ def web():
                 if data:
                     audio_b64 = base64.b64encode(data).decode()
             
+            # Parse skip_upscaling (comes as string from form)
+            do_skip_upscaling = skip_upscaling.lower() == "true"
+            
             engine = OfficialLTX2Engine()
             video_bytes = engine.generate.remote(
                 prompt=prompt,
@@ -1608,6 +1829,7 @@ def web():
                 last_frame_b64=last_frame_b64,
                 audio_b64=audio_b64,
                 audio_conditioning_strength=audio_conditioning_strength,
+                skip_upscaling=do_skip_upscaling,
             )
             return Response(content=video_bytes, media_type="video/mp4")
         except Exception as e:

@@ -22,7 +22,7 @@ from flask_socketio import SocketIO
 # Configuration
 LTX2_MODELS_DIR = "/workspace/models/LTX-2"
 GEMMA_DIR = "/workspace/models/gemma"
-USE_FP8 = True  # True = FP8 checkpoint (~27GB), False = BF16 (~43GB)
+USE_FP8 = False  # True = FP8 checkpoint (~27GB), False = BF16 (~43GB)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
@@ -271,25 +271,51 @@ class LTX2StreamingEngine:
         # Store latent for next segment
         self._last_segment_latent = video_state.latent.clone()
 
-        # Decode video - yields frames
+        # Decode video - yields frame chunks
         video_iterator = vae_decode_video(
             video_decoder=self._video_decoder,
             latent=video_state.latent[:1],
         )
 
-        # Convert and yield each frame
-        for frame_tensor in video_iterator:
-            # frame_tensor is typically [C, H, W] or [H, W, C]
-            if isinstance(frame_tensor, torch.Tensor):
-                frame = frame_tensor.cpu().numpy()
-                if frame.shape[0] == 3:  # [C, H, W]
-                    frame = np.transpose(frame, (1, 2, 0))
-                # Normalize to 0-255
-                frame = np.clip(frame * 255, 0, 255).astype(np.uint8)
+        # Collect all chunks and process
+        all_frames = []
+        for chunk in video_iterator:
+            if isinstance(chunk, torch.Tensor):
+                all_frames.append(chunk)
             else:
-                frame = np.array(frame_tensor)
+                all_frames.append(torch.tensor(chunk))
 
-            yield frame
+        # Concatenate chunks - typically [B, T, H, W, C] or [B, C, T, H, W]
+        if len(all_frames) > 0:
+            video_tensor = torch.cat(all_frames, dim=0) if len(all_frames) > 1 else all_frames[0]
+
+            # Debug shape
+            print(f"   Video tensor shape: {video_tensor.shape}", flush=True)
+
+            # Handle various tensor formats
+            video = video_tensor.cpu().numpy()
+
+            # Remove batch dimension if present
+            while len(video.shape) > 4:
+                video = video.squeeze(0)
+
+            # Now should be [T, H, W, C] or [C, T, H, W] or [T, C, H, W]
+            if len(video.shape) == 4:
+                # Check if channels are first or last
+                if video.shape[0] == 3:  # [C, T, H, W]
+                    video = np.transpose(video, (1, 2, 3, 0))  # -> [T, H, W, C]
+                elif video.shape[1] == 3:  # [T, C, H, W]
+                    video = np.transpose(video, (0, 2, 3, 1))  # -> [T, H, W, C]
+                # else assume [T, H, W, C] already
+
+            # Normalize to 0-255 if needed
+            if video.max() <= 1.0:
+                video = video * 255
+            video = np.clip(video, 0, 255).astype(np.uint8)
+
+            # Yield individual frames
+            for i in range(video.shape[0]):
+                yield video[i]
 
     def generate_rolling(
         self,
@@ -470,8 +496,8 @@ def emission_loop():
     """Emit frames to clients via WebSocket."""
     global is_generating, frame_queue
 
-    frame_interval = 1.0 / 24.0  # 24 FPS display
-    print(f"Starting emission loop at 24 FPS...", flush=True)
+    frame_interval = 1.0 / 19.0  # 19 FPS display (matches generation speed)
+    print(f"Starting emission loop at 19 FPS...", flush=True)
 
     frame_num = 0
     while is_generating:

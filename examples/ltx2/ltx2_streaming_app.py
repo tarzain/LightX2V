@@ -33,12 +33,16 @@ is_generating = False
 current_prompt = "A beautiful landscape with mountains and flowing water, cinematic, high quality"
 prompt_lock = threading.Lock()
 frame_queue = queue.Queue(maxsize=256)
+audio_queue = queue.Queue(maxsize=32)  # Audio chunks queue
 hard_reset_requested = False
 
 # Image adjustment parameters
 brightness = 1.0
 contrast = 1.0
 gamma = 1.0
+
+# Audio sample rate (will be set from model)
+audio_sample_rate = 16000
 
 
 class LTX2StreamingEngine:
@@ -96,11 +100,27 @@ class LTX2StreamingEngine:
         print("   Loading transformer (19B)...", flush=True)
         self._transformer = ledger.transformer()
 
+        # Apply torch.compile for faster inference
+        # Note: Using "default" mode instead of "reduce-overhead" because CUDA graphs
+        # require static shapes, but conditioning changes between segments
+        print("   Compiling transformer with torch.compile (default mode)...", flush=True)
+        self._transformer = torch.compile(
+            self._transformer,
+            mode="default",  # Kernel fusion without strict CUDA graph requirements
+            fullgraph=False,  # Allow graph breaks for compatibility
+        )
+
         print("   Loading VAE encoder...", flush=True)
         self._video_encoder = ledger.video_encoder()
 
         print("   Loading VAE decoder...", flush=True)
         self._video_decoder = ledger.video_decoder()
+
+        print("   Loading audio decoder...", flush=True)
+        self._audio_decoder = ledger.audio_decoder()
+
+        print("   Loading vocoder...", flush=True)
+        self._vocoder = ledger.vocoder()
 
         torch.cuda.synchronize()
 
@@ -113,11 +133,15 @@ class LTX2StreamingEngine:
         cached_transformer = self._transformer
         cached_video_encoder = self._video_encoder
         cached_video_decoder = self._video_decoder
+        cached_audio_decoder = self._audio_decoder
+        cached_vocoder = self._vocoder
 
         ledger.text_encoder = lambda: cached_text_encoder
         ledger.transformer = lambda: cached_transformer
         ledger.video_encoder = lambda: cached_video_encoder
         ledger.video_decoder = lambda: cached_video_decoder
+        ledger.audio_decoder = lambda: cached_audio_decoder
+        ledger.vocoder = lambda: cached_vocoder
 
         # Disable cleanup to prevent model unloading
         ledger.cleanup_memory = lambda *args, **kwargs: None
@@ -125,29 +149,37 @@ class LTX2StreamingEngine:
         print("   ModelLedger patched - models stay in VRAM!", flush=True)
 
     def _warmup(self):
-        """Run a warmup generation."""
+        """Run warmup generations to trigger torch.compile and CUDA graph capture."""
         from ltx_core.model.video_vae import TilingConfig
 
-        warmup_height, warmup_width, warmup_frames = 512, 768, 17
+        # Use production resolution for warmup so CUDA graphs match
+        warmup_height, warmup_width, warmup_frames = 480, 832, 49
 
-        print(f"   Warmup: {warmup_height}x{warmup_width}, {warmup_frames} frames...", flush=True)
+        # Run multiple warmup iterations for torch.compile to optimize
+        num_warmup_iters = 2
+        print(f"   Warmup: {num_warmup_iters} iterations at {warmup_height}x{warmup_width}, {warmup_frames} frames...", flush=True)
+        print("   (First iterations trigger torch.compile - may be slow)", flush=True)
 
         with torch.inference_mode():
-            frames = self._generate_segment(
-                prompt="warmup test",
-                seed=42,
-                height=warmup_height,
-                width=warmup_width,
-                num_frames=warmup_frames,
-                frame_rate=24.0,
-                conditioning_latent=None,
-            )
-            # Consume frames
-            for _ in frames:
-                pass
+            for i in range(num_warmup_iters):
+                start_time = time.time()
+                frames = self._generate_segment(
+                    prompt="warmup test video generation",
+                    seed=42 + i,
+                    height=warmup_height,
+                    width=warmup_width,
+                    num_frames=warmup_frames,
+                    frame_rate=24.0,
+                    conditioning_latent=None,
+                )
+                # Consume frames
+                frame_count = sum(1 for _ in frames)
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                print(f"   Warmup {i+1}/{num_warmup_iters}: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} FPS)", flush=True)
 
         torch.cuda.synchronize()
-        print("   Warmup complete!", flush=True)
+        print("   Warmup complete - CUDA graphs should be captured!", flush=True)
 
     def _print_memory_usage(self):
         """Print GPU memory usage."""
@@ -179,6 +211,7 @@ class LTX2StreamingEngine:
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.conditioning import VideoConditionByKeyframeIndex
         from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_core.model.audio_vae import decode_audio
         from ltx_core.text_encoders.gemma import encode_text
         from ltx_core.types import VideoPixelShape
         from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
@@ -271,6 +304,17 @@ class LTX2StreamingEngine:
         # Store latent for next segment
         self._last_segment_latent = video_state.latent.clone()
 
+        # Decode audio
+        audio_waveform = decode_audio(
+            latent=audio_state.latent[:1],
+            audio_decoder=self._audio_decoder,
+            vocoder=self._vocoder,
+        )
+        # Convert to numpy int16 for WAV format
+        audio_np = audio_waveform.cpu().numpy()
+        audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+        print(f"   Audio shape: {audio_np.shape}, sample_rate: {self._audio_decoder.sample_rate}", flush=True)
+
         # Decode video - yields frame chunks
         video_iterator = vae_decode_video(
             video_decoder=self._video_decoder,
@@ -313,9 +357,12 @@ class LTX2StreamingEngine:
                 video = video * 255
             video = np.clip(video, 0, 255).astype(np.uint8)
 
-            # Yield individual frames
+            # Yield individual frames as (frame, None) tuples
             for i in range(video.shape[0]):
-                yield video[i]
+                yield (video[i], None)
+
+            # Yield audio at the end of segment as (None, audio_data) tuple
+            yield (None, audio_np)
 
     def generate_rolling(
         self,
@@ -328,10 +375,13 @@ class LTX2StreamingEngine:
         overlap_frames: int = 8,
     ):
         """
-        Generator that yields frames continuously using rolling segment generation.
+        Generator that yields frames and audio continuously using rolling segment generation.
 
         Each segment uses the last frames from the previous segment as conditioning
         for temporal coherence.
+
+        Yields:
+            tuple: (frame, None) for video frames, (None, audio_data) for segment audio
         """
         self._last_segment_latent = None
         segment_idx = 0
@@ -350,7 +400,8 @@ class LTX2StreamingEngine:
             start_time = time.time()
 
             frame_count = 0
-            for frame in self._generate_segment(
+            segment_audio = None
+            for item in self._generate_segment(
                 prompt=prompt,
                 seed=seg_seed,
                 height=height,
@@ -359,24 +410,34 @@ class LTX2StreamingEngine:
                 frame_rate=frame_rate,
                 conditioning_latent=conditioning_latent,
             ):
-                # Skip overlap frames for non-first segments
-                if segment_idx > 0 and frame_count < overlap_frames:
-                    frame_count += 1
-                    continue
+                frame, audio = item
 
-                yield frame
-                frame_count += 1
+                if frame is not None:
+                    # Skip overlap frames for non-first segments
+                    if segment_idx > 0 and frame_count < overlap_frames:
+                        frame_count += 1
+                        continue
+
+                    yield (frame, None)
+                    frame_count += 1
+                elif audio is not None:
+                    # Store audio for the segment
+                    segment_audio = audio
+
+            # Yield audio at end of segment
+            if segment_audio is not None:
+                yield (None, segment_audio)
 
             gen_time = time.time() - start_time
             fps = frame_count / gen_time if gen_time > 0 else 0
             print(f"Segment {segment_idx + 1}: {frame_count} frames in {gen_time:.2f}s ({fps:.1f} FPS)", flush=True)
 
-            # Memory cleanup between segments
-            gc.collect()
-            torch.cuda.empty_cache()
+            # Skip memory cleanup between segments - we have enough VRAM
+            # gc.collect()
+            # torch.cuda.empty_cache()
 
             segment_idx += 1
-            yield None  # Signal segment boundary
+            yield (None, None)  # Signal segment boundary
 
 
 def apply_image_adjustments(frame: np.ndarray) -> np.ndarray:
@@ -413,16 +474,56 @@ def frame_to_base64(frame: np.ndarray) -> str:
     return f"data:image/jpeg;base64,{img_str}"
 
 
+def audio_to_base64_wav(audio_data: np.ndarray, sample_rate: int) -> str:
+    """Convert numpy audio to base64 WAV string."""
+    import wave
+
+    # Handle different audio shapes
+    if len(audio_data.shape) == 1:
+        # Already mono
+        num_channels = 1
+        audio_flat = audio_data
+    elif len(audio_data.shape) == 2:
+        if audio_data.shape[0] <= 2:
+            # Shape is [channels, samples] - convert to mono by averaging
+            num_channels = 1
+            audio_flat = audio_data.mean(axis=0).astype(np.int16)
+        else:
+            # Shape is [samples, channels] - convert to mono by averaging
+            num_channels = 1
+            audio_flat = audio_data.mean(axis=1).astype(np.int16)
+    else:
+        # Flatten and hope for the best
+        num_channels = 1
+        audio_flat = audio_data.flatten()
+
+    buffer = BytesIO()
+    with wave.open(buffer, 'wb') as wav_file:
+        wav_file.setnchannels(num_channels)
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_flat.astype(np.int16).tobytes())
+
+    wav_bytes = buffer.getvalue()
+    audio_str = base64.b64encode(wav_bytes).decode()
+    return f"data:audio/wav;base64,{audio_str}"
+
+
 @torch.inference_mode()
 def generation_loop():
     """Main generation loop with rolling segments."""
-    global is_generating, current_prompt, engine, frame_queue, hard_reset_requested
+    global is_generating, current_prompt, engine, frame_queue, audio_queue, hard_reset_requested, audio_sample_rate
 
     print("Starting rolling segment generation loop...", flush=True)
 
     last_prompt = current_prompt
     generator = None
     seed = 42
+
+    # Get audio sample rate from engine
+    if engine is not None:
+        audio_sample_rate = engine._audio_decoder.sample_rate
+        print(f"Audio sample rate: {audio_sample_rate} Hz", flush=True)
 
     while is_generating:
         try:
@@ -460,24 +561,39 @@ def generation_loop():
                     )
                     print(f"Prompt updated: {last_prompt[:50]}...", flush=True)
 
-            # Get next frame
-            frame = next(generator)
+            # Get next item (frame, audio) tuple
+            item = next(generator)
+            frame, audio = item
 
-            if frame is None:
+            if frame is None and audio is None:
                 # Segment boundary, continue
                 continue
 
-            # Convert and queue
-            base64_frame = frame_to_base64(frame)
+            if frame is not None:
+                # Convert and queue video frame
+                base64_frame = frame_to_base64(frame)
 
-            try:
-                frame_queue.put(base64_frame, timeout=2.0)
-            except queue.Full:
                 try:
-                    frame_queue.get_nowait()
-                    frame_queue.put(base64_frame, timeout=1.0)
-                except:
-                    pass
+                    frame_queue.put(base64_frame, timeout=2.0)
+                except queue.Full:
+                    try:
+                        frame_queue.get_nowait()
+                        frame_queue.put(base64_frame, timeout=1.0)
+                    except:
+                        pass
+
+            if audio is not None:
+                # Convert and queue audio chunk
+                base64_audio = audio_to_base64_wav(audio, audio_sample_rate)
+
+                try:
+                    audio_queue.put(base64_audio, timeout=2.0)
+                except queue.Full:
+                    try:
+                        audio_queue.get_nowait()
+                        audio_queue.put(base64_audio, timeout=1.0)
+                    except:
+                        pass
 
         except StopIteration:
             # Generator exhausted (shouldn't happen with infinite rolling)
@@ -496,8 +612,8 @@ def emission_loop():
     """Emit frames to clients via WebSocket."""
     global is_generating, frame_queue
 
-    frame_interval = 1.0 / 19.0  # 19 FPS display (matches generation speed)
-    print(f"Starting emission loop at 19 FPS...", flush=True)
+    frame_interval = 1.0 / 20.0  # 20 FPS display (matches generation speed)
+    print(f"Starting emission loop at 20 FPS...", flush=True)
 
     frame_num = 0
     while is_generating:
@@ -515,6 +631,28 @@ def emission_loop():
             break
 
     print("Emission loop stopped.", flush=True)
+
+
+def audio_emission_loop():
+    """Emit audio chunks to clients via WebSocket."""
+    global is_generating, audio_queue
+
+    print("Starting audio emission loop...", flush=True)
+
+    audio_num = 0
+    while is_generating:
+        try:
+            audio = audio_queue.get(timeout=1.0)
+            socketio.emit('audio', {'audio': audio})
+            audio_num += 1
+            print(f"Emitted audio chunk {audio_num}", flush=True)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Error in audio emission: {e}", flush=True)
+            break
+
+    print("Audio emission loop stopped.", flush=True)
 
 
 HTML_TEMPLATE = '''
@@ -609,7 +747,7 @@ HTML_TEMPLATE = '''
 </head>
 <body>
     <h1>LTX-2 Streaming Video</h1>
-    <div class="badge">19B Distilled Model | 8-Step Inference | Rolling Segments | ~11 FPS</div>
+    <div class="badge">19B Distilled Model | 8-Step Inference | torch.compile | ~20 FPS</div>
 
     <div class="container">
         <div class="controls">
@@ -640,13 +778,18 @@ HTML_TEMPLATE = '''
                    oninput="updateImageParam('gamma', this.value)">
             <span class="slider-value" id="gammaValue">1.00</span>
         </div>
+        <div class="slider-container">
+            <label>Volume</label>
+            <input type="range" id="volumeSlider" min="0" max="1" step="0.1" value="0.7">
+            <button id="audioToggle" onclick="toggleAudio()" style="padding: 6px 12px; border: none; border-radius: 4px; background: #e94560; color: white; cursor: pointer; min-width: 70px;">Mute</button>
+        </div>
         <div class="video-container">
             <img id="videoFrame" style="display:none;">
             <div class="placeholder" id="placeholder">Click "Start Stream" to begin</div>
         </div>
         <div class="status" id="status">Connecting...</div>
         <div class="info">
-            <strong>LTX-2 19B Distilled:</strong> 8-step denoising with rolling segment generation.<br>
+            <strong>LTX-2 19B Distilled:</strong> 8-step denoising with rolling segment generation and audio.<br>
             Each segment conditions on the previous for temporal coherence.
         </div>
     </div>
@@ -654,6 +797,34 @@ HTML_TEMPLATE = '''
     <script>
         const socket = io();
         let isStreaming = false;
+
+        // Audio playback queue
+        let audioQueue = [];
+        let isAudioPlaying = false;
+        let audioEnabled = true;
+
+        function playNextAudio() {
+            if (audioQueue.length === 0 || !audioEnabled) {
+                isAudioPlaying = false;
+                return;
+            }
+
+            isAudioPlaying = true;
+            const audioData = audioQueue.shift();
+            const audio = new Audio(audioData);
+            audio.volume = document.getElementById('volumeSlider').value;
+            audio.onended = () => {
+                playNextAudio();
+            };
+            audio.onerror = (e) => {
+                console.error('Audio playback error:', e);
+                playNextAudio();
+            };
+            audio.play().catch(e => {
+                console.error('Audio play failed:', e);
+                playNextAudio();
+            });
+        }
 
         socket.on('connect', () => {
             document.getElementById('status').textContent = 'Connected - Ready';
@@ -673,8 +844,29 @@ HTML_TEMPLATE = '''
             placeholder.style.display = 'none';
         });
 
+        socket.on('audio', (data) => {
+            if (!audioEnabled) return;
+
+            // Add to queue
+            audioQueue.push(data.audio);
+
+            // Start playing if not already
+            if (!isAudioPlaying) {
+                playNextAudio();
+            }
+        });
+
+        function toggleAudio() {
+            audioEnabled = !audioEnabled;
+            document.getElementById('audioToggle').textContent = audioEnabled ? 'Mute' : 'Unmute';
+            if (!audioEnabled) {
+                audioQueue = []; // Clear queue when muting
+            }
+        }
+
         function startStream() {
             const prompt = document.getElementById('promptInput').value;
+            audioQueue = []; // Clear audio queue on start
             fetch('/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -693,6 +885,7 @@ HTML_TEMPLATE = '''
         function stopStream() {
             fetch('/stop', {method: 'POST'}).then(r => r.json()).then(data => {
                 isStreaming = false;
+                audioQueue = []; // Clear audio queue on stop
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('stopBtn').disabled = true;
                 document.getElementById('status').textContent = 'Stopped';
@@ -746,7 +939,7 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start():
-    global is_generating, current_prompt, frame_queue
+    global is_generating, current_prompt, frame_queue, audio_queue
 
     if is_generating:
         return jsonify({'success': False, 'message': 'Already generating'})
@@ -755,10 +948,15 @@ def start():
     with prompt_lock:
         current_prompt = data.get('prompt', current_prompt)
 
-    # Clear queue
+    # Clear queues
     while not frame_queue.empty():
         try:
             frame_queue.get_nowait()
+        except queue.Empty:
+            break
+    while not audio_queue.empty():
+        try:
+            audio_queue.get_nowait()
         except queue.Empty:
             break
 
@@ -766,6 +964,7 @@ def start():
 
     threading.Thread(target=generation_loop, daemon=True).start()
     threading.Thread(target=emission_loop, daemon=True).start()
+    threading.Thread(target=audio_emission_loop, daemon=True).start()
 
     return jsonify({'success': True})
 

@@ -373,6 +373,7 @@ class LTX2StreamingEngine:
         frame_rate: float = 24.0,
         segment_frames: int = 49,  # ~2 seconds at 24fps
         overlap_frames: int = 8,
+        reset_history: bool = True,
     ):
         """
         Generator that yields frames and audio continuously using rolling segment generation.
@@ -380,10 +381,15 @@ class LTX2StreamingEngine:
         Each segment uses the last frames from the previous segment as conditioning
         for temporal coherence.
 
+        Args:
+            reset_history: If True, clears video history and starts fresh.
+                          If False, continues from previous segment for smooth transitions.
+
         Yields:
             tuple: (frame, None) for video frames, (None, audio_data) for segment audio
         """
-        self._last_segment_latent = None
+        if reset_history:
+            self._last_segment_latent = None
         segment_idx = 0
 
         while True:
@@ -542,6 +548,7 @@ def generation_loop():
                     frame_rate=24.0,
                     segment_frames=49,  # ~2 seconds
                     overlap_frames=8,
+                    reset_history=True,  # Fresh start
                 )
                 print(f"Started generation with prompt: {last_prompt[:50]}...", flush=True)
 
@@ -558,8 +565,9 @@ def generation_loop():
                         frame_rate=24.0,
                         segment_frames=49,
                         overlap_frames=8,
+                        reset_history=False,  # Preserve continuity on prompt change
                     )
-                    print(f"Prompt updated: {last_prompt[:50]}...", flush=True)
+                    print(f"Prompt updated (preserving continuity): {last_prompt[:50]}...", flush=True)
 
             # Get next item (frame, audio) tuple
             item = next(generator)

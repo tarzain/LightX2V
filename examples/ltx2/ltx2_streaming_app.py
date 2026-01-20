@@ -36,13 +36,21 @@ frame_queue = queue.Queue(maxsize=256)
 audio_queue = queue.Queue(maxsize=32)  # Audio chunks queue
 hard_reset_requested = False
 
-# Image adjustment parameters
-brightness = 1.0
-contrast = 1.0
-gamma = 1.0
-
 # Audio sample rate - vocoder outputs at 24kHz (not the decoder's 16kHz mel rate)
 audio_sample_rate = 24000
+
+# Target image conditioning (optional end-frame target)
+target_image_latent = None
+target_image_lock = threading.Lock()
+
+
+def get_and_clear_target_image():
+    """Get the target image latent and clear it (so it's only used for one segment)."""
+    global target_image_latent
+    with target_image_lock:
+        latent = target_image_latent
+        target_image_latent = None
+    return latent
 
 
 class LTX2StreamingEngine:
@@ -188,6 +196,12 @@ class LTX2StreamingEngine:
             reserved = torch.cuda.memory_reserved() / 1e9
             print(f"GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved", flush=True)
 
+    def encode_image(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """Encode an image tensor to latent space for conditioning."""
+        with torch.inference_mode():
+            encoded = self._video_encoder(image_tensor)
+        return encoded
+
     def _generate_segment(
         self,
         prompt: str,
@@ -197,12 +211,14 @@ class LTX2StreamingEngine:
         num_frames: int,
         frame_rate: float,
         conditioning_latent=None,
+        end_frame_latent=None,
     ):
         """
         Generate a single video segment and yield frames.
 
         Args:
             conditioning_latent: Optional latent from previous segment for continuity
+            end_frame_latent: Optional latent for end-frame conditioning (target image)
 
         Yields:
             numpy arrays of shape [H, W, 3] uint8
@@ -260,13 +276,22 @@ class LTX2StreamingEngine:
         # Build conditionings
         conditionings = []
         if conditioning_latent is not None:
-            # Use last frames from previous segment as conditioning
-            video_conditioning = VideoConditionByKeyframeIndex(
+            # Use last frames from previous segment as start-frame conditioning
+            start_conditioning = VideoConditionByKeyframeIndex(
                 keyframes=conditioning_latent,
                 frame_idx=0,
                 strength=1.0,
             )
-            conditionings = [video_conditioning]
+            conditionings.append(start_conditioning)
+
+        if end_frame_latent is not None:
+            # Use target image as end-frame conditioning
+            end_conditioning = VideoConditionByKeyframeIndex(
+                keyframes=end_frame_latent,
+                frame_idx=num_frames - 1,  # Last frame
+                strength=1.0,
+            )
+            conditionings.append(end_conditioning)
 
         # Initialize video state
         video_state, video_tools = noise_video_state(
@@ -402,7 +427,10 @@ class LTX2StreamingEngine:
                 latent_overlap = max(1, overlap_frames // 8)  # Temporal compression ~8x
                 conditioning_latent = self._last_segment_latent[:, :, -latent_overlap:, :, :]
 
-            print(f"Generating segment {segment_idx + 1} ({segment_frames} frames)...", flush=True)
+            # Get target image latent (if set) and clear it so it's only used once
+            end_frame_latent = get_and_clear_target_image()
+
+            print(f"Generating segment {segment_idx + 1} ({segment_frames} frames){' with target image' if end_frame_latent is not None else ''}...", flush=True)
             start_time = time.time()
 
             frame_count = 0
@@ -415,6 +443,7 @@ class LTX2StreamingEngine:
                 num_frames=segment_frames,
                 frame_rate=frame_rate,
                 conditioning_latent=conditioning_latent,
+                end_frame_latent=end_frame_latent,
             ):
                 frame, audio = item
 
@@ -446,33 +475,8 @@ class LTX2StreamingEngine:
             yield (None, None)  # Signal segment boundary
 
 
-def apply_image_adjustments(frame: np.ndarray) -> np.ndarray:
-    """Apply brightness, contrast, and gamma adjustments."""
-    global brightness, contrast, gamma
-
-    if brightness == 1.0 and contrast == 1.0 and gamma == 1.0:
-        return frame
-
-    f = frame.astype(np.float32) / 255.0
-
-    # Gamma correction
-    if gamma != 1.0:
-        f = np.power(f, gamma)
-
-    # Contrast around midpoint
-    if contrast != 1.0:
-        f = (f - 0.5) * contrast + 0.5
-
-    # Brightness
-    if brightness != 1.0:
-        f = f * brightness
-
-    return np.clip(f * 255, 0, 255).astype(np.uint8)
-
-
 def frame_to_base64(frame: np.ndarray) -> str:
     """Convert numpy frame to base64 JPEG string."""
-    frame = apply_image_adjustments(frame)
     img = Image.fromarray(frame)
     buffer = BytesIO()
     img.save(buffer, format='JPEG', quality=85)
@@ -750,7 +754,25 @@ HTML_TEMPLATE = '''
             -webkit-appearance: none; width: 18px; height: 18px;
             background: #e94560; border-radius: 50%; cursor: pointer;
         }
-        .slider-value { color: #e94560; font-weight: bold; min-width: 45px; text-align: right; }
+        .target-image-row {
+            display: flex; gap: 8px; align-items: center; margin-bottom: 12px;
+        }
+        .target-image-preview {
+            width: 80px; height: 45px; border-radius: 4px; background: #0a0a15;
+            border: 1px dashed rgba(233, 69, 96, 0.3); display: flex; align-items: center;
+            justify-content: center; overflow: hidden; flex-shrink: 0;
+        }
+        .target-image-preview img { width: 100%; height: 100%; object-fit: cover; }
+        .target-image-preview .placeholder-text { color: #666; font-size: 9px; text-align: center; }
+        .target-image-preview.has-image { border: 2px solid #4ade80; }
+        .file-input-wrapper {
+            position: relative; overflow: hidden; display: inline-block;
+        }
+        .file-input-wrapper input[type=file] {
+            position: absolute; left: 0; top: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+        }
+        .btn-upload { background: linear-gradient(135deg, #0f3460, #16213e); color: #fff; border: 1px solid #e94560; }
+        .btn-clear { background: rgba(255, 71, 87, 0.8); color: #fff; padding: 4px 8px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; }
     </style>
 </head>
 <body>
@@ -768,23 +790,15 @@ HTML_TEMPLATE = '''
             <button class="btn-stop" onclick="stopStream()" id="stopBtn" disabled>Stop</button>
             <button class="btn-reset" onclick="hardReset()">Reset</button>
         </div>
-        <div class="slider-container">
-            <label>Brightness</label>
-            <input type="range" id="brightnessSlider" min="0.5" max="1.5" step="0.05" value="1.0"
-                   oninput="updateImageParam('brightness', this.value)">
-            <span class="slider-value" id="brightnessValue">1.00</span>
-        </div>
-        <div class="slider-container">
-            <label>Contrast</label>
-            <input type="range" id="contrastSlider" min="0.5" max="2.0" step="0.05" value="1.0"
-                   oninput="updateImageParam('contrast', this.value)">
-            <span class="slider-value" id="contrastValue">1.00</span>
-        </div>
-        <div class="slider-container">
-            <label>Gamma</label>
-            <input type="range" id="gammaSlider" min="0.5" max="2.0" step="0.05" value="1.0"
-                   oninput="updateImageParam('gamma', this.value)">
-            <span class="slider-value" id="gammaValue">1.00</span>
+        <div class="target-image-row">
+            <div class="target-image-preview" id="targetPreview">
+                <span class="placeholder-text">No target</span>
+            </div>
+            <div class="file-input-wrapper">
+                <button class="btn-upload" style="padding: 8px 12px; font-size: 12px;">Target Image</button>
+                <input type="file" id="targetImageInput" accept="image/*" onchange="stageTargetImage(this)">
+            </div>
+            <button class="btn-clear" onclick="clearTargetImage()" id="clearTargetBtn" style="display:none;">✕</button>
         </div>
         <div class="slider-container">
             <label>Volume</label>
@@ -909,8 +923,67 @@ HTML_TEMPLATE = '''
             });
         }
 
-        function updatePrompt() {
+        // Staged target image (not yet uploaded)
+        let stagedImageFile = null;
+
+        function stageTargetImage(input) {
+            if (input.files && input.files[0]) {
+                stagedImageFile = input.files[0];
+
+                // Show preview
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const preview = document.getElementById('targetPreview');
+                    preview.innerHTML = '<img src="' + e.target.result + '" alt="Target">';
+                    preview.classList.add('has-image');
+                };
+                reader.readAsDataURL(stagedImageFile);
+
+                document.getElementById('clearTargetBtn').style.display = 'inline-block';
+            }
+        }
+
+        function clearTargetImage() {
+            stagedImageFile = null;
+            document.getElementById('targetPreview').innerHTML = '<span class="placeholder-text">No target</span>';
+            document.getElementById('targetPreview').classList.remove('has-image');
+            document.getElementById('clearTargetBtn').style.display = 'none';
+            document.getElementById('targetImageInput').value = '';
+
+            // Also clear on server if already uploaded
+            fetch('/clear_target_image', {method: 'POST'});
+        }
+
+        async function updatePrompt() {
             const prompt = document.getElementById('promptInput').value;
+
+            // If there's a staged image, upload it first
+            if (stagedImageFile) {
+                const formData = new FormData();
+                formData.append('image', stagedImageFile);
+
+                try {
+                    const response = await fetch('/upload_target_image', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await response.json();
+                    if (data.success) {
+                        console.log('Target image uploaded');
+                    } else {
+                        console.error('Failed to upload target image:', data.message);
+                    }
+                } catch (err) {
+                    console.error('Error uploading target image:', err);
+                }
+                // Clear staged file after upload (it's now on the server)
+                stagedImageFile = null;
+            } else {
+                // No staged image - clear any existing target on server
+                await fetch('/clear_target_image', {method: 'POST'});
+            }
+
+            // Now update the prompt
             fetch('/update_prompt', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -919,15 +992,6 @@ HTML_TEMPLATE = '''
                 if (data.success) {
                     document.getElementById('status').textContent = 'Prompt updated!';
                 }
-            });
-        }
-
-        function updateImageParam(param, value) {
-            document.getElementById(param + 'Value').textContent = parseFloat(value).toFixed(2);
-            fetch('/update_image_params', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({[param]: parseFloat(value)})
             });
         }
 
@@ -1000,18 +1064,64 @@ def update_prompt():
     return jsonify({'success': True})
 
 
-@app.route('/update_image_params', methods=['POST'])
-def update_image_params():
-    global brightness, contrast, gamma
-    data = request.json
-    if 'brightness' in data:
-        brightness = float(data['brightness'])
-    if 'contrast' in data:
-        contrast = float(data['contrast'])
-    if 'gamma' in data:
-        gamma = float(data['gamma'])
-    print(f"Image params: brightness={brightness}, contrast={contrast}, gamma={gamma}", flush=True)
-    return jsonify({'success': True})
+@app.route('/upload_target_image', methods=['POST'])
+def upload_target_image():
+    """Upload and encode a target image for end-frame conditioning."""
+    global target_image_latent, engine
+
+    if engine is None:
+        return jsonify({'success': False, 'message': 'Engine not initialized'})
+
+    if 'image' not in request.files:
+        return jsonify({'success': False, 'message': 'No image file provided'})
+
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'success': False, 'message': 'No image selected'})
+
+    try:
+        # Load and preprocess image
+        img = Image.open(file.stream).convert('RGB')
+
+        # Resize to match generation resolution (480x832)
+        target_height, target_width = 480, 832
+        img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+        # Convert to tensor: [B, C, T, H, W] where T=1 for single frame
+        # Normalize to [-1, 1] range (same as LTX's normalize_latent: x / 127.5 - 1.0)
+        img_np = np.array(img).astype(np.float32) / 127.5 - 1.0  # [H, W, C] in [-1, 1] range
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)  # [C, H, W]
+        img_tensor = img_tensor.unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
+        img_tensor = img_tensor.to(dtype=torch.bfloat16, device=engine.pipeline.device)
+
+        # Encode to latent space
+        with torch.inference_mode():
+            encoded_latent = engine.encode_image(img_tensor)
+
+        # Store globally
+        with target_image_lock:
+            target_image_latent = encoded_latent
+
+        print(f"Target image uploaded and encoded. Latent shape: {encoded_latent.shape}", flush=True)
+        return jsonify({'success': True, 'message': 'Target image set'})
+
+    except Exception as e:
+        print(f"Error encoding target image: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': str(e)})
+
+
+@app.route('/clear_target_image', methods=['POST'])
+def clear_target_image():
+    """Clear the target image conditioning."""
+    global target_image_latent
+
+    with target_image_lock:
+        target_image_latent = None
+
+    print("Target image cleared", flush=True)
+    return jsonify({'success': True, 'message': 'Target image cleared'})
 
 
 if __name__ == '__main__':

@@ -1839,10 +1839,272 @@ class OfficialLTX2Engine:
         
         gc.collect()
         torch.cuda.empty_cache()
-        
+
         total_duration = num_frames / frame_rate
         print(f"   Rolling: Complete! Output: {out_path} ({num_frames} frames, {total_duration:.1f}s)")
         return video_bytes
+
+    def generate_streaming(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        use_second_stage: bool = False,
+    ):
+        """
+        Generator that yields frames for real-time streaming.
+
+        Yields:
+            dict with either:
+            - {"type": "frame", "data": base64_jpeg, "index": int}
+            - {"type": "audio", "data": base64_wav, "sample_rate": int}
+            - {"type": "segment_complete", "segment": int, "frames": int}
+        """
+        import gc
+        import torch
+        import numpy as np
+        import base64
+        from io import BytesIO
+        from PIL import Image
+        from ltx_core.components.diffusion_steps import EulerDiffusionStep
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.conditioning import VideoConditionByKeyframeIndex
+        from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+        from ltx_core.model.upsampler import upsample_video
+        from ltx_core.text_encoders.gemma import encode_text
+        from ltx_core.types import VideoPixelShape
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils.helpers import (
+            euler_denoising_loop,
+            noise_video_state,
+            noise_audio_state,
+            simple_denoising_func,
+        )
+
+        device = self.pipeline.device
+        dtype = torch.bfloat16
+
+        # Use 49 frames per segment (like the streaming app)
+        segment_frames = num_frames
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        with torch.inference_mode():
+            # Pre-encode text
+            text_encoder = self._text_encoder
+            video_encoder = self._video_encoder
+            video_decoder = self._video_decoder
+            transformer = self._transformer
+
+            context_p = encode_text(text_encoder, prompts=[prompt])[0]
+            video_context, audio_context = context_p
+
+            # Sigmas for denoising
+            stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+
+            def denoising_loop(sigmas, video_state, audio_state, stepper):
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=video_context,
+                        audio_context=audio_context,
+                        transformer=transformer,
+                    ),
+                )
+
+            generator = torch.Generator(device=device).manual_seed(seed)
+            noiser = GaussianNoiser(generator=generator)
+            stepper = EulerDiffusionStep()
+
+            output_shape = VideoPixelShape(
+                batch=1,
+                frames=segment_frames,
+                width=width,
+                height=height,
+                fps=frame_rate,
+            )
+
+            # No conditioning for first segment
+            conditionings = []
+
+            # Initialize video state
+            video_state, video_tools = noise_video_state(
+                output_shape=output_shape,
+                noiser=noiser,
+                conditionings=conditionings,
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=1.0,
+                initial_latent=None,
+            )
+
+            # Initialize audio state
+            audio_state, audio_tools = noise_audio_state(
+                output_shape=output_shape,
+                noiser=noiser,
+                conditionings=[],
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=1.0,
+                initial_latent=None,
+            )
+
+            # Run stage 1 denoising (8 steps)
+            print(f"   Streaming: Stage 1 denoising ({len(stage_1_sigmas)} steps)...", flush=True)
+            video_state, audio_state = denoising_loop(stage_1_sigmas, video_state, audio_state, stepper)
+
+            # Clear conditioning and unpatchify
+            video_state = video_tools.clear_conditioning(video_state)
+            video_state = video_tools.unpatchify(video_state)
+            audio_state = audio_tools.clear_conditioning(audio_state)
+            audio_state = audio_tools.unpatchify(audio_state)
+
+            # Determine latent for decode
+            if use_second_stage:
+                print(f"   Streaming: Stage 2 upsampling and refinement...", flush=True)
+                # Upsample with proper normalization
+                upsampled_latent = upsample_video(
+                    latent=video_state.latent[:1],
+                    video_encoder=video_encoder,
+                    upsampler=self._spatial_upsampler,
+                )
+
+                # Stage 2 output shape at 2x resolution
+                stage_2_shape = VideoPixelShape(
+                    batch=1,
+                    frames=segment_frames,
+                    width=width * 2,
+                    height=height * 2,
+                    fps=frame_rate,
+                )
+
+                # Re-initialize for stage 2
+                video_state_2, video_tools_2 = noise_video_state(
+                    output_shape=stage_2_shape,
+                    noiser=noiser,
+                    conditionings=[],
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=stage_2_sigmas[0].item(),
+                    initial_latent=upsampled_latent,
+                )
+
+                audio_state_2, audio_tools_2 = noise_audio_state(
+                    output_shape=stage_2_shape,
+                    noiser=noiser,
+                    conditionings=[],
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=stage_2_sigmas[0].item(),
+                    initial_latent=audio_state.latent,
+                )
+
+                # Run stage 2 denoising (4 steps)
+                video_state_2, audio_state_2 = denoising_loop(stage_2_sigmas, video_state_2, audio_state_2, stepper)
+
+                # Clear and unpatchify
+                video_state_2 = video_tools_2.clear_conditioning(video_state_2)
+                video_state_2 = video_tools_2.unpatchify(video_state_2)
+                audio_state_2 = audio_tools_2.clear_conditioning(audio_state_2)
+                audio_state_2 = audio_tools_2.unpatchify(audio_state_2)
+
+                video_latent_for_decode = video_state_2.latent
+                final_audio_state = audio_state_2
+            else:
+                video_latent_for_decode = video_state.latent
+                final_audio_state = audio_state
+
+            # Decode audio
+            print(f"   Streaming: Decoding audio...", flush=True)
+            audio_waveform = vae_decode_audio(
+                latent=final_audio_state.latent[:1],
+                audio_decoder=self._audio_decoder,
+                vocoder=self._vocoder,
+            )
+            audio_np = audio_waveform.cpu().numpy()
+            audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+
+            # Convert audio to base64 WAV
+            import wave
+            import struct
+            audio_buffer = BytesIO()
+            with wave.open(audio_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(2 if audio_np.ndim > 1 and audio_np.shape[0] == 2 else 1)
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(24000)  # Vocoder output rate
+                # Interleave stereo channels if needed
+                if audio_np.ndim > 1 and audio_np.shape[0] == 2:
+                    audio_interleaved = audio_np.T.flatten()
+                else:
+                    audio_interleaved = audio_np.flatten()
+                wav_file.writeframes(audio_interleaved.tobytes())
+
+            audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
+            yield {"type": "audio", "data": audio_base64, "sample_rate": 24000}
+
+            # Decode video - yields frame chunks
+            print(f"   Streaming: Decoding video frames...", flush=True)
+            video_iterator = vae_decode_video(
+                video_decoder=video_decoder,
+                latent=video_latent_for_decode[:1],
+            )
+
+            # Collect all chunks and process
+            all_frames = []
+            for chunk in video_iterator:
+                if isinstance(chunk, torch.Tensor):
+                    all_frames.append(chunk)
+                else:
+                    all_frames.append(torch.tensor(chunk))
+
+            if len(all_frames) > 0:
+                video_tensor = torch.cat(all_frames, dim=0) if len(all_frames) > 1 else all_frames[0]
+                video = video_tensor.cpu().numpy()
+
+                # Remove batch dimension if present
+                while len(video.shape) > 4:
+                    video = video.squeeze(0)
+
+                # Handle tensor format
+                if len(video.shape) == 4:
+                    if video.shape[0] == 3:  # [C, T, H, W]
+                        video = np.transpose(video, (1, 2, 3, 0))
+                    elif video.shape[1] == 3:  # [T, C, H, W]
+                        video = np.transpose(video, (0, 2, 3, 1))
+
+                # Normalize to 0-255
+                if video.max() <= 1.0:
+                    video = video * 255
+                video = np.clip(video, 0, 255).astype(np.uint8)
+
+                print(f"   Streaming: Yielding {video.shape[0]} frames...", flush=True)
+
+                # Yield each frame as base64 JPEG
+                for i in range(video.shape[0]):
+                    frame = video[i]
+                    img = Image.fromarray(frame)
+                    buffer = BytesIO()
+                    img.save(buffer, format='JPEG', quality=85)
+                    frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                    yield {"type": "frame", "data": frame_base64, "index": i}
+
+            yield {"type": "segment_complete", "segment": 1, "frames": segment_frames}
+
+            gc.collect()
+            torch.cuda.empty_cache()
 
     @modal.method()
     def generate_t2v(
@@ -2047,15 +2309,181 @@ class OfficialLTX2Engine:
             audio_conditioning_strength=audio_conditioning_strength,
         )
 
+    @modal.asgi_app()
+    def streaming_app(self):
+        """
+        ASGI app for real-time WebSocket streaming with access to preloaded models.
+
+        Endpoints:
+        - GET /stream - Streaming UI
+        - WS /ws/stream - WebSocket for real-time frame streaming
+        - GET /health - Health check
+        """
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi.responses import HTMLResponse
+        from fastapi.middleware.cors import CORSMiddleware
+        import asyncio
+        import json
+
+        app = FastAPI(title="LTX-2 Streaming API")
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        engine = self  # Reference to the engine with preloaded models
+
+        @app.get("/", response_class=HTMLResponse)
+        async def index():
+            return HTMLResponse(STREAMING_HTML)
+
+        @app.get("/stream", response_class=HTMLResponse)
+        async def stream_ui():
+            return HTMLResponse(STREAMING_HTML)
+
+        @app.get("/health")
+        async def health():
+            return {"status": "healthy", "model": "LTX-2 Streaming", "streaming": True}
+
+        @app.websocket("/ws/stream")
+        async def websocket_stream(websocket: WebSocket):
+            """WebSocket endpoint for real-time video streaming."""
+            await websocket.accept()
+
+            current_prompt = None
+            should_stop = False
+            segment_count = 0
+
+            try:
+                while True:
+                    try:
+                        data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                        msg = json.loads(data)
+
+                        if msg.get("action") == "stop":
+                            should_stop = True
+                            await websocket.send_json({"type": "stopped"})
+                            break
+
+                        elif msg.get("action") == "update_prompt":
+                            current_prompt = msg.get("prompt", current_prompt)
+                            await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+
+                        elif msg.get("action") == "start":
+                            current_prompt = msg.get("prompt", "A beautiful landscape")
+                            seed = msg.get("seed", 42)
+                            height = msg.get("height", 480)
+                            width = msg.get("width", 832)
+                            num_frames = msg.get("num_frames", 49)
+                            frame_rate = msg.get("frame_rate", 24.0)
+                            use_second_stage = msg.get("use_second_stage", False)
+                            max_segments = msg.get("max_segments", 10)
+
+                            await websocket.send_json({"type": "started", "prompt": current_prompt})
+
+                            segment_count = 0
+                            should_stop = False
+
+                            while not should_stop and segment_count < max_segments:
+                                segment_count += 1
+                                seg_seed = seed + segment_count
+
+                                # Check for messages
+                                try:
+                                    check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.01)
+                                    check_msg = json.loads(check_data)
+                                    if check_msg.get("action") == "stop":
+                                        should_stop = True
+                                        break
+                                    elif check_msg.get("action") == "update_prompt":
+                                        current_prompt = check_msg.get("prompt", current_prompt)
+                                        await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+                                except asyncio.TimeoutError:
+                                    pass
+
+                                if should_stop:
+                                    break
+
+                                await websocket.send_json({
+                                    "type": "segment_start",
+                                    "segment": segment_count,
+                                    "prompt": current_prompt
+                                })
+
+                                # Run generation in thread pool
+                                import concurrent.futures
+                                loop = asyncio.get_event_loop()
+
+                                # Capture variables for closure
+                                _prompt = current_prompt
+                                _seed = seg_seed
+                                _height = height
+                                _width = width
+                                _frames = num_frames
+                                _fps = frame_rate
+                                _stage2 = use_second_stage
+
+                                def run_generation():
+                                    return list(engine.generate_streaming(
+                                        prompt=_prompt,
+                                        seed=_seed,
+                                        height=_height,
+                                        width=_width,
+                                        num_frames=_frames,
+                                        frame_rate=_fps,
+                                        use_second_stage=_stage2,
+                                    ))
+
+                                with concurrent.futures.ThreadPoolExecutor() as pool:
+                                    results = await loop.run_in_executor(pool, run_generation)
+
+                                for item in results:
+                                    if should_stop:
+                                        break
+                                    await websocket.send_json(item)
+
+                                    try:
+                                        check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                                        check_msg = json.loads(check_data)
+                                        if check_msg.get("action") == "stop":
+                                            should_stop = True
+                                            break
+                                        elif check_msg.get("action") == "update_prompt":
+                                            current_prompt = check_msg.get("prompt", current_prompt)
+                                    except asyncio.TimeoutError:
+                                        pass
+
+                            if should_stop:
+                                await websocket.send_json({"type": "stopped"})
+                            else:
+                                await websocket.send_json({"type": "complete", "segments": segment_count})
+
+                    except asyncio.TimeoutError:
+                        continue
+
+            except WebSocketDisconnect:
+                print("WebSocket disconnected")
+            except Exception as e:
+                try:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+                except:
+                    pass
+
+        return app
+
 
 # ============================================================================
 # Web API
 # ============================================================================
 
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import json
 
 class T2VRequest(BaseModel):
     prompt: str
@@ -2708,7 +3136,500 @@ def web():
     async def health():
         return {"status": "healthy", "model": "LTX-2 19B DistilledPipeline (8-step, FP8)"}
 
+    @web_app.websocket("/ws/stream")
+    async def websocket_stream(websocket: WebSocket):
+        """
+        WebSocket endpoint for real-time video streaming.
+
+        Client sends:
+        - {"action": "start", "prompt": str, "seed": int, "height": int, "width": int,
+           "num_frames": int, "frame_rate": float, "use_second_stage": bool}
+        - {"action": "update_prompt", "prompt": str}
+        - {"action": "stop"}
+
+        Server sends:
+        - {"type": "frame", "data": base64_jpeg, "index": int}
+        - {"type": "audio", "data": base64_wav, "sample_rate": int}
+        - {"type": "segment_complete", "segment": int, "frames": int}
+        - {"type": "error", "message": str}
+        - {"type": "stopped"}
+        """
+        await websocket.accept()
+
+        engine = OfficialLTX2Engine()
+        current_prompt = None
+        should_stop = False
+        segment_count = 0
+        last_segment_latent = None
+
+        try:
+            while True:
+                # Wait for a message from the client
+                try:
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                    msg = json.loads(data)
+
+                    if msg.get("action") == "stop":
+                        should_stop = True
+                        await websocket.send_json({"type": "stopped"})
+                        break
+
+                    elif msg.get("action") == "update_prompt":
+                        current_prompt = msg.get("prompt", current_prompt)
+                        await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+
+                    elif msg.get("action") == "start":
+                        current_prompt = msg.get("prompt", "A beautiful landscape")
+                        seed = msg.get("seed", 42)
+                        height = msg.get("height", 480)
+                        width = msg.get("width", 832)
+                        num_frames = msg.get("num_frames", 49)
+                        frame_rate = msg.get("frame_rate", 24.0)
+                        use_second_stage = msg.get("use_second_stage", False)
+                        max_segments = msg.get("max_segments", 10)  # Limit segments
+
+                        await websocket.send_json({"type": "started", "prompt": current_prompt})
+
+                        # Generate segments continuously
+                        segment_count = 0
+                        while not should_stop and segment_count < max_segments:
+                            segment_count += 1
+                            seg_seed = seed + segment_count
+
+                            # Check for stop/update messages during generation
+                            try:
+                                check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.01)
+                                check_msg = json.loads(check_data)
+                                if check_msg.get("action") == "stop":
+                                    should_stop = True
+                                    break
+                                elif check_msg.get("action") == "update_prompt":
+                                    current_prompt = check_msg.get("prompt", current_prompt)
+                                    await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+                            except asyncio.TimeoutError:
+                                pass
+
+                            if should_stop:
+                                break
+
+                            # Generate segment
+                            await websocket.send_json({
+                                "type": "segment_start",
+                                "segment": segment_count,
+                                "prompt": current_prompt
+                            })
+
+                            # Run generation in thread pool to not block
+                            import concurrent.futures
+                            loop = asyncio.get_event_loop()
+
+                            def run_generation():
+                                return list(engine.generate_streaming(
+                                    prompt=current_prompt,
+                                    seed=seg_seed,
+                                    height=height,
+                                    width=width,
+                                    num_frames=num_frames,
+                                    frame_rate=frame_rate,
+                                    use_second_stage=use_second_stage,
+                                ))
+
+                            with concurrent.futures.ThreadPoolExecutor() as pool:
+                                results = await loop.run_in_executor(pool, run_generation)
+
+                            # Send all results
+                            for item in results:
+                                if should_stop:
+                                    break
+                                await websocket.send_json(item)
+
+                                # Check for stop between frames
+                                try:
+                                    check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                                    check_msg = json.loads(check_data)
+                                    if check_msg.get("action") == "stop":
+                                        should_stop = True
+                                        break
+                                    elif check_msg.get("action") == "update_prompt":
+                                        current_prompt = check_msg.get("prompt", current_prompt)
+                                except asyncio.TimeoutError:
+                                    pass
+
+                        if should_stop:
+                            await websocket.send_json({"type": "stopped"})
+                        else:
+                            await websocket.send_json({"type": "complete", "segments": segment_count})
+
+                except asyncio.TimeoutError:
+                    # No message, continue waiting
+                    continue
+
+        except WebSocketDisconnect:
+            print("WebSocket disconnected")
+        except Exception as e:
+            try:
+                await websocket.send_json({"type": "error", "message": str(e)})
+            except:
+                pass
+            raise
+
+    @web_app.get("/stream", response_class=HTMLResponse)
+    async def stream_ui():
+        """Serve the streaming web UI."""
+        return HTMLResponse(STREAMING_HTML)
+
     return web_app
+
+
+# Streaming UI HTML
+STREAMING_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LTX-2 Streaming</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #0a0a15 0%, #1a1a2e 50%, #0f0f1a 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 {
+            font-size: 2rem;
+            background: linear-gradient(90deg, #00d4ff, #e94560);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 20px;
+        }
+        .layout { display: grid; grid-template-columns: 350px 1fr; gap: 20px; }
+        @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+
+        .controls {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        label { display: block; color: #888; font-size: 0.85rem; margin: 15px 0 5px; }
+        label:first-child { margin-top: 0; }
+        input, textarea, select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: rgba(0,0,0,0.3);
+            color: #fff;
+            font-size: 0.95rem;
+        }
+        textarea { min-height: 80px; resize: vertical; }
+        input:focus, textarea:focus { outline: none; border-color: #e94560; }
+
+        .row { display: flex; gap: 10px; }
+        .row > * { flex: 1; }
+
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .checkbox-row input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: #e94560;
+        }
+        .checkbox-row label { margin: 0; color: #fff; }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            margin-top: 20px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-start {
+            background: linear-gradient(135deg, #e94560, #7b2fff);
+            color: white;
+        }
+        .btn-start:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(233,69,96,0.4); }
+        .btn-stop {
+            background: #ff4444;
+            color: white;
+        }
+        .btn-update {
+            background: #333;
+            color: white;
+            margin-top: 10px;
+        }
+
+        .video-container {
+            background: rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+        #videoCanvas {
+            width: 100%;
+            height: auto;
+            display: block;
+            background: #000;
+        }
+        .status-bar {
+            padding: 10px 15px;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.85rem;
+        }
+        .status { color: #888; }
+        .status.connected { color: #00ff88; }
+        .status.generating { color: #e94560; }
+        .stats { color: #666; }
+
+        .log {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            max-height: 150px;
+            overflow-y: auto;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 LTX-2 Real-Time Streaming</h1>
+        <div class="layout">
+            <div class="controls">
+                <label>Prompt</label>
+                <textarea id="prompt">A serene mountain landscape with flowing rivers and dramatic clouds, cinematic lighting, high quality</textarea>
+
+                <div class="row">
+                    <div>
+                        <label>Width</label>
+                        <input type="number" id="width" value="832" step="32">
+                    </div>
+                    <div>
+                        <label>Height</label>
+                        <input type="number" id="height" value="480" step="32">
+                    </div>
+                </div>
+
+                <div class="row">
+                    <div>
+                        <label>Frames</label>
+                        <input type="number" id="numFrames" value="49" min="17" max="97">
+                    </div>
+                    <div>
+                        <label>FPS</label>
+                        <input type="number" id="frameRate" value="24" min="1" max="60">
+                    </div>
+                </div>
+
+                <div class="row">
+                    <div>
+                        <label>Seed</label>
+                        <input type="number" id="seed" value="42">
+                    </div>
+                    <div>
+                        <label>Max Segments</label>
+                        <input type="number" id="maxSegments" value="5" min="1" max="20">
+                    </div>
+                </div>
+
+                <div class="checkbox-row">
+                    <input type="checkbox" id="useSecondStage">
+                    <label for="useSecondStage">2x Upsampling (960x1664)</label>
+                </div>
+
+                <button class="btn btn-start" id="startBtn" onclick="startStream()">▶ Start Streaming</button>
+                <button class="btn btn-stop" id="stopBtn" onclick="stopStream()" style="display:none;">⏹ Stop</button>
+                <button class="btn btn-update" id="updateBtn" onclick="updatePrompt()" style="display:none;">🔄 Update Prompt</button>
+
+                <div class="log" id="log"></div>
+            </div>
+
+            <div class="video-container">
+                <canvas id="videoCanvas" width="832" height="480"></canvas>
+                <div class="status-bar">
+                    <span class="status" id="status">Disconnected</span>
+                    <span class="stats" id="stats">Frames: 0 | Segments: 0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let frameCount = 0;
+        let segmentCount = 0;
+        let audioContext = null;
+        let audioQueue = [];
+
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const statsEl = document.getElementById('stats');
+        const logEl = document.getElementById('log');
+
+        function log(msg) {
+            const time = new Date().toLocaleTimeString();
+            logEl.innerHTML = `[${time}] ${msg}<br>` + logEl.innerHTML;
+            if (logEl.children.length > 50) {
+                logEl.innerHTML = logEl.innerHTML.split('<br>').slice(0, 50).join('<br>');
+            }
+        }
+
+        function updateStatus(text, className) {
+            statusEl.textContent = text;
+            statusEl.className = 'status ' + (className || '');
+        }
+
+        function updateStats() {
+            statsEl.textContent = `Frames: ${frameCount} | Segments: ${segmentCount}`;
+        }
+
+        function startStream() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
+
+            log('Connecting to ' + wsUrl);
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                log('WebSocket connected');
+                updateStatus('Connected', 'connected');
+
+                // Send start command
+                const config = {
+                    action: 'start',
+                    prompt: document.getElementById('prompt').value,
+                    seed: parseInt(document.getElementById('seed').value),
+                    height: parseInt(document.getElementById('height').value),
+                    width: parseInt(document.getElementById('width').value),
+                    num_frames: parseInt(document.getElementById('numFrames').value),
+                    frame_rate: parseFloat(document.getElementById('frameRate').value),
+                    use_second_stage: document.getElementById('useSecondStage').checked,
+                    max_segments: parseInt(document.getElementById('maxSegments').value),
+                };
+
+                // Update canvas size
+                canvas.width = config.use_second_stage ? config.width * 2 : config.width;
+                canvas.height = config.use_second_stage ? config.height * 2 : config.height;
+
+                ws.send(JSON.stringify(config));
+                log('Started generation: ' + config.prompt.substring(0, 50) + '...');
+
+                document.getElementById('startBtn').style.display = 'none';
+                document.getElementById('stopBtn').style.display = 'block';
+                document.getElementById('updateBtn').style.display = 'block';
+
+                frameCount = 0;
+                segmentCount = 0;
+                updateStats();
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === 'frame') {
+                    // Display frame on canvas
+                    const img = new Image();
+                    img.onload = () => {
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    };
+                    img.src = 'data:image/jpeg;base64,' + msg.data;
+                    frameCount++;
+                    updateStats();
+                    updateStatus('Generating...', 'generating');
+                }
+                else if (msg.type === 'audio') {
+                    log('Received audio chunk');
+                    // Could play audio here with Web Audio API
+                }
+                else if (msg.type === 'segment_start') {
+                    log(`Starting segment ${msg.segment}: ${msg.prompt.substring(0, 30)}...`);
+                }
+                else if (msg.type === 'segment_complete') {
+                    segmentCount = msg.segment;
+                    log(`Segment ${msg.segment} complete (${msg.frames} frames)`);
+                    updateStats();
+                }
+                else if (msg.type === 'prompt_updated') {
+                    log('Prompt updated: ' + msg.prompt.substring(0, 30) + '...');
+                }
+                else if (msg.type === 'complete') {
+                    log(`Generation complete! ${msg.segments} segments`);
+                    updateStatus('Complete', 'connected');
+                    resetButtons();
+                }
+                else if (msg.type === 'stopped') {
+                    log('Generation stopped');
+                    updateStatus('Stopped', '');
+                    resetButtons();
+                }
+                else if (msg.type === 'error') {
+                    log('Error: ' + msg.message);
+                    updateStatus('Error', '');
+                    resetButtons();
+                }
+            };
+
+            ws.onerror = (error) => {
+                log('WebSocket error');
+                updateStatus('Error', '');
+                resetButtons();
+            };
+
+            ws.onclose = () => {
+                log('WebSocket closed');
+                updateStatus('Disconnected', '');
+                resetButtons();
+            };
+        }
+
+        function stopStream() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({action: 'stop'}));
+                log('Stop requested');
+            }
+        }
+
+        function updatePrompt() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const newPrompt = document.getElementById('prompt').value;
+                ws.send(JSON.stringify({action: 'update_prompt', prompt: newPrompt}));
+                log('Updating prompt...');
+            }
+        }
+
+        function resetButtons() {
+            document.getElementById('startBtn').style.display = 'block';
+            document.getElementById('stopBtn').style.display = 'none';
+            document.getElementById('updateBtn').style.display = 'none';
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
 
 
 # ============================================================================

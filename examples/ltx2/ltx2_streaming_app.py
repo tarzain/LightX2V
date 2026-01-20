@@ -624,8 +624,9 @@ def emission_loop():
     """Emit frames to clients via WebSocket."""
     global is_generating, frame_queue
 
-    frame_interval = 1.0 / 20.0  # 20 FPS display (matches generation speed)
-    print(f"Starting emission loop at 20 FPS...", flush=True)
+    # No rate limiting here - client handles playback timing
+    # Frames are emitted as fast as they're generated
+    print(f"Starting emission loop (client-side buffered playback)...", flush=True)
 
     frame_num = 0
     while is_generating:
@@ -635,7 +636,6 @@ def emission_loop():
             frame_num += 1
             if frame_num % 50 == 0:
                 print(f"Emitted {frame_num} frames, queue: {frame_queue.qsize()}", flush=True)
-            time.sleep(frame_interval)
         except queue.Empty:
             continue
         except Exception as e:
@@ -773,6 +773,7 @@ HTML_TEMPLATE = '''
         }
         .btn-upload { background: linear-gradient(135deg, #0f3460, #16213e); color: #fff; border: 1px solid #e94560; }
         .btn-clear { background: rgba(255, 71, 87, 0.8); color: #fff; padding: 4px 8px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; }
+        .slider-value { color: #e94560; font-weight: bold; min-width: 30px; text-align: right; }
     </style>
 </head>
 <body>
@@ -801,6 +802,11 @@ HTML_TEMPLATE = '''
             <button class="btn-clear" onclick="clearTargetImage()" id="clearTargetBtn" style="display:none;">✕</button>
         </div>
         <div class="slider-container">
+            <label>Playback FPS</label>
+            <input type="range" id="fpsSlider" min="10" max="24" step="1" value="15" oninput="updateFPS(this.value)">
+            <span class="slider-value" id="fpsValue">15</span>
+        </div>
+        <div class="slider-container">
             <label>Volume</label>
             <input type="range" id="volumeSlider" min="0" max="1" step="0.1" value="0.7">
             <button id="audioToggle" onclick="toggleAudio()" style="padding: 6px 12px; border: none; border-radius: 4px; background: #e94560; color: white; cursor: pointer; min-width: 70px;">Mute</button>
@@ -820,32 +826,144 @@ HTML_TEMPLATE = '''
         const socket = io();
         let isStreaming = false;
 
-        // Audio playback queue
-        let audioQueue = [];
-        let isAudioPlaying = false;
-        let audioEnabled = true;
+        // ===== A/V Sync Buffer System =====
+        // Generation: ~41 frames per ~2.5s segment = ~16.4 FPS effective rate
+        // Playback must be slower than generation to build/maintain buffer
+        const CONTENT_FPS = 24;  // Content is generated at 24 FPS
+        let targetFPS = 15;  // Playback FPS (adjustable via slider)
+        let frameDurationMS = 1000 / targetFPS;  // ms per frame
+        const MIN_BUFFER_FRAMES = 10;  // Start playback after buffering this many frames
 
-        function playNextAudio() {
-            if (audioQueue.length === 0 || !audioEnabled) {
-                isAudioPlaying = false;
-                return;
+        function getAudioPlaybackRate() {
+            return targetFPS / CONTENT_FPS;  // Slow audio to match video playback rate
+        }
+
+        function updateFPS(value) {
+            targetFPS = parseInt(value);
+            frameDurationMS = 1000 / targetFPS;
+            document.getElementById('fpsValue').textContent = value;
+            console.log('Playback FPS set to', targetFPS, '- audio rate:', getAudioPlaybackRate().toFixed(3));
+        }
+
+        // Frame buffer
+        let frameBuffer = [];
+        let isPlaying = false;
+        let lastFrameTime = 0;  // Timestamp of last frame display
+        let framesPlayed = 0;
+
+        // Audio system using Web Audio API for precise timing
+        let audioContext = null;
+        let audioEnabled = true;
+        let pendingAudioChunks = [];  // Audio waiting to be scheduled
+        let nextAudioStartTime = 0;   // When next audio chunk should start (in audioContext time)
+
+        function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+        }
+
+        async function decodeAndScheduleAudio(base64Audio, startTime) {
+            if (!audioEnabled || !audioContext) return;
+
+            try {
+                // Decode base64 to array buffer
+                const base64Data = base64Audio.split(',')[1];
+                const binaryString = atob(base64Data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Decode audio data
+                const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
+
+                // Create source and gain for volume control
+                const source = audioContext.createBufferSource();
+                const gainNode = audioContext.createGain();
+                gainNode.gain.value = parseFloat(document.getElementById('volumeSlider').value);
+
+                source.buffer = audioBuffer;
+                // Slow down audio to match video playback rate (this will lower pitch slightly)
+                const audioRate = getAudioPlaybackRate();
+                source.playbackRate.value = audioRate;
+                source.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                // Schedule playback at precise time
+                const scheduleTime = Math.max(startTime, audioContext.currentTime);
+                source.start(scheduleTime);
+
+                // Return adjusted duration for scheduling next chunk (longer due to slower playback)
+                return audioBuffer.duration / audioRate;
+            } catch (e) {
+                console.error('Audio decode/schedule error:', e);
+                return 0;
+            }
+        }
+
+        function renderLoop(timestamp) {
+            if (!isPlaying) return;
+
+            // Rate-limited playback: only show one frame per frameDurationMS
+            const timeSinceLastFrame = timestamp - lastFrameTime;
+
+            if (timeSinceLastFrame >= frameDurationMS && frameBuffer.length > 0) {
+                const frame = frameBuffer.shift();
+                const img = document.getElementById('videoFrame');
+                const placeholder = document.getElementById('placeholder');
+                img.src = frame;
+                img.style.display = 'block';
+                placeholder.style.display = 'none';
+                framesPlayed++;
+                lastFrameTime = timestamp;
+            }
+            // If buffer is empty, we just wait - don't advance lastFrameTime
+
+            // Update buffer status
+            const bufferStatus = frameBuffer.length;
+            if (bufferStatus < 5) {
+                document.getElementById('status').textContent = `Playing (buffer: ${bufferStatus} - low!)`;
+            } else {
+                document.getElementById('status').textContent = `Playing (buffer: ${bufferStatus} frames)`;
             }
 
-            isAudioPlaying = true;
-            const audioData = audioQueue.shift();
-            const audio = new Audio(audioData);
-            audio.volume = document.getElementById('volumeSlider').value;
-            audio.onended = () => {
-                playNextAudio();
-            };
-            audio.onerror = (e) => {
-                console.error('Audio playback error:', e);
-                playNextAudio();
-            };
-            audio.play().catch(e => {
-                console.error('Audio play failed:', e);
-                playNextAudio();
-            });
+            requestAnimationFrame(renderLoop);
+        }
+
+        function startPlayback() {
+            if (isPlaying) return;
+
+            initAudioContext();
+            isPlaying = true;
+            lastFrameTime = performance.now();  // Initialize to now so first frame plays immediately
+            framesPlayed = 0;
+            nextAudioStartTime = audioContext.currentTime;
+
+            // Schedule any pending audio
+            processPendingAudio();
+
+            requestAnimationFrame(renderLoop);
+            console.log('Playback started with', frameBuffer.length, 'frames buffered');
+        }
+
+        function stopPlayback() {
+            isPlaying = false;
+            frameBuffer = [];
+            pendingAudioChunks = [];
+            framesPlayed = 0;
+            lastFrameTime = 0;
+        }
+
+        async function processPendingAudio() {
+            while (pendingAudioChunks.length > 0 && audioEnabled) {
+                const audioData = pendingAudioChunks.shift();
+                const duration = await decodeAndScheduleAudio(audioData, nextAudioStartTime);
+                nextAudioStartTime += duration;
+            }
         }
 
         socket.on('connect', () => {
@@ -856,25 +974,27 @@ HTML_TEMPLATE = '''
         socket.on('disconnect', () => {
             document.getElementById('status').textContent = 'Disconnected';
             document.getElementById('status').className = 'status stopped';
+            stopPlayback();
         });
 
         socket.on('frame', (data) => {
-            const img = document.getElementById('videoFrame');
-            const placeholder = document.getElementById('placeholder');
-            img.src = data.image;
-            img.style.display = 'block';
-            placeholder.style.display = 'none';
+            frameBuffer.push(data.image);
+
+            // Start playback once we have enough buffered
+            if (!isPlaying && frameBuffer.length >= MIN_BUFFER_FRAMES) {
+                startPlayback();
+            }
         });
 
         socket.on('audio', (data) => {
             if (!audioEnabled) return;
 
-            // Add to queue
-            audioQueue.push(data.audio);
+            // Queue audio for scheduling
+            pendingAudioChunks.push(data.audio);
 
-            // Start playing if not already
-            if (!isAudioPlaying) {
-                playNextAudio();
+            // If already playing, process immediately
+            if (isPlaying && audioContext) {
+                processPendingAudio();
             }
         });
 
@@ -882,13 +1002,13 @@ HTML_TEMPLATE = '''
             audioEnabled = !audioEnabled;
             document.getElementById('audioToggle').textContent = audioEnabled ? 'Mute' : 'Unmute';
             if (!audioEnabled) {
-                audioQueue = []; // Clear queue when muting
+                pendingAudioChunks = [];
             }
         }
 
         function startStream() {
             const prompt = document.getElementById('promptInput').value;
-            audioQueue = []; // Clear audio queue on start
+            stopPlayback();  // Reset playback state
             fetch('/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -898,7 +1018,7 @@ HTML_TEMPLATE = '''
                     isStreaming = true;
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
-                    document.getElementById('status').textContent = 'Generating with rolling segments...';
+                    document.getElementById('status').textContent = 'Buffering...';
                     document.getElementById('status').className = 'status generating';
                 }
             });
@@ -907,7 +1027,7 @@ HTML_TEMPLATE = '''
         function stopStream() {
             fetch('/stop', {method: 'POST'}).then(r => r.json()).then(data => {
                 isStreaming = false;
-                audioQueue = []; // Clear audio queue on stop
+                stopPlayback();
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('stopBtn').disabled = true;
                 document.getElementById('status').textContent = 'Stopped';
@@ -916,9 +1036,10 @@ HTML_TEMPLATE = '''
         }
 
         function hardReset() {
+            stopPlayback();  // Clear buffer and reset playback state
             fetch('/hard_reset', {method: 'POST'}).then(r => r.json()).then(data => {
                 if (data.success) {
-                    document.getElementById('status').textContent = 'Reset!';
+                    document.getElementById('status').textContent = 'Reset - buffering...';
                 }
             });
         }

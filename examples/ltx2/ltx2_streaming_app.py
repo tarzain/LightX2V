@@ -43,6 +43,9 @@ audio_sample_rate = 24000
 target_image_latent = None
 target_image_lock = threading.Lock()
 
+# Second stage upsampling toggle
+use_second_stage = False
+
 
 def get_and_clear_target_image():
     """Get the target image latent and clear it (so it's only used for one segment)."""
@@ -130,6 +133,9 @@ class LTX2StreamingEngine:
         print("   Loading vocoder...", flush=True)
         self._vocoder = ledger.vocoder()
 
+        print("   Loading spatial upsampler (2x)...", flush=True)
+        self._spatial_upsampler = ledger.spatial_upsampler()
+
         torch.cuda.synchronize()
 
         # Patch ledger to return cached models
@@ -143,6 +149,7 @@ class LTX2StreamingEngine:
         cached_video_decoder = self._video_decoder
         cached_audio_decoder = self._audio_decoder
         cached_vocoder = self._vocoder
+        cached_spatial_upsampler = self._spatial_upsampler
 
         ledger.text_encoder = lambda: cached_text_encoder
         ledger.transformer = lambda: cached_transformer
@@ -150,6 +157,7 @@ class LTX2StreamingEngine:
         ledger.video_decoder = lambda: cached_video_decoder
         ledger.audio_decoder = lambda: cached_audio_decoder
         ledger.vocoder = lambda: cached_vocoder
+        ledger.spatial_upsampler = lambda: cached_spatial_upsampler
 
         # Disable cleanup to prevent model unloading
         ledger.cleanup_memory = lambda *args, **kwargs: None
@@ -212,6 +220,7 @@ class LTX2StreamingEngine:
         frame_rate: float,
         conditioning_latent=None,
         end_frame_latent=None,
+        use_upsampler: bool = False,
     ):
         """
         Generate a single video segment and yield frames.
@@ -219,6 +228,7 @@ class LTX2StreamingEngine:
         Args:
             conditioning_latent: Optional latent from previous segment for continuity
             end_frame_latent: Optional latent for end-frame conditioning (target image)
+            use_upsampler: If True, apply 2x spatial upsampling for higher resolution
 
         Yields:
             numpy arrays of shape [H, W, 3] uint8
@@ -228,9 +238,10 @@ class LTX2StreamingEngine:
         from ltx_core.conditioning import VideoConditionByKeyframeIndex
         from ltx_core.model.video_vae import decode_video as vae_decode_video
         from ltx_core.model.audio_vae import decode_audio
+        from ltx_core.model.upsampler import upsample_video
         from ltx_core.text_encoders.gemma import encode_text
         from ltx_core.types import VideoPixelShape
-        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
         from ltx_pipelines.utils.helpers import (
             euler_denoising_loop,
             noise_video_state,
@@ -317,7 +328,7 @@ class LTX2StreamingEngine:
             initial_latent=None,
         )
 
-        # Run 8-step denoising
+        # Run 8-step stage 1 denoising
         video_state, audio_state = denoising_loop(sigmas, video_state, audio_state, stepper)
 
         # Clear conditioning and unpatchify
@@ -326,8 +337,99 @@ class LTX2StreamingEngine:
         audio_state = audio_tools.clear_conditioning(audio_state)
         audio_state = audio_tools.unpatchify(audio_state)
 
-        # Store latent for next segment
+        # Store latent for next segment conditioning (at original resolution)
         self._last_segment_latent = video_state.latent.clone()
+
+        # Stage 2: Upsample and refine if enabled
+        if use_upsampler:
+            print("   Stage 2: Upsampling latent 2x...", flush=True)
+            # Upsample with proper normalization via video encoder
+            upsampled_latent = upsample_video(
+                latent=video_state.latent[:1],
+                video_encoder=self._video_encoder,
+                upsampler=self._spatial_upsampler,
+            )
+
+            # Stage 2 output shape at 2x resolution
+            stage_2_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width * 2,
+                height=height * 2,
+                fps=frame_rate,
+            )
+
+            # Stage 2 sigmas (4 steps: 0.909375, 0.725, 0.421875, 0.0)
+            stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+
+            # Build stage 2 conditionings at 2x resolution
+            stage_2_conditionings = []
+            if conditioning_latent is not None:
+                # Upsample the conditioning latent for stage 2
+                upsampled_cond = upsample_video(
+                    latent=conditioning_latent,
+                    video_encoder=self._video_encoder,
+                    upsampler=self._spatial_upsampler,
+                )
+                start_conditioning = VideoConditionByKeyframeIndex(
+                    keyframes=upsampled_cond,
+                    frame_idx=0,
+                    strength=1.0,
+                )
+                stage_2_conditionings.append(start_conditioning)
+
+            if end_frame_latent is not None:
+                # Upsample the end frame latent for stage 2
+                upsampled_end = upsample_video(
+                    latent=end_frame_latent,
+                    video_encoder=self._video_encoder,
+                    upsampler=self._spatial_upsampler,
+                )
+                end_conditioning = VideoConditionByKeyframeIndex(
+                    keyframes=upsampled_end,
+                    frame_idx=num_frames - 1,
+                    strength=1.0,
+                )
+                stage_2_conditionings.append(end_conditioning)
+
+            print("   Stage 2: Denoising at 2x resolution (4 steps)...", flush=True)
+            # Initialize video state for stage 2 with upsampled latent
+            video_state_2, video_tools_2 = noise_video_state(
+                output_shape=stage_2_shape,
+                noiser=noiser,
+                conditionings=stage_2_conditionings,
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=stage_2_sigmas[0].item(),  # Initial noise scale for stage 2
+                initial_latent=upsampled_latent,
+            )
+
+            # Initialize audio state for stage 2 (use existing audio latent)
+            audio_state_2, audio_tools_2 = noise_audio_state(
+                output_shape=stage_2_shape,
+                noiser=noiser,
+                conditionings=[],
+                components=self.pipeline.pipeline_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=audio_state.latent,
+            )
+
+            # Run stage 2 denoising (4 steps)
+            video_state_2, audio_state_2 = denoising_loop(stage_2_sigmas, video_state_2, audio_state_2, stepper)
+
+            # Clear conditioning and unpatchify stage 2
+            video_state_2 = video_tools_2.clear_conditioning(video_state_2)
+            video_state_2 = video_tools_2.unpatchify(video_state_2)
+            audio_state_2 = audio_tools_2.clear_conditioning(audio_state_2)
+            audio_state_2 = audio_tools_2.unpatchify(audio_state_2)
+
+            video_latent_for_decode = video_state_2.latent
+            audio_state = audio_state_2  # Use refined audio
+        else:
+            video_latent_for_decode = video_state.latent
 
         # Decode audio
         audio_waveform = decode_audio(
@@ -343,7 +445,7 @@ class LTX2StreamingEngine:
         # Decode video - yields frame chunks
         video_iterator = vae_decode_video(
             video_decoder=self._video_decoder,
-            latent=video_state.latent[:1],
+            latent=video_latent_for_decode[:1],
         )
 
         # Collect all chunks and process
@@ -444,6 +546,7 @@ class LTX2StreamingEngine:
                 frame_rate=frame_rate,
                 conditioning_latent=conditioning_latent,
                 end_frame_latent=end_frame_latent,
+                use_upsampler=use_second_stage,
             ):
                 frame, audio = item
 
@@ -774,6 +877,17 @@ HTML_TEMPLATE = '''
         .btn-upload { background: linear-gradient(135deg, #0f3460, #16213e); color: #fff; border: 1px solid #e94560; }
         .btn-clear { background: rgba(255, 71, 87, 0.8); color: #fff; padding: 4px 8px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; }
         .slider-value { color: #e94560; font-weight: bold; min-width: 30px; text-align: right; }
+        .checkbox-container {
+            display: flex; align-items: center; gap: 12px; margin: 12px 0;
+            background: rgba(10, 10, 21, 0.5); padding: 12px 16px; border-radius: 8px;
+        }
+        .checkbox-label {
+            display: flex; align-items: center; gap: 8px; cursor: pointer; color: #fff;
+        }
+        .checkbox-label input[type="checkbox"] {
+            width: 18px; height: 18px; accent-color: #e94560; cursor: pointer;
+        }
+        .checkbox-hint { color: #888; font-size: 12px; }
     </style>
 </head>
 <body>
@@ -800,6 +914,13 @@ HTML_TEMPLATE = '''
                 <input type="file" id="targetImageInput" accept="image/*" onchange="stageTargetImage(this)">
             </div>
             <button class="btn-clear" onclick="clearTargetImage()" id="clearTargetBtn" style="display:none;">✕</button>
+        </div>
+        <div class="checkbox-container">
+            <label class="checkbox-label">
+                <input type="checkbox" id="secondStageCheckbox" onchange="toggleSecondStage(this.checked)">
+                <span>2x Upsampling (960x1664)</span>
+            </label>
+            <span class="checkbox-hint">Higher quality, slower generation</span>
         </div>
         <div class="slider-container">
             <label>Playback FPS</label>
@@ -843,6 +964,16 @@ HTML_TEMPLATE = '''
             frameDurationMS = 1000 / targetFPS;
             document.getElementById('fpsValue').textContent = value;
             console.log('Playback FPS set to', targetFPS, '- audio rate:', getAudioPlaybackRate().toFixed(3));
+        }
+
+        function toggleSecondStage(enabled) {
+            fetch('/toggle_second_stage', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled: enabled})
+            }).then(r => r.json()).then(data => {
+                console.log('Second stage upsampling:', data.enabled ? 'enabled' : 'disabled');
+            });
         }
 
         // Frame buffer
@@ -1243,6 +1374,16 @@ def clear_target_image():
 
     print("Target image cleared", flush=True)
     return jsonify({'success': True, 'message': 'Target image cleared'})
+
+
+@app.route('/toggle_second_stage', methods=['POST'])
+def toggle_second_stage():
+    """Toggle second stage (2x spatial upsampling)."""
+    global use_second_stage
+    data = request.json
+    use_second_stage = data.get('enabled', False)
+    print(f"Second stage upsampling: {'enabled' if use_second_stage else 'disabled'}", flush=True)
+    return jsonify({'success': True, 'enabled': use_second_stage})
 
 
 if __name__ == '__main__':

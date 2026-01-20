@@ -41,8 +41,8 @@ brightness = 1.0
 contrast = 1.0
 gamma = 1.0
 
-# Audio sample rate (will be set from model)
-audio_sample_rate = 16000
+# Audio sample rate - vocoder outputs at 24kHz (not the decoder's 16kHz mel rate)
+audio_sample_rate = 24000
 
 
 class LTX2StreamingEngine:
@@ -526,10 +526,10 @@ def generation_loop():
     generator = None
     seed = 42
 
-    # Get audio sample rate from engine
+    # Get audio sample rate from vocoder (outputs 24kHz, not decoder's 16kHz mel rate)
     if engine is not None:
-        audio_sample_rate = engine._audio_decoder.sample_rate
-        print(f"Audio sample rate: {audio_sample_rate} Hz", flush=True)
+        audio_sample_rate = engine._vocoder.output_sample_rate
+        print(f"Audio sample rate (vocoder output): {audio_sample_rate} Hz", flush=True)
 
     while is_generating:
         try:

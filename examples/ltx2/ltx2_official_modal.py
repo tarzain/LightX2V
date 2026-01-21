@@ -2025,7 +2025,40 @@ class OfficialLTX2Engine:
                 initial_latent=None,
             )
 
-            # Initialize audio state
+            # Initialize audio state - use previous audio latent for continuity
+            audio_initial_latent = None
+            audio_noise_scale = 1.0  # Default: generate fresh audio
+
+            has_audio_latent = hasattr(self, '_streaming_last_audio_latent') and self._streaming_last_audio_latent is not None
+            if not is_first_segment and has_audio_latent:
+                # Use stored audio latent for conditioning
+                # Audio latent shape is [B, C, T, H]
+                prev_audio = self._streaming_last_audio_latent
+                print(f"   Streaming: Using previous audio latent for conditioning, shape: {prev_audio.shape}", flush=True)
+
+                # Get expected audio latent shape for this segment
+                from ltx_video.models.autoencoders.latent_configs import AudioLatentShape
+                expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+                expected_frames = expected_audio_shape.frames
+
+                # Resize previous audio latent to match expected frames if needed
+                actual_frames = prev_audio.shape[2]
+                if actual_frames != expected_frames:
+                    B, C, T, H = prev_audio.shape
+                    audio_flat = prev_audio.reshape(B * C, 1, T, H)
+                    audio_resized = torch.nn.functional.interpolate(
+                        audio_flat, size=(expected_frames, H), mode='bilinear', align_corners=False
+                    )
+                    audio_initial_latent = audio_resized.reshape(B, C, expected_frames, H)
+                else:
+                    audio_initial_latent = prev_audio
+
+                # Use lower noise scale to preserve more of the audio conditioning
+                audio_noise_scale = 0.7  # Preserve ~30% of previous audio characteristics
+            elif is_first_segment:
+                # Clear previous audio latent when starting fresh
+                self._streaming_last_audio_latent = None
+
             audio_state, audio_tools = noise_audio_state(
                 output_shape=output_shape,
                 noiser=noiser,
@@ -2033,8 +2066,8 @@ class OfficialLTX2Engine:
                 components=self.pipeline.pipeline_components,
                 dtype=dtype,
                 device=device,
-                noise_scale=1.0,
-                initial_latent=None,
+                noise_scale=audio_noise_scale,
+                initial_latent=audio_initial_latent,
             )
 
             # Run stage 1 denoising (8 steps)
@@ -2055,6 +2088,10 @@ class OfficialLTX2Engine:
             self._streaming_last_latent = video_state.latent[:, :, -latent_overlap:, :, :].clone()
             self._streaming_overlap_frames = overlap_frames  # Store for frame skipping
             print(f"   Streaming: Stored last {latent_overlap} latent frame(s) ({overlap_frames} video frames) for conditioning, shape: {self._streaming_last_latent.shape}", flush=True)
+
+            # Store audio latent for next segment conditioning (audio continuity)
+            self._streaming_last_audio_latent = audio_state.latent.clone()
+            print(f"   Streaming: Stored audio latent for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
 
             # Determine latent for decode
             if use_second_stage:
@@ -2109,6 +2146,8 @@ class OfficialLTX2Engine:
 
                 video_latent_for_decode = video_state_2.latent
                 final_audio_state = audio_state_2
+                # Update stored audio latent with refined stage 2 audio
+                self._streaming_last_audio_latent = audio_state_2.latent.clone()
             else:
                 video_latent_for_decode = video_state.latent
                 final_audio_state = audio_state

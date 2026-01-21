@@ -1905,6 +1905,7 @@ class OfficialLTX2Engine:
             video_decoder = self._video_decoder
             transformer = self._transformer
 
+            print(f"   Streaming: Encoding prompt: {prompt[:60]}...", flush=True)
             context_p = encode_text(text_encoder, prompts=[prompt])[0]
             video_context, audio_context = context_p
 
@@ -2418,15 +2419,16 @@ class OfficialLTX2Engine:
                                 segment_count += 1
                                 seg_seed = seed + segment_count
 
-                                # Check for messages
+                                # Check for messages with longer timeout to catch prompt updates
                                 try:
-                                    check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.01)
+                                    check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
                                     check_msg = json.loads(check_data)
                                     if check_msg.get("action") == "stop":
                                         should_stop = True
                                         break
                                     elif check_msg.get("action") == "update_prompt":
                                         current_prompt = check_msg.get("prompt", current_prompt)
+                                        print(f"   WebSocket: Prompt updated to: {current_prompt[:50]}...", flush=True)
                                         await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
                                 except asyncio.TimeoutError:
                                     pass
@@ -2434,6 +2436,7 @@ class OfficialLTX2Engine:
                                 if should_stop:
                                     break
 
+                                print(f"   WebSocket: Segment {segment_count} using prompt: {current_prompt[:50]}...", flush=True)
                                 await websocket.send_json({
                                     "type": "segment_start",
                                     "segment": segment_count,
@@ -2486,6 +2489,8 @@ class OfficialLTX2Engine:
                                             break
                                         elif check_msg.get("action") == "update_prompt":
                                             current_prompt = check_msg.get("prompt", current_prompt)
+                                            print(f"   WebSocket: Prompt updated (mid-segment) to: {current_prompt[:50]}...", flush=True)
+                                            await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
                                     except asyncio.TimeoutError:
                                         pass
 

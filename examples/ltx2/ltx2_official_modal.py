@@ -3956,36 +3956,71 @@ STREAMING_HTML = """
         });
 
         function handleTargetImage(file) {
+            // Resize image on client side to avoid large WebSocket messages
+            const targetWidth = parseInt(document.getElementById('width').value) || 832;
+            const targetHeight = parseInt(document.getElementById('height').value) || 480;
+
             const reader = new FileReader();
             reader.onload = (e) => {
-                const imageData = e.target.result;
-                targetImageData = imageData;
+                const img = new Image();
+                img.onload = () => {
+                    // Create canvas at target resolution
+                    const canvas = document.createElement('canvas');
+                    canvas.width = targetWidth;
+                    canvas.height = targetHeight;
+                    const ctx = canvas.getContext('2d');
 
-                // Show preview
-                targetPreview.src = imageData;
-                targetIndicator.classList.add('active');
+                    // Draw image scaled to fit
+                    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
 
-                // Send to server if connected
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    sendTargetImage(imageData);
-                } else {
-                    log('Target image staged (will send when streaming starts)');
-                }
+                    // Export as JPEG with good quality (smaller than PNG)
+                    const resizedImageData = canvas.toDataURL('image/jpeg', 0.9);
+
+                    targetImageData = resizedImageData;
+
+                    // Show preview
+                    targetPreview.src = resizedImageData;
+                    targetIndicator.classList.add('active');
+
+                    const sizeKB = Math.round(resizedImageData.length / 1024);
+                    log(`Image resized to ${targetWidth}x${targetHeight} (${sizeKB}KB)`);
+
+                    // Send to server if connected
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        sendTargetImage(resizedImageData);
+                    } else {
+                        log('Target image staged (will send when streaming starts)');
+                    }
+                };
+                img.onerror = () => {
+                    log('Failed to load image');
+                };
+                img.src = e.target.result;
+            };
+            reader.onerror = () => {
+                log('Failed to read image file');
             };
             reader.readAsDataURL(file);
         }
 
         function sendTargetImage(imageData) {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                const height = parseInt(document.getElementById('height').value);
-                const width = parseInt(document.getElementById('width').value);
-                ws.send(JSON.stringify({
-                    action: 'set_target_image',
-                    image: imageData,
-                    height: height,
-                    width: width
-                }));
-                log('Sending target image to server...');
+                try {
+                    const height = parseInt(document.getElementById('height').value);
+                    const width = parseInt(document.getElementById('width').value);
+                    const message = JSON.stringify({
+                        action: 'set_target_image',
+                        image: imageData,
+                        height: height,
+                        width: width
+                    });
+                    const sizeMB = (message.length / (1024 * 1024)).toFixed(2);
+                    log(`Sending target image (${sizeMB}MB)...`);
+                    ws.send(message);
+                } catch (err) {
+                    log('Error sending target image: ' + err.message);
+                    console.error('Send error:', err);
+                }
             }
         }
 

@@ -235,8 +235,8 @@ class OfficialLTX2Engine:
         print("   Loading text encoder (Gemma)...")
         self._text_encoder = ledger.text_encoder()
         
-        # Load transformer - ~19GB (FP8)
-        print("   Loading transformer (19B FP8)...")
+        # Load transformer
+        print(f"   Loading transformer (19B {'FP8' if self.use_fp8 else 'BF16'})...")
         self._transformer = ledger.transformer()
         
         # Load VAE components
@@ -2543,6 +2543,28 @@ class OfficialLTX2Engine:
                             await websocket.send_json({"type": "target_image_cleared"})
                             print(f"   WebSocket: Target image cleared", flush=True)
 
+                        elif msg.get("action") == "set_next_segment":
+                            # Combined action to set prompt and/or target image for next segment
+                            response = {"type": "next_segment_set"}
+                            if "prompt" in msg:
+                                current_prompt = msg.get("prompt")
+                                response["prompt"] = current_prompt
+                                print(f"   WebSocket: Next segment prompt: {current_prompt[:50]}...", flush=True)
+                            if "target_image" in msg:
+                                image_data = msg.get("target_image")
+                                img_height = msg.get("height", 480)
+                                img_width = msg.get("width", 832)
+                                if image_data:
+                                    try:
+                                        target_image_latent = engine.encode_target_image(image_data, img_height, img_width)
+                                        response["target_image_set"] = True
+                                        print(f"   WebSocket: Next segment target image set", flush=True)
+                                    except Exception as e:
+                                        response["target_image_set"] = False
+                                        response["target_image_error"] = str(e)
+                                        print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
+                            await websocket.send_json(response)
+
                         elif msg.get("action") == "start":
                             current_prompt = msg.get("prompt", "A beautiful landscape")
                             seed = msg.get("seed", 42)
@@ -2586,6 +2608,24 @@ class OfficialLTX2Engine:
                                     elif check_msg.get("action") == "clear_target_image":
                                         target_image_latent = None
                                         await websocket.send_json({"type": "target_image_cleared"})
+                                    elif check_msg.get("action") == "set_next_segment":
+                                        # Combined action to set prompt and/or target image
+                                        response = {"type": "next_segment_set"}
+                                        if "prompt" in check_msg:
+                                            current_prompt = check_msg.get("prompt")
+                                            response["prompt"] = current_prompt
+                                            print(f"   WebSocket: Next segment prompt (pre-segment): {current_prompt[:50]}...", flush=True)
+                                        if "target_image" in check_msg:
+                                            image_data = check_msg.get("target_image")
+                                            if image_data:
+                                                try:
+                                                    target_image_latent = engine.encode_target_image(image_data, height, width)
+                                                    response["target_image_set"] = True
+                                                    print(f"   WebSocket: Next segment target image set (pre-segment)", flush=True)
+                                                except Exception as e:
+                                                    response["target_image_set"] = False
+                                                    response["target_image_error"] = str(e)
+                                        await websocket.send_json(response)
                                 except asyncio.TimeoutError:
                                     pass
 
@@ -2670,6 +2710,24 @@ class OfficialLTX2Engine:
                                         elif check_msg.get("action") == "clear_target_image":
                                             target_image_latent = None
                                             await websocket.send_json({"type": "target_image_cleared"})
+                                        elif check_msg.get("action") == "set_next_segment":
+                                            # Combined action to set prompt and/or target image
+                                            response = {"type": "next_segment_set"}
+                                            if "prompt" in check_msg:
+                                                current_prompt = check_msg.get("prompt")
+                                                response["prompt"] = current_prompt
+                                                print(f"   WebSocket: Next segment prompt (mid-segment): {current_prompt[:50]}...", flush=True)
+                                            if "target_image" in check_msg:
+                                                image_data = check_msg.get("target_image")
+                                                if image_data:
+                                                    try:
+                                                        target_image_latent = engine.encode_target_image(image_data, height, width)
+                                                        response["target_image_set"] = True
+                                                        print(f"   WebSocket: Next segment target image set (mid-segment)", flush=True)
+                                                    except Exception as e:
+                                                        response["target_image_set"] = False
+                                                        response["target_image_error"] = str(e)
+                                            await websocket.send_json(response)
                                     except asyncio.TimeoutError:
                                         pass
 

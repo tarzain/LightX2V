@@ -2123,6 +2123,20 @@ class OfficialLTX2Engine:
             audio_np = audio_waveform.cpu().numpy()
             audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
 
+            # Trim audio to match skipped video frames (for non-first segments)
+            audio_sample_rate = 24000  # Vocoder output rate
+            if not is_first_segment and overlap_frames > 0:
+                # Calculate samples to skip based on overlap frames and frame rate
+                overlap_duration = overlap_frames / frame_rate  # seconds
+                samples_to_skip = int(overlap_duration * audio_sample_rate)
+                if audio_np.ndim > 1:
+                    # Multi-channel: shape is [channels, samples]
+                    audio_np = audio_np[:, samples_to_skip:]
+                else:
+                    # Mono: shape is [samples]
+                    audio_np = audio_np[samples_to_skip:]
+                print(f"   Streaming: Trimmed {samples_to_skip} audio samples ({overlap_duration:.2f}s) for overlap", flush=True)
+
             # Convert audio to base64 WAV
             import wave
             import struct
@@ -2130,7 +2144,7 @@ class OfficialLTX2Engine:
             with wave.open(audio_buffer, 'wb') as wav_file:
                 wav_file.setnchannels(2 if audio_np.ndim > 1 and audio_np.shape[0] == 2 else 1)
                 wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(24000)  # Vocoder output rate
+                wav_file.setframerate(audio_sample_rate)
                 # Interleave stereo channels if needed
                 if audio_np.ndim > 1 and audio_np.shape[0] == 2:
                     audio_interleaved = audio_np.T.flatten()
@@ -2139,7 +2153,7 @@ class OfficialLTX2Engine:
                 wav_file.writeframes(audio_interleaved.tobytes())
 
             audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
-            yield {"type": "audio", "data": audio_base64, "sample_rate": 24000}
+            yield {"type": "audio", "data": audio_base64, "sample_rate": audio_sample_rate}
 
             # Decode video - yields frame chunks
             print(f"   Streaming: Decoding video frames...", flush=True)

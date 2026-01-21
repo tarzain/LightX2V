@@ -139,6 +139,7 @@ def download_models():
         "/outputs": outputs_volume,
         "/vol_cache": cache_volume,
     },
+    allow_concurrent_inputs=10,  # Handle multiple requests on same container
 )
 class OfficialLTX2Engine:
     """

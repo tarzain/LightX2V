@@ -1939,7 +1939,12 @@ class OfficialLTX2Engine:
 
             # Build conditionings - use previous segment's latent for continuity
             conditionings = []
-            if not is_first_segment and hasattr(self, '_streaming_last_latent') and self._streaming_last_latent is not None:
+            has_latent = hasattr(self, '_streaming_last_latent') and self._streaming_last_latent is not None
+            print(f"   Streaming: is_first_segment={is_first_segment}, has_previous_latent={has_latent}", flush=True)
+            if has_latent:
+                print(f"   Streaming: Previous latent shape: {self._streaming_last_latent.shape}", flush=True)
+
+            if not is_first_segment and has_latent:
                 print(f"   Streaming: Conditioning on previous segment latent", flush=True)
                 start_conditioning = VideoConditionByKeyframeIndex(
                     keyframes=self._streaming_last_latent,
@@ -1949,6 +1954,7 @@ class OfficialLTX2Engine:
                 conditionings.append(start_conditioning)
             elif is_first_segment:
                 # Clear any previous latent when starting fresh
+                print(f"   Streaming: First segment - clearing previous latent", flush=True)
                 self._streaming_last_latent = None
 
             # Initialize video state
@@ -1985,8 +1991,12 @@ class OfficialLTX2Engine:
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
 
-            # Store latent for next segment conditioning (at original resolution)
-            self._streaming_last_latent = video_state.latent.clone()
+            # Store LAST latent frames for next segment conditioning
+            # Temporal compression is ~8x, so overlap_frames=8 -> 1 latent frame
+            overlap_frames = 8
+            latent_overlap = max(1, overlap_frames // 8)
+            self._streaming_last_latent = video_state.latent[:, :, -latent_overlap:, :, :].clone()
+            print(f"   Streaming: Stored last {latent_overlap} latent frame(s) for next segment, shape: {self._streaming_last_latent.shape}", flush=True)
 
             # Determine latent for decode
             if use_second_stage:
@@ -2443,6 +2453,7 @@ class OfficialLTX2Engine:
                                 _fps = frame_rate
                                 _stage2 = use_second_stage
                                 _is_first = (segment_count == 1)
+                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}", flush=True)
 
                                 def run_generation():
                                     return list(engine.generate_streaming(
@@ -2462,6 +2473,9 @@ class OfficialLTX2Engine:
                                 for item in results:
                                     if should_stop:
                                         break
+                                    # Add segment number to frame messages for debugging
+                                    if item.get("type") == "frame":
+                                        item["segment"] = segment_count
                                     await websocket.send_json(item)
 
                                     try:
@@ -3628,10 +3642,21 @@ STREAMING_HTML = """
 
         function playFrame() {
             if (frameBuffer.length > 0) {
-                const frameData = frameBuffer.shift();
+                const frame = frameBuffer.shift();
+                const frameData = frame.data;
+                const segment = frame.segment;
+                const frameIndex = frame.index;
+
                 const img = new Image();
                 img.onload = () => {
                     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                    // Draw debug overlay with segment/frame info
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+                    ctx.fillRect(10, 10, 180, 30);
+                    ctx.fillStyle = '#00ff00';
+                    ctx.font = 'bold 16px monospace';
+                    ctx.fillText(`Seg: ${segment} | Frame: ${frameIndex}`, 20, 30);
                 };
                 img.src = 'data:image/jpeg;base64,' + frameData;
                 playedFrames++;
@@ -3762,8 +3787,12 @@ STREAMING_HTML = """
                 const msg = JSON.parse(event.data);
 
                 if (msg.type === 'frame') {
-                    // Add frame to buffer
-                    frameBuffer.push(msg.data);
+                    // Add frame to buffer with segment info
+                    frameBuffer.push({
+                        data: msg.data,
+                        segment: msg.segment || 0,
+                        index: msg.index || 0
+                    });
                     receivedFrames++;
                     updateStats();
                 }

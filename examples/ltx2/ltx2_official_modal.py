@@ -3567,12 +3567,14 @@ STREAMING_HTML = """
 
         // Playback control
         let playbackFps = 18;
+        let generationFps = 24;  // Server-side generation rate
         let playbackInterval = null;
         let isPlaying = false;
 
         // Audio
         let audioContext = null;
         let audioQueue = [];
+        let audioSources = [];  // Track active audio sources for rate changes
         let nextAudioTime = 0;
 
         // Canvas
@@ -3601,6 +3603,13 @@ STREAMING_HTML = """
                 clearInterval(playbackInterval);
                 playbackInterval = setInterval(playFrame, 1000 / playbackFps);
             }
+            // Update audio playback rate for active sources
+            const audioRate = playbackFps / generationFps;
+            audioSources.forEach(source => {
+                if (source && source.playbackRate) {
+                    source.playbackRate.value = audioRate;
+                }
+            });
         }
 
         function updateStatus(text, className) {
@@ -3670,10 +3679,24 @@ STREAMING_HTML = """
                 source.buffer = buffer;
                 source.connect(audioContext.destination);
 
+                // Adjust playback rate to match video playback speed
+                const audioRate = playbackFps / generationFps;
+                source.playbackRate.value = audioRate;
+
+                // Track this source so we can update its rate if FPS changes
+                audioSources.push(source);
+                source.onended = () => {
+                    const idx = audioSources.indexOf(source);
+                    if (idx > -1) audioSources.splice(idx, 1);
+                };
+
                 // Schedule audio to play at the right time
+                // Adjust duration based on playback rate
                 const startTime = Math.max(audioContext.currentTime, nextAudioTime);
                 source.start(startTime);
-                nextAudioTime = startTime + buffer.duration;
+                nextAudioTime = startTime + (buffer.duration / audioRate);
+
+                log(`Audio: rate=${audioRate.toFixed(2)}x (${playbackFps}/${generationFps} FPS)`);
             }, (err) => {
                 console.error('Audio decode error:', err);
             });
@@ -3697,7 +3720,16 @@ STREAMING_HTML = """
                 segmentCount = 0;
                 isStreaming = true;
 
+                // Reset audio state
+                audioSources = [];
+                nextAudioTime = 0;
+                if (audioContext) {
+                    audioContext.close();
+                    audioContext = null;
+                }
+
                 // Send start command
+                generationFps = 24.0;  // Server-side generation rate
                 const config = {
                     action: 'start',
                     prompt: document.getElementById('prompt').value,
@@ -3705,7 +3737,7 @@ STREAMING_HTML = """
                     height: parseInt(document.getElementById('height').value),
                     width: parseInt(document.getElementById('width').value),
                     num_frames: parseInt(document.getElementById('numFrames').value),
-                    frame_rate: 24.0,  // Generation rate (server-side)
+                    frame_rate: generationFps,
                     use_second_stage: document.getElementById('useSecondStage').checked,
                     max_segments: parseInt(document.getElementById('maxSegments').value),
                 };

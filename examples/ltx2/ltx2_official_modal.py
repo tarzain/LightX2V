@@ -1853,9 +1853,13 @@ class OfficialLTX2Engine:
         num_frames: int,
         frame_rate: float,
         use_second_stage: bool = False,
+        is_first_segment: bool = True,
     ):
         """
         Generator that yields frames for real-time streaming.
+
+        Args:
+            is_first_segment: If True, starts fresh. If False, conditions on previous segment.
 
         Yields:
             dict with either:
@@ -1933,8 +1937,19 @@ class OfficialLTX2Engine:
                 fps=frame_rate,
             )
 
-            # No conditioning for first segment
+            # Build conditionings - use previous segment's latent for continuity
             conditionings = []
+            if not is_first_segment and hasattr(self, '_streaming_last_latent') and self._streaming_last_latent is not None:
+                print(f"   Streaming: Conditioning on previous segment latent", flush=True)
+                start_conditioning = VideoConditionByKeyframeIndex(
+                    keyframes=self._streaming_last_latent,
+                    frame_idx=0,
+                    strength=1.0,
+                )
+                conditionings.append(start_conditioning)
+            elif is_first_segment:
+                # Clear any previous latent when starting fresh
+                self._streaming_last_latent = None
 
             # Initialize video state
             video_state, video_tools = noise_video_state(
@@ -1969,6 +1984,9 @@ class OfficialLTX2Engine:
             video_state = video_tools.unpatchify(video_state)
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
+
+            # Store latent for next segment conditioning (at original resolution)
+            self._streaming_last_latent = video_state.latent.clone()
 
             # Determine latent for decode
             if use_second_stage:
@@ -2424,6 +2442,7 @@ class OfficialLTX2Engine:
                                 _frames = num_frames
                                 _fps = frame_rate
                                 _stage2 = use_second_stage
+                                _is_first = (segment_count == 1)
 
                                 def run_generation():
                                     return list(engine.generate_streaming(
@@ -2434,6 +2453,7 @@ class OfficialLTX2Engine:
                                         num_frames=_frames,
                                         frame_rate=_fps,
                                         use_second_stage=_stage2,
+                                        is_first_segment=_is_first,
                                     ))
 
                                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -3281,7 +3301,7 @@ def web():
     return web_app
 
 
-# Streaming UI HTML
+# Streaming UI HTML with buffered playback
 STREAMING_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -3345,6 +3365,37 @@ STREAMING_HTML = """
         }
         .checkbox-row label { margin: 0; color: #fff; }
 
+        .slider-container {
+            margin-top: 15px;
+            padding: 12px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }
+        .slider-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            color: #888;
+            font-size: 0.85rem;
+        }
+        .slider-value { color: #e94560; font-weight: 600; }
+        input[type="range"] {
+            width: 100%;
+            height: 6px;
+            -webkit-appearance: none;
+            background: #333;
+            border-radius: 3px;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: #e94560;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
         .btn {
             width: 100%;
             padding: 12px;
@@ -3391,11 +3442,32 @@ STREAMING_HTML = """
             justify-content: space-between;
             align-items: center;
             font-size: 0.85rem;
+            flex-wrap: wrap;
+            gap: 10px;
         }
         .status { color: #888; }
         .status.connected { color: #00ff88; }
         .status.generating { color: #e94560; }
+        .status.buffering { color: #ffaa00; }
         .stats { color: #666; }
+        .buffer-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #888;
+        }
+        .buffer-bar {
+            width: 100px;
+            height: 8px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .buffer-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #e94560, #00d4ff);
+            transition: width 0.1s;
+        }
 
         .log {
             margin-top: 20px;
@@ -3431,24 +3503,28 @@ STREAMING_HTML = """
 
                 <div class="row">
                     <div>
-                        <label>Frames</label>
+                        <label>Frames/Segment</label>
                         <input type="number" id="numFrames" value="49" min="17" max="97">
                     </div>
                     <div>
-                        <label>FPS</label>
-                        <input type="number" id="frameRate" value="24" min="1" max="60">
+                        <label>Seed</label>
+                        <input type="number" id="seed" value="42">
                     </div>
                 </div>
 
                 <div class="row">
                     <div>
-                        <label>Seed</label>
-                        <input type="number" id="seed" value="42">
-                    </div>
-                    <div>
                         <label>Max Segments</label>
-                        <input type="number" id="maxSegments" value="5" min="1" max="20">
+                        <input type="number" id="maxSegments" value="10" min="1" max="50">
                     </div>
+                </div>
+
+                <div class="slider-container">
+                    <div class="slider-label">
+                        <span>Playback FPS</span>
+                        <span class="slider-value" id="fpsValue">18</span>
+                    </div>
+                    <input type="range" id="playbackFps" min="6" max="30" value="18" oninput="updateFps(this.value)">
                 </div>
 
                 <div class="checkbox-row">
@@ -3467,30 +3543,63 @@ STREAMING_HTML = """
                 <canvas id="videoCanvas" width="832" height="480"></canvas>
                 <div class="status-bar">
                     <span class="status" id="status">Disconnected</span>
-                    <span class="stats" id="stats">Frames: 0 | Segments: 0</span>
+                    <div class="buffer-indicator">
+                        <span>Buffer:</span>
+                        <div class="buffer-bar"><div class="buffer-fill" id="bufferFill" style="width: 0%"></div></div>
+                        <span id="bufferCount">0</span>
+                    </div>
+                    <span class="stats" id="stats">Frames: 0 | Played: 0</span>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
+        // WebSocket and state
         let ws = null;
-        let frameCount = 0;
+        let isStreaming = false;
+
+        // Frame buffer for smooth playback
+        let frameBuffer = [];
+        let playedFrames = 0;
+        let receivedFrames = 0;
         let segmentCount = 0;
+
+        // Playback control
+        let playbackFps = 18;
+        let playbackInterval = null;
+        let isPlaying = false;
+
+        // Audio
         let audioContext = null;
         let audioQueue = [];
+        let nextAudioTime = 0;
 
+        // Canvas
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
+
+        // UI elements
         const statusEl = document.getElementById('status');
         const statsEl = document.getElementById('stats');
         const logEl = document.getElementById('log');
+        const bufferFillEl = document.getElementById('bufferFill');
+        const bufferCountEl = document.getElementById('bufferCount');
 
         function log(msg) {
             const time = new Date().toLocaleTimeString();
             logEl.innerHTML = `[${time}] ${msg}<br>` + logEl.innerHTML;
-            if (logEl.children.length > 50) {
-                logEl.innerHTML = logEl.innerHTML.split('<br>').slice(0, 50).join('<br>');
+            if (logEl.innerHTML.length > 5000) {
+                logEl.innerHTML = logEl.innerHTML.substring(0, 5000);
+            }
+        }
+
+        function updateFps(value) {
+            playbackFps = parseInt(value);
+            document.getElementById('fpsValue').textContent = value;
+            if (playbackInterval) {
+                clearInterval(playbackInterval);
+                playbackInterval = setInterval(playFrame, 1000 / playbackFps);
             }
         }
 
@@ -3500,19 +3609,93 @@ STREAMING_HTML = """
         }
 
         function updateStats() {
-            statsEl.textContent = `Frames: ${frameCount} | Segments: ${segmentCount}`;
+            statsEl.textContent = `Frames: ${receivedFrames} | Played: ${playedFrames}`;
+            const bufferSize = frameBuffer.length;
+            bufferCountEl.textContent = bufferSize;
+            // Buffer bar: 0-100 frames mapped to 0-100%
+            const bufferPercent = Math.min(100, (bufferSize / 100) * 100);
+            bufferFillEl.style.width = bufferPercent + '%';
+        }
+
+        function playFrame() {
+            if (frameBuffer.length > 0) {
+                const frameData = frameBuffer.shift();
+                const img = new Image();
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                };
+                img.src = 'data:image/jpeg;base64,' + frameData;
+                playedFrames++;
+                updateStats();
+
+                if (frameBuffer.length > 0) {
+                    updateStatus('Playing', 'generating');
+                }
+            } else if (isStreaming) {
+                updateStatus('Buffering...', 'buffering');
+            }
+        }
+
+        function startPlayback() {
+            if (!isPlaying) {
+                isPlaying = true;
+                playbackInterval = setInterval(playFrame, 1000 / playbackFps);
+                log('Playback started at ' + playbackFps + ' FPS');
+            }
+        }
+
+        function stopPlayback() {
+            if (playbackInterval) {
+                clearInterval(playbackInterval);
+                playbackInterval = null;
+            }
+            isPlaying = false;
+        }
+
+        function playAudioChunk(base64Audio) {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                nextAudioTime = audioContext.currentTime;
+            }
+
+            // Decode base64 to ArrayBuffer
+            const binaryString = atob(base64Audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+
+            audioContext.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+
+                // Schedule audio to play at the right time
+                const startTime = Math.max(audioContext.currentTime, nextAudioTime);
+                source.start(startTime);
+                nextAudioTime = startTime + buffer.duration;
+            }, (err) => {
+                console.error('Audio decode error:', err);
+            });
         }
 
         function startStream() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
 
-            log('Connecting to ' + wsUrl);
+            log('Connecting to WebSocket...');
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
-                log('WebSocket connected');
+                log('Connected!');
                 updateStatus('Connected', 'connected');
+
+                // Reset state
+                frameBuffer = [];
+                playedFrames = 0;
+                receivedFrames = 0;
+                segmentCount = 0;
+                isStreaming = true;
 
                 // Send start command
                 const config = {
@@ -3522,7 +3705,7 @@ STREAMING_HTML = """
                     height: parseInt(document.getElementById('height').value),
                     width: parseInt(document.getElementById('width').value),
                     num_frames: parseInt(document.getElementById('numFrames').value),
-                    frame_rate: parseFloat(document.getElementById('frameRate').value),
+                    frame_rate: 24.0,  // Generation rate (server-side)
                     use_second_stage: document.getElementById('useSecondStage').checked,
                     max_segments: parseInt(document.getElementById('maxSegments').value),
                 };
@@ -3532,14 +3715,14 @@ STREAMING_HTML = """
                 canvas.height = config.use_second_stage ? config.height * 2 : config.height;
 
                 ws.send(JSON.stringify(config));
-                log('Started generation: ' + config.prompt.substring(0, 50) + '...');
+                log('Generation started: ' + config.prompt.substring(0, 40) + '...');
 
                 document.getElementById('startBtn').style.display = 'none';
                 document.getElementById('stopBtn').style.display = 'block';
                 document.getElementById('updateBtn').style.display = 'block';
 
-                frameCount = 0;
-                segmentCount = 0;
+                // Start playback
+                startPlayback();
                 updateStats();
             };
 
@@ -3547,43 +3730,41 @@ STREAMING_HTML = """
                 const msg = JSON.parse(event.data);
 
                 if (msg.type === 'frame') {
-                    // Display frame on canvas
-                    const img = new Image();
-                    img.onload = () => {
-                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                    };
-                    img.src = 'data:image/jpeg;base64,' + msg.data;
-                    frameCount++;
+                    // Add frame to buffer
+                    frameBuffer.push(msg.data);
+                    receivedFrames++;
                     updateStats();
-                    updateStatus('Generating...', 'generating');
                 }
                 else if (msg.type === 'audio') {
-                    log('Received audio chunk');
-                    // Could play audio here with Web Audio API
+                    log('Audio chunk received');
+                    playAudioChunk(msg.data);
                 }
                 else if (msg.type === 'segment_start') {
-                    log(`Starting segment ${msg.segment}: ${msg.prompt.substring(0, 30)}...`);
+                    log(`Segment ${msg.segment}: ${msg.prompt.substring(0, 30)}...`);
                 }
                 else if (msg.type === 'segment_complete') {
                     segmentCount = msg.segment;
-                    log(`Segment ${msg.segment} complete (${msg.frames} frames)`);
-                    updateStats();
+                    log(`Segment ${msg.segment} done (${msg.frames} frames)`);
                 }
                 else if (msg.type === 'prompt_updated') {
-                    log('Prompt updated: ' + msg.prompt.substring(0, 30) + '...');
+                    log('Prompt updated!');
                 }
                 else if (msg.type === 'complete') {
-                    log(`Generation complete! ${msg.segments} segments`);
-                    updateStatus('Complete', 'connected');
-                    resetButtons();
+                    log(`Complete! ${msg.segments} segments`);
+                    isStreaming = false;
+                    // Keep playing until buffer is empty
                 }
                 else if (msg.type === 'stopped') {
-                    log('Generation stopped');
+                    log('Stopped');
+                    isStreaming = false;
+                    stopPlayback();
                     updateStatus('Stopped', '');
                     resetButtons();
                 }
                 else if (msg.type === 'error') {
                     log('Error: ' + msg.message);
+                    isStreaming = false;
+                    stopPlayback();
                     updateStatus('Error', '');
                     resetButtons();
                 }
@@ -3591,14 +3772,23 @@ STREAMING_HTML = """
 
             ws.onerror = (error) => {
                 log('WebSocket error');
+                isStreaming = false;
+                stopPlayback();
                 updateStatus('Error', '');
                 resetButtons();
             };
 
             ws.onclose = () => {
-                log('WebSocket closed');
-                updateStatus('Disconnected', '');
-                resetButtons();
+                log('Disconnected');
+                isStreaming = false;
+                // Don't stop playback immediately - let buffer drain
+                setTimeout(() => {
+                    if (frameBuffer.length === 0) {
+                        stopPlayback();
+                        updateStatus('Disconnected', '');
+                        resetButtons();
+                    }
+                }, 1000);
             };
         }
 
@@ -3607,6 +3797,7 @@ STREAMING_HTML = """
                 ws.send(JSON.stringify({action: 'stop'}));
                 log('Stop requested');
             }
+            isStreaming = false;
         }
 
         function updatePrompt() {

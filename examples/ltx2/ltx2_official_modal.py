@@ -1844,6 +1844,49 @@ class OfficialLTX2Engine:
         print(f"   Rolling: Complete! Output: {out_path} ({num_frames} frames, {total_duration:.1f}s)")
         return video_bytes
 
+    def encode_target_image(self, image_base64: str, target_height: int = 480, target_width: int = 832) -> "torch.Tensor":
+        """
+        Encode a base64 image to latent space for end-frame conditioning.
+
+        Args:
+            image_base64: Base64-encoded image data (with or without data URL prefix)
+            target_height: Height to resize image to
+            target_width: Width to resize image to
+
+        Returns:
+            Encoded latent tensor suitable for VideoConditionByKeyframeIndex
+        """
+        import torch
+        import numpy as np
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        # Strip data URL prefix if present
+        if ',' in image_base64:
+            image_base64 = image_base64.split(',')[1]
+
+        # Decode base64 to image
+        image_data = base64.b64decode(image_base64)
+        img = Image.open(BytesIO(image_data)).convert('RGB')
+
+        # Resize to match generation resolution
+        img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+        # Convert to tensor: [B, C, T, H, W] where T=1 for single frame
+        # Normalize to [-1, 1] range (same as LTX's normalize_latent: x / 127.5 - 1.0)
+        img_np = np.array(img).astype(np.float32) / 127.5 - 1.0  # [H, W, C] in [-1, 1] range
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)  # [C, H, W]
+        img_tensor = img_tensor.unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
+        img_tensor = img_tensor.to(dtype=torch.bfloat16, device=self.pipeline.device)
+
+        # Encode to latent space
+        with torch.inference_mode():
+            encoded_latent = self._video_encoder(img_tensor)
+
+        print(f"   Target image encoded. Latent shape: {encoded_latent.shape}", flush=True)
+        return encoded_latent
+
     def generate_streaming(
         self,
         prompt: str,
@@ -1854,12 +1897,14 @@ class OfficialLTX2Engine:
         frame_rate: float,
         use_second_stage: bool = False,
         is_first_segment: bool = True,
+        end_frame_latent: "torch.Tensor | None" = None,
     ):
         """
         Generator that yields frames for real-time streaming.
 
         Args:
             is_first_segment: If True, starts fresh. If False, conditions on previous segment.
+            end_frame_latent: Optional latent for end-frame conditioning (target image).
 
         Yields:
             dict with either:
@@ -1957,6 +2002,16 @@ class OfficialLTX2Engine:
                 # Clear any previous latent when starting fresh
                 print(f"   Streaming: First segment - clearing previous latent", flush=True)
                 self._streaming_last_latent = None
+
+            # Add end-frame conditioning (target image) if provided
+            if end_frame_latent is not None:
+                print(f"   Streaming: Adding end-frame conditioning (target image), shape: {end_frame_latent.shape}", flush=True)
+                end_conditioning = VideoConditionByKeyframeIndex(
+                    keyframes=end_frame_latent,
+                    frame_idx=segment_frames - 1,  # Last frame
+                    strength=1.0,
+                )
+                conditionings.append(end_conditioning)
 
             # Initialize video state
             video_state, video_tools = noise_video_state(
@@ -2384,6 +2439,7 @@ class OfficialLTX2Engine:
             current_prompt = None
             should_stop = False
             segment_count = 0
+            target_image_latent = None  # For end-frame conditioning
 
             try:
                 while True:
@@ -2399,6 +2455,29 @@ class OfficialLTX2Engine:
                         elif msg.get("action") == "update_prompt":
                             current_prompt = msg.get("prompt", current_prompt)
                             await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+
+                        elif msg.get("action") == "set_target_image":
+                            # Encode target image for end-frame conditioning
+                            image_data = msg.get("image")
+                            if image_data:
+                                try:
+                                    target_height = msg.get("height", 480)
+                                    target_width = msg.get("width", 832)
+                                    target_image_latent = engine.encode_target_image(
+                                        image_data, target_height, target_width
+                                    )
+                                    await websocket.send_json({"type": "target_image_set", "success": True})
+                                    print(f"   WebSocket: Target image set", flush=True)
+                                except Exception as e:
+                                    print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
+                                    await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
+                            else:
+                                await websocket.send_json({"type": "target_image_set", "success": False, "error": "No image data"})
+
+                        elif msg.get("action") == "clear_target_image":
+                            target_image_latent = None
+                            await websocket.send_json({"type": "target_image_cleared"})
+                            print(f"   WebSocket: Target image cleared", flush=True)
 
                         elif msg.get("action") == "start":
                             current_prompt = msg.get("prompt", "A beautiful landscape")
@@ -2419,7 +2498,7 @@ class OfficialLTX2Engine:
                                 segment_count += 1
                                 seg_seed = seed + segment_count
 
-                                # Check for messages with longer timeout to catch prompt updates
+                                # Check for messages with longer timeout to catch prompt/image updates
                                 try:
                                     check_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
                                     check_msg = json.loads(check_data)
@@ -2430,24 +2509,40 @@ class OfficialLTX2Engine:
                                         current_prompt = check_msg.get("prompt", current_prompt)
                                         print(f"   WebSocket: Prompt updated to: {current_prompt[:50]}...", flush=True)
                                         await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+                                    elif check_msg.get("action") == "set_target_image":
+                                        image_data = check_msg.get("image")
+                                        if image_data:
+                                            try:
+                                                target_image_latent = engine.encode_target_image(image_data, height, width)
+                                                await websocket.send_json({"type": "target_image_set", "success": True})
+                                                print(f"   WebSocket: Target image set (pre-segment)", flush=True)
+                                            except Exception as e:
+                                                print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
+                                                await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
+                                    elif check_msg.get("action") == "clear_target_image":
+                                        target_image_latent = None
+                                        await websocket.send_json({"type": "target_image_cleared"})
                                 except asyncio.TimeoutError:
                                     pass
 
                                 if should_stop:
                                     break
 
-                                print(f"   WebSocket: Segment {segment_count} using prompt: {current_prompt[:50]}...", flush=True)
+                                # Check if we have a target image for this segment
+                                has_target = target_image_latent is not None
+                                print(f"   WebSocket: Segment {segment_count} using prompt: {current_prompt[:50]}...{' (with target image)' if has_target else ''}", flush=True)
                                 await websocket.send_json({
                                     "type": "segment_start",
                                     "segment": segment_count,
-                                    "prompt": current_prompt
+                                    "prompt": current_prompt,
+                                    "has_target_image": has_target
                                 })
 
                                 # Run generation in thread pool
                                 import concurrent.futures
                                 loop = asyncio.get_event_loop()
 
-                                # Capture variables for closure
+                                # Capture variables for closure (including target image)
                                 _prompt = current_prompt
                                 _seed = seg_seed
                                 _height = height
@@ -2456,7 +2551,13 @@ class OfficialLTX2Engine:
                                 _fps = frame_rate
                                 _stage2 = use_second_stage
                                 _is_first = (segment_count == 1)
+                                _target_latent = target_image_latent  # Capture for this segment
                                 print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}", flush=True)
+
+                                # Clear target image after capturing (one-shot use)
+                                if target_image_latent is not None:
+                                    target_image_latent = None
+                                    await websocket.send_json({"type": "target_image_used"})
 
                                 def run_generation():
                                     return list(engine.generate_streaming(
@@ -2468,6 +2569,7 @@ class OfficialLTX2Engine:
                                         frame_rate=_fps,
                                         use_second_stage=_stage2,
                                         is_first_segment=_is_first,
+                                        end_frame_latent=_target_latent,
                                     ))
 
                                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -2491,6 +2593,19 @@ class OfficialLTX2Engine:
                                             current_prompt = check_msg.get("prompt", current_prompt)
                                             print(f"   WebSocket: Prompt updated (mid-segment) to: {current_prompt[:50]}...", flush=True)
                                             await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
+                                        elif check_msg.get("action") == "set_target_image":
+                                            image_data = check_msg.get("image")
+                                            if image_data:
+                                                try:
+                                                    target_image_latent = engine.encode_target_image(image_data, height, width)
+                                                    await websocket.send_json({"type": "target_image_set", "success": True})
+                                                    print(f"   WebSocket: Target image set (mid-segment, will apply to next segment)", flush=True)
+                                                except Exception as e:
+                                                    print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
+                                                    await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
+                                        elif check_msg.get("action") == "clear_target_image":
+                                            target_image_latent = None
+                                            await websocket.send_json({"type": "target_image_cleared"})
                                     except asyncio.TimeoutError:
                                         pass
 
@@ -3454,6 +3569,65 @@ STREAMING_HTML = """
             display: block;
             background: #000;
         }
+
+        /* Drag and drop overlay */
+        .drop-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(233, 69, 96, 0.8);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            pointer-events: none;
+        }
+        .drop-overlay.active {
+            display: flex;
+        }
+        .drop-overlay-text {
+            color: white;
+            font-size: 1.5rem;
+            font-weight: 600;
+            text-align: center;
+        }
+
+        /* Target image indicator */
+        .target-indicator {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(74, 222, 128, 0.9);
+            color: #000;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            display: none;
+            z-index: 50;
+        }
+        .target-indicator.active {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .target-indicator img {
+            width: 40px;
+            height: 30px;
+            object-fit: cover;
+            border-radius: 4px;
+        }
+        .target-indicator .clear-btn {
+            cursor: pointer;
+            padding: 2px 6px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 4px;
+        }
+        .target-indicator .clear-btn:hover {
+            background: rgba(0,0,0,0.5);
+        }
         .status-bar {
             padding: 10px 15px;
             background: rgba(0,0,0,0.5);
@@ -3558,8 +3732,16 @@ STREAMING_HTML = """
                 <div class="log" id="log"></div>
             </div>
 
-            <div class="video-container">
+            <div class="video-container" id="videoContainer">
                 <canvas id="videoCanvas" width="832" height="480"></canvas>
+                <div class="drop-overlay" id="dropOverlay">
+                    <div class="drop-overlay-text">Drop image to set as target frame</div>
+                </div>
+                <div class="target-indicator" id="targetIndicator">
+                    <img id="targetPreview" src="" alt="Target">
+                    <span>Target Set</span>
+                    <span class="clear-btn" onclick="clearTargetImage()">✕</span>
+                </div>
                 <div class="status-bar">
                     <span class="status" id="status">Disconnected</span>
                     <div class="buffer-indicator">
@@ -3596,6 +3778,9 @@ STREAMING_HTML = """
         let audioSources = [];  // Track active audio sources for rate changes
         let nextAudioTime = 0;
 
+        // Target image
+        let targetImageData = null;
+
         // Canvas
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
@@ -3606,6 +3791,10 @@ STREAMING_HTML = """
         const logEl = document.getElementById('log');
         const bufferFillEl = document.getElementById('bufferFill');
         const bufferCountEl = document.getElementById('bufferCount');
+        const videoContainer = document.getElementById('videoContainer');
+        const dropOverlay = document.getElementById('dropOverlay');
+        const targetIndicator = document.getElementById('targetIndicator');
+        const targetPreview = document.getElementById('targetPreview');
 
         function log(msg) {
             const time = new Date().toLocaleTimeString();
@@ -3732,6 +3921,87 @@ STREAMING_HTML = """
             });
         }
 
+        // ============ Target Image / Drag-and-Drop ============
+
+        // Drag and drop handlers
+        videoContainer.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropOverlay.classList.add('active');
+        });
+
+        videoContainer.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        videoContainer.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            // Only hide if leaving the container entirely
+            if (!videoContainer.contains(e.relatedTarget)) {
+                dropOverlay.classList.remove('active');
+            }
+        });
+
+        videoContainer.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropOverlay.classList.remove('active');
+
+            const files = e.dataTransfer.files;
+            if (files.length > 0 && files[0].type.startsWith('image/')) {
+                handleTargetImage(files[0]);
+            }
+        });
+
+        function handleTargetImage(file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const imageData = e.target.result;
+                targetImageData = imageData;
+
+                // Show preview
+                targetPreview.src = imageData;
+                targetIndicator.classList.add('active');
+
+                // Send to server if connected
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    sendTargetImage(imageData);
+                } else {
+                    log('Target image staged (will send when streaming starts)');
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function sendTargetImage(imageData) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const height = parseInt(document.getElementById('height').value);
+                const width = parseInt(document.getElementById('width').value);
+                ws.send(JSON.stringify({
+                    action: 'set_target_image',
+                    image: imageData,
+                    height: height,
+                    width: width
+                }));
+                log('Sending target image to server...');
+            }
+        }
+
+        function clearTargetImage() {
+            targetImageData = null;
+            targetPreview.src = '';
+            targetIndicator.classList.remove('active');
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'clear_target_image' }));
+                log('Target image cleared');
+            }
+        }
+
+        // ============ Streaming Functions ============
+
         function startStream() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
@@ -3779,6 +4049,11 @@ STREAMING_HTML = """
                 ws.send(JSON.stringify(config));
                 log('Generation started: ' + config.prompt.substring(0, 40) + '...');
 
+                // Send staged target image if any
+                if (targetImageData) {
+                    sendTargetImage(targetImageData);
+                }
+
                 document.getElementById('startBtn').style.display = 'none';
                 document.getElementById('stopBtn').style.display = 'block';
                 document.getElementById('updateBtn').style.display = 'block';
@@ -3814,6 +4089,24 @@ STREAMING_HTML = """
                 }
                 else if (msg.type === 'prompt_updated') {
                     log('Prompt updated!');
+                }
+                else if (msg.type === 'target_image_set') {
+                    if (msg.success) {
+                        log('Target image set - will apply to next segment');
+                    } else {
+                        log('Failed to set target image: ' + (msg.error || 'Unknown error'));
+                        clearTargetImage();
+                    }
+                }
+                else if (msg.type === 'target_image_used') {
+                    log('Target image applied to segment');
+                    // Clear the indicator after use
+                    targetImageData = null;
+                    targetPreview.src = '';
+                    targetIndicator.classList.remove('active');
+                }
+                else if (msg.type === 'target_image_cleared') {
+                    log('Target image cleared');
                 }
                 else if (msg.type === 'complete') {
                     log(`Complete! ${msg.segments} segments`);

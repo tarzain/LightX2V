@@ -2048,11 +2048,13 @@ class OfficialLTX2Engine:
             audio_state = audio_tools.unpatchify(audio_state)
 
             # Store LAST latent frames for next segment conditioning
-            # Temporal compression is ~8x, so overlap_frames=8 -> 1 latent frame
-            overlap_frames = 8
-            latent_overlap = max(1, overlap_frames // 8)
+            # Temporal compression is ~8x, so overlap_frames=16 -> 2 latent frames
+            # More overlap frames = better continuity but more redundant frames to skip
+            overlap_frames = 16  # ~0.5s at 30fps
+            latent_overlap = max(1, overlap_frames // 8)  # 2 latent frames
             self._streaming_last_latent = video_state.latent[:, :, -latent_overlap:, :, :].clone()
-            print(f"   Streaming: Stored last {latent_overlap} latent frame(s) for next segment, shape: {self._streaming_last_latent.shape}", flush=True)
+            self._streaming_overlap_frames = overlap_frames  # Store for frame skipping
+            print(f"   Streaming: Stored last {latent_overlap} latent frame(s) ({overlap_frames} video frames) for conditioning, shape: {self._streaming_last_latent.shape}", flush=True)
 
             # Determine latent for decode
             if use_second_stage:
@@ -2174,16 +2176,25 @@ class OfficialLTX2Engine:
                     video = video * 255
                 video = np.clip(video, 0, 255).astype(np.uint8)
 
-                print(f"   Streaming: Yielding {video.shape[0]} frames...", flush=True)
+                # Skip overlap frames for non-first segments (they overlap with previous segment)
+                skip_frames = 0 if is_first_segment else overlap_frames
+                actual_frames = video.shape[0] - skip_frames
+                print(f"   Streaming: Yielding {actual_frames} frames (skipping first {skip_frames} overlap frames)...", flush=True)
 
-                # Yield each frame as base64 JPEG
+                # Yield each frame as base64 JPEG (skipping overlap)
+                frame_idx = 0
                 for i in range(video.shape[0]):
+                    # Skip overlap frames for non-first segments
+                    if i < skip_frames:
+                        continue
+
                     frame = video[i]
                     img = Image.fromarray(frame)
                     buffer = BytesIO()
                     img.save(buffer, format='JPEG', quality=85)
                     frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                    yield {"type": "frame", "data": frame_base64, "index": i}
+                    yield {"type": "frame", "data": frame_base64, "index": frame_idx}
+                    frame_idx += 1
 
             yield {"type": "segment_complete", "segment": 1, "frames": segment_frames}
 

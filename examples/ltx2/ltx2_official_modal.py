@@ -2037,7 +2037,7 @@ class OfficialLTX2Engine:
                 print(f"   Streaming: Using previous audio latent for conditioning, shape: {prev_audio.shape}", flush=True)
 
                 # Get expected audio latent shape for this segment
-                from ltx_video.models.autoencoders.latent_configs import AudioLatentShape
+                from ltx_core.types import AudioLatentShape
                 expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
                 expected_frames = expected_audio_shape.frames
 

@@ -5744,6 +5744,11 @@ MINIMAL_HTML = """
                 seekBar.max = frameHistory.length - 1;
                 updateTimeDisplay();
                 updateBufferDisplay();
+
+                // Enable controls once we have frames
+                if (frameHistory.length === 1) {
+                    updateControlsState();
+                }
             };
             img.src = 'data:image/jpeg;base64,' + msg.data;
         }

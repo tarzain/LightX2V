@@ -42,8 +42,9 @@ DEFAULT_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 
 # Pipeline configuration
 USE_FP8 = False  # False = BF16 checkpoint (~43GB), True = FP8 checkpoint (~27GB)
-NUM_INFERENCE_STEPS = 20  # Number of denoising steps (gradient estimation allows 20-30 instead of 40)
+NUM_INFERENCE_STEPS = 10  # Number of denoising steps (with high gamma, can go as low as 10)
 CFG_GUIDANCE_SCALE = 3.0  # Classifier-free guidance scale (higher = more prompt adherence)
+GE_GAMMA = 4.0  # Gradient estimation coefficient (higher = faster but may reduce quality)
 NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
 # WebSocket endpoint URL (GPU container) - UI served separately from lightweight CPU container
@@ -223,6 +224,7 @@ class NondistilledLTX2Engine:
         self.use_fp8 = USE_FP8
         self.num_inference_steps = NUM_INFERENCE_STEPS
         self.cfg_guidance_scale = CFG_GUIDANCE_SCALE
+        self.ge_gamma = GE_GAMMA
         self.negative_prompt = NEGATIVE_PROMPT
 
         # Select checkpoint based on configuration (dev = non-distilled)
@@ -233,7 +235,7 @@ class NondistilledLTX2Engine:
             ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-dev.safetensors"
             print(f"🔧 Loading LTX-2 TI2VidOneStagePipeline with BF16 (~43GB)...")
 
-        print(f"   Inference steps: {NUM_INFERENCE_STEPS}, CFG scale: {CFG_GUIDANCE_SCALE}")
+        print(f"   Inference steps: {NUM_INFERENCE_STEPS}, CFG scale: {CFG_GUIDANCE_SCALE}, GE gamma: {GE_GAMMA}")
 
         # Check for required files
         required_files = [ckpt]
@@ -1984,6 +1986,9 @@ class NondistilledLTX2Engine:
             # CFG guider for classifier-free guidance
             cfg_guider = CFGGuider(self.cfg_guidance_scale)
 
+            # Capture ge_gamma for the closure
+            _ge_gamma = self.ge_gamma
+
             def denoising_loop(sigmas, video_state, audio_state, stepper):
                 return gradient_estimating_euler_denoising_loop(
                     sigmas=sigmas,
@@ -1998,7 +2003,7 @@ class NondistilledLTX2Engine:
                         a_context_n,
                         transformer=transformer,
                     ),
-                    ge_gamma=2.0,  # Gradient estimation coefficient for faster convergence
+                    ge_gamma=_ge_gamma,
                 )
 
             generator = torch.Generator(device=device).manual_seed(seed)

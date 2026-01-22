@@ -44,8 +44,9 @@ DEFAULT_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 USE_FP8 = False  # False = BF16 checkpoint (~38GB), True = FP8 checkpoint (~19GB)
 SKIP_UPSCALING = True  # True = generate at full res, skip stage 2 (faster), False = 2-stage with upscaling
 
-# WebSocket endpoint URL (GPU container) - UI served separately from lightweight CPU container
-WEBSOCKET_ENDPOINT = "wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream"
+# WebSocket endpoint URLs (GPU containers) - UI served separately from lightweight CPU container
+WEBSOCKET_ENDPOINT_TURBO = "wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream"
+WEBSOCKET_ENDPOINT_HQ = "wss://tmalive--ltx2-nondistilled-nondistilledltx2engine-streaming-app.modal.run/ws/stream"
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
@@ -139,6 +140,7 @@ def streaming_ui():
 
     This serves the HTML page instantly without waiting for GPU/model loading.
     The page connects to the GPU container's WebSocket endpoint for actual streaming.
+    Supports both Turbo (distilled) and HQ (non-distilled) modes.
     """
     from fastapi import FastAPI
     from fastapi.responses import HTMLResponse
@@ -152,22 +154,22 @@ def streaming_ui():
         allow_headers=["*"],
     )
 
+    def inject_endpoints(html):
+        """Inject both WebSocket endpoint URLs into the HTML."""
+        # Replace the single wsUrl with both endpoints
+        html = html.replace(
+            "const wsUrl = `${protocol}//${window.location.host}/ws/stream`;",
+            f'const WS_ENDPOINT_TURBO = "{WEBSOCKET_ENDPOINT_TURBO}";\n            const WS_ENDPOINT_HQ = "{WEBSOCKET_ENDPOINT_HQ}";\n            let wsUrl = WS_ENDPOINT_TURBO;  // Default to turbo'
+        )
+        return html
+
     @ui_app.get("/", response_class=HTMLResponse)
     async def index():
-        # Inject the WebSocket endpoint URL into the HTML
-        html = STREAMING_HTML.replace(
-            "const wsUrl = `${protocol}//${window.location.host}/ws/stream`;",
-            f'const wsUrl = "{WEBSOCKET_ENDPOINT}";'
-        )
-        return HTMLResponse(html)
+        return HTMLResponse(inject_endpoints(STREAMING_HTML))
 
     @ui_app.get("/stream", response_class=HTMLResponse)
     async def stream():
-        html = STREAMING_HTML.replace(
-            "const wsUrl = `${protocol}//${window.location.host}/ws/stream`;",
-            f'const wsUrl = "{WEBSOCKET_ENDPOINT}";'
-        )
-        return HTMLResponse(html)
+        return HTMLResponse(inject_endpoints(STREAMING_HTML))
 
     @ui_app.get("/health")
     async def health():
@@ -3713,10 +3715,17 @@ STREAMING_HTML = """
             transition: all 0.2s;
         }
         .btn-start {
-            background: linear-gradient(135deg, #e94560, #7b2fff);
             color: white;
+            flex: 1;
         }
-        .btn-start:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(233,69,96,0.4); }
+        .btn-turbo {
+            background: linear-gradient(135deg, #e94560, #ff6b35);
+        }
+        .btn-turbo:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(233,69,96,0.4); }
+        .btn-hq {
+            background: linear-gradient(135deg, #7b2fff, #00d4ff);
+        }
+        .btn-hq:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(123,47,255,0.4); }
         .btn-stop {
             background: #ff4444;
             color: white;
@@ -3896,7 +3905,10 @@ STREAMING_HTML = """
                     <label for="useSecondStage">2x Upsampling (960x1664)</label>
                 </div>
 
-                <button class="btn btn-start" id="startBtn" onclick="startStream()">▶ Start Streaming</button>
+                <div class="btn-row" style="display: flex; gap: 10px;">
+                    <button class="btn btn-start btn-turbo" id="startTurboBtn" onclick="startStream('turbo')">⚡ Start Turbo</button>
+                    <button class="btn btn-start btn-hq" id="startHQBtn" onclick="startStream('hq')">✨ Start HQ</button>
+                </div>
                 <button class="btn btn-stop" id="stopBtn" onclick="stopStream()" style="display:none;">⏹ Stop</button>
                 <button class="btn btn-update" id="updateBtn" onclick="updatePrompt()" style="display:none;">🔄 Update Prompt</button>
 
@@ -4208,11 +4220,14 @@ STREAMING_HTML = """
 
         // ============ Streaming Functions ============
 
-        function startStream() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
+        let currentMode = 'turbo';  // Track current streaming mode
 
-            log('Connecting to WebSocket...');
+        function startStream(mode = 'turbo') {
+            currentMode = mode;
+            // Select WebSocket URL based on mode
+            const wsUrl = mode === 'hq' ? WS_ENDPOINT_HQ : WS_ENDPOINT_TURBO;
+
+            log(`Connecting to ${mode.toUpperCase()} endpoint...`);
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
@@ -4260,7 +4275,8 @@ STREAMING_HTML = """
                     sendTargetImage(targetImageData);
                 }
 
-                document.getElementById('startBtn').style.display = 'none';
+                document.getElementById('startTurboBtn').style.display = 'none';
+                document.getElementById('startHQBtn').style.display = 'none';
                 document.getElementById('stopBtn').style.display = 'block';
                 document.getElementById('updateBtn').style.display = 'block';
 
@@ -4374,7 +4390,8 @@ STREAMING_HTML = """
         }
 
         function resetButtons() {
-            document.getElementById('startBtn').style.display = 'block';
+            document.getElementById('startTurboBtn').style.display = 'block';
+            document.getElementById('startHQBtn').style.display = 'block';
             document.getElementById('stopBtn').style.display = 'none';
             document.getElementById('updateBtn').style.display = 'none';
             if (ws) {

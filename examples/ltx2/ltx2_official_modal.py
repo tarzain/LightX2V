@@ -5704,6 +5704,8 @@ MINIMAL_HTML = """
                     break;
                 case 'started':
                     isStreaming = true;
+                    isPaused = false;
+                    playPauseBtn.textContent = '⏸'; // Show pause icon since we're playing
                     placeholder.classList.add('hidden');
                     videoControls.classList.add('visible');
                     updateControlsState();

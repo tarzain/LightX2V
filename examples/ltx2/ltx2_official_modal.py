@@ -156,11 +156,8 @@ def streaming_ui():
 
     def inject_endpoints(html):
         """Inject both WebSocket endpoint URLs into the HTML."""
-        # Replace the single wsUrl with both endpoints
-        html = html.replace(
-            "const wsUrl = `${protocol}//${window.location.host}/ws/stream`;",
-            f'const WS_ENDPOINT_TURBO = "{WEBSOCKET_ENDPOINT_TURBO}";\n            const WS_ENDPOINT_HQ = "{WEBSOCKET_ENDPOINT_HQ}";\n            let wsUrl = WS_ENDPOINT_TURBO;  // Default to turbo'
-        )
+        html = html.replace("__WS_ENDPOINT_TURBO__", WEBSOCKET_ENDPOINT_TURBO)
+        html = html.replace("__WS_ENDPOINT_HQ__", WEBSOCKET_ENDPOINT_HQ)
         return html
 
     @ui_app.get("/", response_class=HTMLResponse)
@@ -3939,6 +3936,10 @@ STREAMING_HTML = """
     </div>
 
     <script>
+        // WebSocket endpoints (injected by server)
+        const WS_ENDPOINT_TURBO = "__WS_ENDPOINT_TURBO__";
+        const WS_ENDPOINT_HQ = "__WS_ENDPOINT_HQ__";
+
         // WebSocket and state
         let ws = null;
         let isStreaming = false;

@@ -4717,6 +4717,1271 @@ STREAMING_HTML = """
 
 
 # ============================================================================
+# Minimal Streaming UI
+# ============================================================================
+
+MINIMAL_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LTX-2 Video Stream</title>
+    <style>
+        :root {
+            --bg-primary: #000;
+            --bg-secondary: rgba(30, 30, 30, 0.9);
+            --bg-tertiary: rgba(255, 255, 255, 0.1);
+            --bg-hover: rgba(255, 255, 255, 0.2);
+            --text-primary: #fff;
+            --text-secondary: #888;
+            --text-muted: #666;
+            --border-color: rgba(255, 255, 255, 0.1);
+            --accent: #6366f1;
+            --canvas-bg: #000;
+        }
+
+        body.light-mode {
+            --bg-primary: #f5f5f5;
+            --bg-secondary: rgba(255, 255, 255, 0.95);
+            --bg-tertiary: rgba(0, 0, 0, 0.05);
+            --bg-hover: rgba(0, 0, 0, 0.1);
+            --text-primary: #1a1a1a;
+            --text-secondary: #666;
+            --text-muted: #999;
+            --border-color: rgba(0, 0, 0, 0.1);
+            --canvas-bg: #e0e0e0;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        /* Full-screen video container */
+        .video-wrapper {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--canvas-bg);
+        }
+
+        #videoCanvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        /* Drop overlay for drag-and-drop */
+        .drop-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(99, 102, 241, 0.3);
+            border: 4px dashed #6366f1;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            pointer-events: none;
+        }
+
+        .drop-overlay.active {
+            display: flex;
+        }
+
+        .drop-overlay-text {
+            font-size: 2rem;
+            color: #fff;
+            text-shadow: 0 2px 8px rgba(0,0,0,0.5);
+        }
+
+        /* Video controls bar */
+        .video-controls {
+            position: fixed;
+            bottom: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 20px;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            border-radius: 30px;
+            z-index: 50;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .video-wrapper:hover .video-controls,
+        .video-controls:hover,
+        .video-controls.visible {
+            opacity: 1;
+        }
+
+        .ctrl-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 50%;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+
+        .ctrl-btn:hover {
+            background: var(--bg-hover);
+        }
+
+        .ctrl-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .ctrl-btn.active {
+            background: #6366f1;
+        }
+
+        /* Seek bar */
+        .seek-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+            min-width: 200px;
+            max-width: 400px;
+        }
+
+        .seek-bar {
+            flex: 1;
+            height: 4px;
+            -webkit-appearance: none;
+            appearance: none;
+            background: rgba(255,255,255,0.2);
+            border-radius: 2px;
+            cursor: pointer;
+        }
+
+        .seek-bar::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #fff;
+            cursor: pointer;
+        }
+
+        .time-display {
+            font-size: 12px;
+            color: rgba(255,255,255,0.7);
+            min-width: 80px;
+            text-align: center;
+        }
+
+        /* Live indicator */
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: rgba(239, 68, 68, 0.8);
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .live-indicator.paused {
+            background: rgba(100, 100, 100, 0.8);
+        }
+
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background: #fff;
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+
+        .live-indicator.paused .live-dot {
+            animation: none;
+            background: #888;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Bottom prompt bar */
+        .prompt-bar {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 700px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 8px 8px 16px;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            border-radius: 28px;
+            border: 1px solid var(--border-color);
+            z-index: 60;
+        }
+
+        .prompt-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            font-size: 15px;
+            outline: none;
+            padding: 8px 0;
+        }
+
+        .prompt-input::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .prompt-btn {
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 50%;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+
+        .prompt-btn:hover {
+            background: var(--bg-hover);
+        }
+
+        .prompt-btn.primary {
+            background: #6366f1;
+        }
+
+        .prompt-btn.primary:hover {
+            background: #5558e3;
+        }
+
+        .prompt-btn.primary:disabled {
+            background: #444;
+            cursor: not-allowed;
+        }
+
+        /* Image preview in prompt bar */
+        .attached-image {
+            position: relative;
+            width: 44px;
+            height: 44px;
+            border-radius: 8px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .attached-image img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .attached-image .remove-btn {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            width: 18px;
+            height: 18px;
+            background: rgba(239, 68, 68, 0.9);
+            border: none;
+            border-radius: 50%;
+            color: #fff;
+            font-size: 10px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* Settings panel */
+        .settings-panel {
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            width: 280px;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            border: 1px solid var(--border-color);
+            padding: 16px;
+            z-index: 70;
+            display: none;
+        }
+
+        .settings-panel.open {
+            display: block;
+        }
+
+        .settings-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .settings-title {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .settings-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 18px;
+            cursor: pointer;
+        }
+
+        .setting-group {
+            margin-bottom: 14px;
+        }
+
+        .setting-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .setting-value {
+            color: var(--text-primary);
+        }
+
+        .setting-input {
+            width: 100%;
+            padding: 8px 10px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 13px;
+        }
+
+        .setting-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .setting-slider {
+            width: 100%;
+            -webkit-appearance: none;
+            appearance: none;
+            height: 4px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 2px;
+        }
+
+        .setting-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #6366f1;
+            cursor: pointer;
+        }
+
+        .setting-row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .setting-row .setting-group {
+            flex: 1;
+        }
+
+        /* Settings gear button */
+        .settings-btn {
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            width: 44px;
+            height: 44px;
+            border: none;
+            border-radius: 50%;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            color: var(--text-primary);
+            font-size: 20px;
+            cursor: pointer;
+            z-index: 65;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-color);
+            transition: background 0.2s;
+        }
+
+        .settings-btn:hover {
+            background: var(--bg-hover);
+        }
+
+        .settings-btn.hidden {
+            display: none;
+        }
+
+        /* Theme toggle */
+        .theme-toggle {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 50%;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            color: var(--text-primary);
+            font-size: 18px;
+            cursor: pointer;
+            z-index: 65;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-color);
+            transition: background 0.2s;
+        }
+
+        .theme-toggle:hover {
+            background: var(--bg-hover);
+        }
+
+        /* Status indicator */
+        .status-indicator {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            padding: 8px 14px;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            z-index: 50;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+        }
+
+        .status-dot.connected {
+            background: #22c55e;
+        }
+
+        .status-dot.connecting {
+            background: #f59e0b;
+            animation: pulse 1s infinite;
+        }
+
+        /* Hidden file input */
+        #imageInput {
+            display: none;
+        }
+
+        /* Toast notifications */
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 20px;
+            background: var(--bg-secondary);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            font-size: 13px;
+            z-index: 200;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+        }
+
+        .toast.visible {
+            opacity: 1;
+        }
+
+        /* Placeholder when no video */
+        .placeholder {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            z-index: 5;
+            pointer-events: none;
+        }
+
+        .placeholder.hidden {
+            display: none;
+        }
+
+        .placeholder-icon {
+            font-size: 64px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .placeholder-text {
+            font-size: 18px;
+            margin-bottom: 8px;
+        }
+
+        .placeholder-hint {
+            font-size: 13px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <!-- Video display -->
+    <div class="video-wrapper" id="videoWrapper">
+        <canvas id="videoCanvas" width="832" height="480"></canvas>
+        <div class="drop-overlay" id="dropOverlay">
+            <div class="drop-overlay-text">Drop image to guide next segment</div>
+        </div>
+    </div>
+
+    <!-- Placeholder -->
+    <div class="placeholder" id="placeholder">
+        <div class="placeholder-icon">🎬</div>
+        <div class="placeholder-text">Enter a prompt to start generating</div>
+        <div class="placeholder-hint">Or drop an image to begin with image-to-video</div>
+    </div>
+
+    <!-- Status indicator -->
+    <div class="status-indicator" id="statusIndicator">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Ready</span>
+    </div>
+
+    <!-- Theme toggle -->
+    <button class="theme-toggle" id="themeToggle" title="Toggle light/dark mode">🌙</button>
+
+    <!-- Video controls -->
+    <div class="video-controls" id="videoControls">
+        <button class="ctrl-btn" id="playPauseBtn" title="Play/Pause" disabled>▶</button>
+        <button class="ctrl-btn" id="stopBtn" title="Stop" disabled>⏹</button>
+        <div class="seek-container">
+            <input type="range" class="seek-bar" id="seekBar" min="0" max="100" value="100" disabled>
+            <div class="time-display" id="timeDisplay">0 / 0</div>
+        </div>
+        <button class="ctrl-btn" id="liveBtn" title="Jump to Live" disabled>⏭</button>
+        <div class="live-indicator" id="liveIndicator">
+            <div class="live-dot"></div>
+            <span>LIVE</span>
+        </div>
+    </div>
+
+    <!-- Prompt bar -->
+    <div class="prompt-bar" id="promptBar">
+        <input type="file" id="imageInput" accept="image/*">
+        <button class="prompt-btn" id="attachBtn" title="Attach image">📎</button>
+        <div class="attached-image" id="attachedImage" style="display: none;">
+            <img id="attachedPreview" src="">
+            <button class="remove-btn" onclick="removeAttachment()">✕</button>
+        </div>
+        <input type="text" class="prompt-input" id="promptInput" placeholder="Describe what you want to see...">
+        <button class="prompt-btn primary" id="sendBtn" title="Send">➤</button>
+    </div>
+
+    <!-- Settings button -->
+    <button class="settings-btn" id="settingsBtn" title="Settings">⚙</button>
+
+    <!-- Settings panel -->
+    <div class="settings-panel" id="settingsPanel">
+        <div class="settings-header">
+            <span class="settings-title">Settings</span>
+            <button class="settings-close" onclick="toggleSettings()">✕</button>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-group">
+                <label class="setting-label">Width</label>
+                <input type="number" class="setting-input" id="widthInput" value="832" step="32" min="256" max="1280">
+            </div>
+            <div class="setting-group">
+                <label class="setting-label">Height</label>
+                <input type="number" class="setting-input" id="heightInput" value="480" step="32" min="256" max="720">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-group">
+                <label class="setting-label">Seed</label>
+                <input type="number" class="setting-input" id="seedInput" value="42" min="0">
+            </div>
+            <div class="setting-group">
+                <label class="setting-label">Frames/Segment</label>
+                <input type="number" class="setting-input" id="numFramesInput" value="49" min="49" max="196" step="8">
+            </div>
+        </div>
+
+        <div class="setting-group">
+            <label class="setting-label">
+                <span>Playback FPS</span>
+                <span class="setting-value" id="fpsValue">18</span>
+            </label>
+            <input type="range" class="setting-slider" id="fpsSlider" min="1" max="30" value="18">
+        </div>
+
+        <div class="setting-group">
+            <label class="setting-label">
+                <span>Target Frame Position</span>
+                <span class="setting-value" id="targetPosValue">End</span>
+            </label>
+            <input type="range" class="setting-slider" id="targetPosSlider" min="0" max="1" step="0.1" value="1">
+            <div style="font-size: 10px; color: #666; margin-top: 4px;">Where dropped images appear in segment</div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // WebSocket endpoint
+        const WS_ENDPOINT = "__WS_ENDPOINT_TURBO__";
+
+        // State
+        let ws = null;
+        let isStreaming = false;
+        let isPaused = false;
+        let isLive = true;
+
+        // Frame buffer and playback
+        let frameHistory = [];      // All received frames (for seeking)
+        let frameBuffer = [];       // Queue of frames waiting to be played
+        let currentFrameIndex = 0;  // Current position in history
+        let playbackInterval = null;
+        let playbackFps = 18;
+        let lastFrameTime = 0;
+
+        // Pending data
+        let pendingImage = null;
+        let currentPrompt = "";
+
+        // Elements
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        const promptInput = document.getElementById('promptInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const attachBtn = document.getElementById('attachBtn');
+        const imageInput = document.getElementById('imageInput');
+        const attachedImage = document.getElementById('attachedImage');
+        const attachedPreview = document.getElementById('attachedPreview');
+        const playPauseBtn = document.getElementById('playPauseBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const seekBar = document.getElementById('seekBar');
+        const timeDisplay = document.getElementById('timeDisplay');
+        const liveBtn = document.getElementById('liveBtn');
+        const liveIndicator = document.getElementById('liveIndicator');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const placeholder = document.getElementById('placeholder');
+        const videoControls = document.getElementById('videoControls');
+        const settingsPanel = document.getElementById('settingsPanel');
+        const settingsBtn = document.getElementById('settingsBtn');
+        const fpsSlider = document.getElementById('fpsSlider');
+        const fpsValue = document.getElementById('fpsValue');
+        const targetPosSlider = document.getElementById('targetPosSlider');
+        const targetPosValue = document.getElementById('targetPosValue');
+        const dropOverlay = document.getElementById('dropOverlay');
+        const themeToggle = document.getElementById('themeToggle');
+
+        // Initialize
+        function init() {
+            // Load saved theme
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'light') {
+                document.body.classList.add('light-mode');
+                themeToggle.textContent = '☀️';
+            }
+
+            // Theme toggle
+            themeToggle.addEventListener('click', () => {
+                document.body.classList.toggle('light-mode');
+                const isLight = document.body.classList.contains('light-mode');
+                themeToggle.textContent = isLight ? '☀️' : '🌙';
+                localStorage.setItem('theme', isLight ? 'light' : 'dark');
+            });
+
+            // Event listeners
+            sendBtn.addEventListener('click', handleSend);
+            promptInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSend();
+                }
+            });
+
+            attachBtn.addEventListener('click', () => imageInput.click());
+            imageInput.addEventListener('change', handleImageSelect);
+
+            playPauseBtn.addEventListener('click', togglePlayPause);
+            stopBtn.addEventListener('click', stopStream);
+            liveBtn.addEventListener('click', jumpToLive);
+            seekBar.addEventListener('input', handleSeek);
+
+            settingsBtn.addEventListener('click', toggleSettings);
+
+            fpsSlider.addEventListener('input', (e) => {
+                playbackFps = parseInt(e.target.value);
+                fpsValue.textContent = playbackFps;
+                // Restart playback at new FPS
+                if (playbackInterval) {
+                    startPlayback();
+                }
+            });
+
+            targetPosSlider.addEventListener('input', (e) => {
+                const val = parseFloat(e.target.value);
+                if (val <= 0.15) targetPosValue.textContent = 'Start';
+                else if (val <= 0.35) targetPosValue.textContent = 'Early';
+                else if (val <= 0.65) targetPosValue.textContent = 'Middle';
+                else if (val <= 0.85) targetPosValue.textContent = 'Late';
+                else targetPosValue.textContent = 'End';
+            });
+
+            // Drag and drop
+            setupDragDrop();
+
+            // Keyboard shortcuts
+            document.addEventListener('keydown', (e) => {
+                if (e.target === promptInput) return;
+                if (e.code === 'Space') {
+                    e.preventDefault();
+                    togglePlayPause();
+                }
+            });
+        }
+
+        // Drag and drop setup
+        function setupDragDrop() {
+            const wrapper = document.getElementById('videoWrapper');
+
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(event => {
+                wrapper.addEventListener(event, (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                });
+            });
+
+            wrapper.addEventListener('dragenter', () => {
+                dropOverlay.classList.add('active');
+            });
+
+            wrapper.addEventListener('dragleave', (e) => {
+                if (!wrapper.contains(e.relatedTarget)) {
+                    dropOverlay.classList.remove('active');
+                }
+            });
+
+            wrapper.addEventListener('drop', (e) => {
+                dropOverlay.classList.remove('active');
+                const file = e.dataTransfer.files[0];
+                if (file && file.type.startsWith('image/')) {
+                    processImageFile(file);
+                }
+            });
+        }
+
+        // Image handling
+        function handleImageSelect(e) {
+            const file = e.target.files[0];
+            if (file) {
+                processImageFile(file);
+            }
+        }
+
+        function processImageFile(file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => {
+                    // Resize if needed
+                    const maxDim = 1024;
+                    let w = img.width, h = img.height;
+                    if (w > maxDim || h > maxDim) {
+                        if (w > h) { h = h * maxDim / w; w = maxDim; }
+                        else { w = w * maxDim / h; h = maxDim; }
+                    }
+
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = w;
+                    tempCanvas.height = h;
+                    const tempCtx = tempCanvas.getContext('2d');
+                    tempCtx.drawImage(img, 0, 0, w, h);
+
+                    pendingImage = tempCanvas.toDataURL('image/jpeg', 0.9);
+                    attachedPreview.src = pendingImage;
+                    attachedImage.style.display = 'block';
+
+                    if (isStreaming && ws && ws.readyState === WebSocket.OPEN) {
+                        // If streaming, send as target image for next segment
+                        sendTargetImage(pendingImage);
+                        showToast('Target image set for next segment');
+                    } else {
+                        // If not streaming, render to canvas as start image preview
+                        renderStartImagePreview(img);
+                        showToast('Start image set - enter a prompt to begin');
+                    }
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function removeAttachment() {
+            pendingImage = null;
+            attachedImage.style.display = 'none';
+            attachedPreview.src = '';
+            imageInput.value = '';
+        }
+
+        // Send handling
+        function handleSend() {
+            const prompt = promptInput.value.trim();
+            if (!prompt && !pendingImage) return;
+
+            if (!isStreaming) {
+                // Start new stream
+                startStream(prompt, pendingImage);
+            } else {
+                // Update existing stream
+                if (prompt && prompt !== currentPrompt) {
+                    updatePrompt(prompt);
+                }
+                if (pendingImage) {
+                    sendTargetImage(pendingImage);
+                    showToast('Target image set for next segment');
+                }
+            }
+
+            currentPrompt = prompt || currentPrompt;
+            promptInput.value = '';
+            removeAttachment();
+        }
+
+        // WebSocket connection
+        function connect() {
+            return new Promise((resolve, reject) => {
+                setStatus('connecting', 'Connecting...');
+
+                ws = new WebSocket(WS_ENDPOINT);
+
+                ws.onopen = () => {
+                    setStatus('connected', 'Connected');
+                    resolve();
+                };
+
+                ws.onmessage = handleMessage;
+
+                ws.onerror = (err) => {
+                    console.error('WebSocket error:', err);
+                    reject(err);
+                };
+
+                ws.onclose = () => {
+                    setStatus('disconnected', 'Disconnected');
+                    isStreaming = false;
+                    updateControlsState();
+                };
+            });
+        }
+
+        function handleMessage(event) {
+            const msg = JSON.parse(event.data);
+
+            switch (msg.type) {
+                case 'frame':
+                    handleFrame(msg);
+                    break;
+                case 'started':
+                    isStreaming = true;
+                    placeholder.classList.add('hidden');
+                    videoControls.classList.add('visible');
+                    updateControlsState();
+                    break;
+                case 'stopped':
+                case 'complete':
+                    // Keep frames but stop receiving new ones
+                    break;
+                case 'prompt_updated':
+                    showToast('Prompt updated');
+                    break;
+                case 'target_image_set':
+                    if (msg.success) {
+                        showToast('Target image ready');
+                    }
+                    break;
+            }
+        }
+
+        function handleFrame(msg) {
+            const img = new Image();
+            img.onload = () => {
+                // Store in history for seeking
+                frameHistory.push(img);
+
+                // Add to playback buffer if we're live
+                if (isLive) {
+                    frameBuffer.push(img);
+                }
+
+                // Update seek bar max
+                seekBar.max = frameHistory.length - 1;
+                updateTimeDisplay();
+                updateBufferDisplay();
+            };
+            img.src = 'data:image/jpeg;base64,' + msg.data;
+        }
+
+        function displayFrame(index) {
+            if (index >= 0 && index < frameHistory.length) {
+                const img = frameHistory[index];
+
+                // Resize canvas if needed
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                }
+
+                ctx.drawImage(img, 0, 0);
+            }
+        }
+
+        function renderStartImagePreview(img) {
+            // Render the start image to canvas immediately (before stream starts)
+            const height = parseInt(document.getElementById('heightInput').value);
+            const width = parseInt(document.getElementById('widthInput').value);
+
+            canvas.width = width;
+            canvas.height = height;
+
+            // Draw image to fit canvas while maintaining aspect ratio
+            const scale = Math.min(width / img.width, height / img.height);
+            const scaledW = img.width * scale;
+            const scaledH = img.height * scale;
+            const offsetX = (width - scaledW) / 2;
+            const offsetY = (height - scaledH) / 2;
+
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(img, offsetX, offsetY, scaledW, scaledH);
+
+            // Hide placeholder since we have an image
+            placeholder.classList.add('hidden');
+        }
+
+        function updateBufferDisplay() {
+            updateTimeDisplay();
+        }
+
+        // Playback controls - FPS-controlled frame consumption
+        function startPlayback() {
+            if (playbackInterval) clearInterval(playbackInterval);
+
+            const frameInterval = 1000 / playbackFps;
+
+            playbackInterval = setInterval(() => {
+                if (isPaused) return;
+
+                if (isLive) {
+                    // Live mode: consume from buffer at FPS rate
+                    if (frameBuffer.length > 0) {
+                        const img = frameBuffer.shift();
+                        currentFrameIndex = frameHistory.indexOf(img);
+                        if (currentFrameIndex === -1) currentFrameIndex = frameHistory.length - 1;
+
+                        // Resize canvas if needed
+                        if (canvas.width !== img.width || canvas.height !== img.height) {
+                            canvas.width = img.width;
+                            canvas.height = img.height;
+                        }
+                        ctx.drawImage(img, 0, 0);
+                        seekBar.value = currentFrameIndex;
+                        updateBufferDisplay();
+                    }
+                } else {
+                    // Seeking mode: play through history at FPS rate
+                    if (currentFrameIndex < frameHistory.length - 1) {
+                        currentFrameIndex++;
+                        displayFrame(currentFrameIndex);
+                        seekBar.value = currentFrameIndex;
+                        updateTimeDisplay();
+
+                        // Auto-switch to live when caught up
+                        if (currentFrameIndex >= frameHistory.length - 1) {
+                            isLive = true;
+                            // Refill buffer with any frames we missed
+                            frameBuffer = [];
+                            updateLiveIndicator();
+                        }
+                    }
+                }
+            }, frameInterval);
+        }
+
+        function togglePlayPause() {
+            isPaused = !isPaused;
+            playPauseBtn.textContent = isPaused ? '▶' : '⏸';
+            liveIndicator.classList.toggle('paused', isPaused);
+        }
+
+        function handleSeek() {
+            isLive = false;
+            frameBuffer = []; // Clear buffer when seeking
+            currentFrameIndex = parseInt(seekBar.value);
+            displayFrame(currentFrameIndex);
+            updateTimeDisplay();
+            updateLiveIndicator();
+        }
+
+        function jumpToLive() {
+            isLive = true;
+            frameBuffer = []; // Clear old buffer, will refill with new frames
+            currentFrameIndex = frameHistory.length - 1;
+            seekBar.value = currentFrameIndex;
+            displayFrame(currentFrameIndex);
+            updateBufferDisplay();
+            updateLiveIndicator();
+        }
+
+        function updateTimeDisplay() {
+            const pct = frameHistory.length > 0 ? Math.round((currentFrameIndex + 1) / frameHistory.length * 100) : 0;
+            timeDisplay.textContent = `${pct}%`;
+        }
+
+        function updateLiveIndicator() {
+            liveIndicator.style.opacity = isLive ? '1' : '0.5';
+            liveBtn.classList.toggle('active', !isLive);
+        }
+
+        function updateControlsState() {
+            const hasFrames = frameHistory.length > 0;
+            playPauseBtn.disabled = !hasFrames;
+            stopBtn.disabled = !isStreaming;
+            seekBar.disabled = !hasFrames;
+            liveBtn.disabled = !hasFrames;
+        }
+
+        // Stream control
+        async function startStream(prompt, imageData) {
+            try {
+                await connect();
+
+                const height = parseInt(document.getElementById('heightInput').value);
+                const width = parseInt(document.getElementById('widthInput').value);
+                const seed = parseInt(document.getElementById('seedInput').value);
+                const numFrames = parseInt(document.getElementById('numFramesInput').value);
+
+                const message = {
+                    action: 'start',
+                    prompt: prompt || 'A beautiful cinematic scene',
+                    height: height,
+                    width: width,
+                    seed: seed,
+                    num_frames: numFrames,
+                    frame_rate: 24,
+                    max_segments: 100,
+                    use_second_stage: false
+                };
+
+                // Add start image if provided (first frame conditioning)
+                if (imageData) {
+                    message.start_image = imageData;
+                }
+
+                ws.send(JSON.stringify(message));
+
+                // Clear old frames and buffers
+                frameHistory = [];
+                frameBuffer = [];
+                currentFrameIndex = 0;
+                seekBar.value = 0;
+                seekBar.max = 0;
+                isLive = true;
+                isPaused = false;
+                playPauseBtn.textContent = '⏸';
+
+                startPlayback();
+
+            } catch (err) {
+                showToast('Failed to connect');
+                console.error(err);
+            }
+        }
+
+        function stopStream() {
+            // Send stop command
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'stop' }));
+            }
+
+            // Disconnect WebSocket
+            disconnect();
+
+            // Reset state for fresh start
+            isStreaming = false;
+            currentPrompt = "";
+
+            updateControlsState();
+            showToast('Stream stopped - enter a new prompt to restart');
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.onclose = null; // Prevent onclose handler
+                ws.close();
+                ws = null;
+            }
+            setStatus('disconnected', 'Ready');
+        }
+
+        function updatePrompt(prompt) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    action: 'update_prompt',
+                    prompt: prompt
+                }));
+            }
+        }
+
+        function sendTargetImage(imageData) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const height = parseInt(document.getElementById('heightInput').value);
+                const width = parseInt(document.getElementById('widthInput').value);
+                const position = parseFloat(targetPosSlider.value);
+
+                ws.send(JSON.stringify({
+                    action: 'set_target_image',
+                    image: imageData,
+                    height: height,
+                    width: width,
+                    position: position
+                }));
+            }
+        }
+
+        // UI helpers
+        function setStatus(state, text) {
+            statusDot.className = 'status-dot ' + state;
+            statusText.textContent = text;
+        }
+
+        function toggleSettings() {
+            settingsPanel.classList.toggle('open');
+            settingsBtn.classList.toggle('hidden', settingsPanel.classList.contains('open'));
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.add('visible');
+            setTimeout(() => toast.classList.remove('visible'), 2000);
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.function(timeout=60)
+@modal.asgi_app()
+def minimal_ui():
+    """
+    Minimalistic video-focused streaming UI.
+
+    Features:
+    - Full-screen video canvas with frame history
+    - Chat-style prompt input with image attachment
+    - Video controls: play/pause, seek, jump to live
+    - Settings panel for resolution, seed, FPS, target position
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse
+    from fastapi.middleware.cors import CORSMiddleware
+
+    ui_app = FastAPI(title="LTX-2 Minimal UI")
+    ui_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    def inject_endpoint(html):
+        """Inject WebSocket endpoint URL into the HTML."""
+        return html.replace("__WS_ENDPOINT_TURBO__", WEBSOCKET_ENDPOINT_TURBO)
+
+    @ui_app.get("/", response_class=HTMLResponse)
+    async def index():
+        return HTMLResponse(inject_endpoint(MINIMAL_HTML))
+
+    @ui_app.get("/health")
+    async def health():
+        return {"status": "healthy", "service": "minimal-ui"}
+
+    return ui_app
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 

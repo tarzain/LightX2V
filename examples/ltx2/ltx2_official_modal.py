@@ -5269,14 +5269,23 @@ MINIMAL_HTML = """
             display: none;
         }
 
-        .placeholder-icon {
-            font-size: 64px;
-            margin-bottom: 16px;
-            opacity: 0.5;
+        .placeholder-title {
+            font-size: 72px;
+            font-weight: 300;
+            letter-spacing: -2px;
+            margin-bottom: 8px;
+            color: var(--text-primary);
+            opacity: 0.9;
+        }
+
+        .placeholder-subtitle {
+            font-size: 16px;
+            margin-bottom: 32px;
+            opacity: 0.6;
         }
 
         .placeholder-text {
-            font-size: 18px;
+            font-size: 16px;
             margin-bottom: 8px;
         }
 
@@ -5297,7 +5306,8 @@ MINIMAL_HTML = """
 
     <!-- Placeholder -->
     <div class="placeholder" id="placeholder">
-        <div class="placeholder-icon">🎬</div>
+        <div class="placeholder-title">vidi</div>
+        <div class="placeholder-subtitle">a realtime interactive video stream</div>
         <div class="placeholder-text">Enter a prompt to start generating</div>
         <div class="placeholder-hint">Or drop an image to begin with image-to-video</div>
     </div>

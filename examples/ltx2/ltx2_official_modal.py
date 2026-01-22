@@ -3992,7 +3992,7 @@ STREAMING_HTML = """
                         <span>Playback FPS</span>
                         <span class="slider-value" id="fpsValue">18</span>
                     </div>
-                    <input type="range" id="playbackFps" min="6" max="30" value="18" oninput="updateFps(this.value)">
+                    <input type="range" id="playbackFps" min="6" max="30" value="12" oninput="updateFps(this.value)">
                 </div>
 
                 <div class="checkbox-row">
@@ -4091,7 +4091,7 @@ STREAMING_HTML = """
         let segmentCount = 0;
 
         // Playback control
-        let playbackFps = 18;
+        let playbackFps = 12;
         let generationFps = 24;  // Server-side generation rate
         let playbackInterval = null;
         let isPlaying = false;
@@ -5173,20 +5173,26 @@ MINIMAL_HTML = """
         }
 
         /* Settings gear button */
-        .settings-btn {
+        /* Top right controls container */
+        .top-right-controls {
             position: fixed;
-            bottom: 80px;
+            top: 20px;
             right: 20px;
-            width: 44px;
-            height: 44px;
+            display: flex;
+            gap: 10px;
+            z-index: 65;
+        }
+
+        .settings-btn {
+            width: 40px;
+            height: 40px;
             border: none;
             border-radius: 50%;
             background: var(--bg-secondary);
             backdrop-filter: blur(10px);
             color: var(--text-primary);
-            font-size: 20px;
+            font-size: 18px;
             cursor: pointer;
-            z-index: 65;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -5204,9 +5210,6 @@ MINIMAL_HTML = """
 
         /* Theme toggle */
         .theme-toggle {
-            position: fixed;
-            top: 20px;
-            right: 20px;
             width: 40px;
             height: 40px;
             border: none;
@@ -5216,7 +5219,6 @@ MINIMAL_HTML = """
             color: var(--text-primary);
             font-size: 18px;
             cursor: pointer;
-            z-index: 65;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -5356,8 +5358,11 @@ MINIMAL_HTML = """
         <span id="statusText">Ready</span>
     </div>
 
-    <!-- Theme toggle -->
-    <button class="theme-toggle" id="themeToggle" title="Toggle light/dark mode">🌙</button>
+    <!-- Top right controls -->
+    <div class="top-right-controls">
+        <button class="settings-btn" id="settingsBtn" title="Settings">⚙</button>
+        <button class="theme-toggle" id="themeToggle" title="Toggle light/dark mode">🌙</button>
+    </div>
 
     <!-- Video controls -->
     <div class="video-controls" id="videoControls">
@@ -5386,9 +5391,6 @@ MINIMAL_HTML = """
         <input type="text" class="prompt-input" id="promptInput" placeholder="Describe what you want to see...">
         <button class="prompt-btn primary" id="sendBtn" title="Send">➤</button>
     </div>
-
-    <!-- Settings button -->
-    <button class="settings-btn" id="settingsBtn" title="Settings">⚙</button>
 
     <!-- Settings panel -->
     <div class="settings-panel" id="settingsPanel">
@@ -5422,9 +5424,9 @@ MINIMAL_HTML = """
         <div class="setting-group">
             <label class="setting-label">
                 <span>Playback FPS</span>
-                <span class="setting-value" id="fpsValue">18</span>
+                <span class="setting-value" id="fpsValue">12</span>
             </label>
-            <input type="range" class="setting-slider" id="fpsSlider" min="1" max="30" value="18">
+            <input type="range" class="setting-slider" id="fpsSlider" min="1" max="30" value="12">
         </div>
 
         <div class="setting-group">
@@ -5455,7 +5457,7 @@ MINIMAL_HTML = """
         let frameBuffer = [];       // Queue of frames waiting to be played
         let currentFrameIndex = 0;  // Current position in history
         let playbackInterval = null;
-        let playbackFps = 18;
+        let playbackFps = 12;
         let lastFrameTime = 0;
 
         // Pending data

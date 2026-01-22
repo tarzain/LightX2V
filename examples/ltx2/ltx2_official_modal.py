@@ -2569,6 +2569,7 @@ class OfficialLTX2Engine:
             segment_count = 0
             target_image_latent = None  # For target-frame conditioning
             target_frame_position = 1.0  # Default: end of segment (0.0=start, 0.5=middle, 1.0=end)
+            reset_next_segment = False  # Flag to treat next segment as first (history reset)
 
             try:
                 while True:
@@ -2610,6 +2611,13 @@ class OfficialLTX2Engine:
                             target_image_latent = None
                             await websocket.send_json({"type": "target_image_cleared"})
                             print(f"   WebSocket: Target image cleared", flush=True)
+
+                        elif msg.get("action") == "reset_history":
+                            # Clear the model's conditioning state - next segment will be generated fresh
+                            engine._streaming_last_latent = None
+                            reset_next_segment = True
+                            await websocket.send_json({"type": "history_reset"})
+                            print(f"   WebSocket: History reset - next segment will start fresh", flush=True)
 
                         elif msg.get("action") == "set_next_segment":
                             # Combined action to set prompt and/or target image for next segment
@@ -2708,6 +2716,12 @@ class OfficialLTX2Engine:
                                     elif check_msg.get("action") == "clear_target_image":
                                         target_image_latent = None
                                         await websocket.send_json({"type": "target_image_cleared"})
+                                    elif check_msg.get("action") == "reset_history":
+                                        # Clear the model's conditioning state - next segment will be generated fresh
+                                        engine._streaming_last_latent = None
+                                        reset_next_segment = True
+                                        await websocket.send_json({"type": "history_reset"})
+                                        print(f"   WebSocket: History reset (pre-segment) - next segment will start fresh", flush=True)
                                     elif check_msg.get("action") == "set_next_segment":
                                         # Combined action to set prompt and/or target image
                                         response = {"type": "next_segment_set"}
@@ -2759,7 +2773,10 @@ class OfficialLTX2Engine:
                                 _frames = num_frames
                                 _fps = frame_rate
                                 _stage2 = use_second_stage
-                                _is_first = (segment_count == 1)
+                                _is_first = (segment_count == 1) or reset_next_segment
+                                if reset_next_segment:
+                                    reset_next_segment = False  # Clear the flag after using it
+                                    print(f"   WebSocket: History reset applied - treating as first segment", flush=True)
                                 _target_latent = target_image_latent  # Capture for this segment
                                 _target_position = target_frame_position  # Capture position for this segment
                                 # Start image only applies to first segment
@@ -2828,6 +2845,12 @@ class OfficialLTX2Engine:
                                         elif check_msg.get("action") == "clear_target_image":
                                             target_image_latent = None
                                             await websocket.send_json({"type": "target_image_cleared"})
+                                        elif check_msg.get("action") == "reset_history":
+                                            # Clear the model's conditioning state - next segment will be generated fresh
+                                            engine._streaming_last_latent = None
+                                            reset_next_segment = True
+                                            await websocket.send_json({"type": "history_reset"})
+                                            print(f"   WebSocket: History reset (mid-segment) - next segment will start fresh", flush=True)
                                         elif check_msg.get("action") == "set_next_segment":
                                             # Combined action to set prompt and/or target image
                                             response = {"type": "next_segment_set"}
@@ -5345,6 +5368,7 @@ MINIMAL_HTML = """
             <div class="time-display" id="timeDisplay">0 / 0</div>
         </div>
         <button class="ctrl-btn" id="liveBtn" title="Jump to Live" disabled>⏭</button>
+        <button class="ctrl-btn" id="resetBtn" title="Reset History" disabled>🔄</button>
         <div class="live-indicator" id="liveIndicator">
             <div class="live-dot"></div>
             <span>LIVE</span>
@@ -5452,6 +5476,7 @@ MINIMAL_HTML = """
         const seekBar = document.getElementById('seekBar');
         const timeDisplay = document.getElementById('timeDisplay');
         const liveBtn = document.getElementById('liveBtn');
+        const resetBtn = document.getElementById('resetBtn');
         const liveIndicator = document.getElementById('liveIndicator');
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
@@ -5498,6 +5523,7 @@ MINIMAL_HTML = """
             playPauseBtn.addEventListener('click', togglePlayPause);
             stopBtn.addEventListener('click', stopStream);
             liveBtn.addEventListener('click', jumpToLive);
+            resetBtn.addEventListener('click', resetHistory);
             seekBar.addEventListener('input', handleSeek);
 
             settingsBtn.addEventListener('click', toggleSettings);
@@ -5692,6 +5718,10 @@ MINIMAL_HTML = """
                         showToast('Target image ready');
                     }
                     break;
+                case 'history_reset':
+                    showToast('History reset - next segment starts fresh');
+                    setStatus('success', 'History reset');
+                    break;
             }
         }
 
@@ -5832,6 +5862,12 @@ MINIMAL_HTML = """
             updateLiveIndicator();
         }
 
+        function resetHistory() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ action: 'reset_history' }));
+            setStatus('Resetting history...', 'warning');
+        }
+
         function updateTimeDisplay() {
             const pct = frameHistory.length > 0 ? Math.round((currentFrameIndex + 1) / frameHistory.length * 100) : 0;
             timeDisplay.textContent = `${pct}%`;
@@ -5848,6 +5884,7 @@ MINIMAL_HTML = """
             stopBtn.disabled = !isStreaming;
             seekBar.disabled = !hasFrames;
             liveBtn.disabled = !hasFrames;
+            resetBtn.disabled = !isStreaming;
         }
 
         // Stream control

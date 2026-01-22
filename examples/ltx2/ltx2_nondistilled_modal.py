@@ -42,9 +42,10 @@ DEFAULT_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 
 # Pipeline configuration
 USE_FP8 = False  # False = BF16 checkpoint (~43GB), True = FP8 checkpoint (~27GB)
-NUM_INFERENCE_STEPS = 10  # Number of denoising steps (with high gamma, can go as low as 10)
+NUM_INFERENCE_STEPS = 30  # Number of denoising steps for best quality
 CFG_GUIDANCE_SCALE = 3.0  # Classifier-free guidance scale (higher = more prompt adherence)
-GE_GAMMA = 4.0  # Gradient estimation coefficient (higher = faster but may reduce quality)
+GE_GAMMA = 2.0  # Gradient estimation coefficient (conservative for quality)
+USE_TWO_STAGE = True  # Enable 2-stage generation with spatial upscaling for max quality
 NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
 # WebSocket endpoint URL (GPU container) - UI served separately from lightweight CPU container
@@ -225,20 +226,32 @@ class NondistilledLTX2Engine:
         self.num_inference_steps = NUM_INFERENCE_STEPS
         self.cfg_guidance_scale = CFG_GUIDANCE_SCALE
         self.ge_gamma = GE_GAMMA
+        self.use_two_stage = USE_TWO_STAGE
         self.negative_prompt = NEGATIVE_PROMPT
 
         # Select checkpoint based on configuration (dev = non-distilled)
         if USE_FP8:
             ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-dev-fp8.safetensors"
-            print(f"🔧 Loading LTX-2 TI2VidOneStagePipeline with FP8 (~27GB)...")
+            distilled_ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-distilled-fp8.safetensors"
+            print(f"🔧 Loading LTX-2 HQ Pipeline (dev FP8 + distilled FP8 for stage 2)...")
         else:
             ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-dev.safetensors"
-            print(f"🔧 Loading LTX-2 TI2VidOneStagePipeline with BF16 (~43GB)...")
+            distilled_ckpt = f"{LTX2_MODELS_DIR}/ltx-2-19b-distilled.safetensors"
+            print(f"🔧 Loading LTX-2 HQ Pipeline (dev BF16 + distilled BF16 for stage 2)...")
 
-        print(f"   Inference steps: {NUM_INFERENCE_STEPS}, CFG scale: {CFG_GUIDANCE_SCALE}, GE gamma: {GE_GAMMA}")
+        spatial_upsampler_path = f"{LTX2_MODELS_DIR}/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        self.spatial_upsampler_path = spatial_upsampler_path
+        self.distilled_checkpoint_path = distilled_ckpt
+
+        print(f"   Stage 1: {NUM_INFERENCE_STEPS} steps, CFG scale: {CFG_GUIDANCE_SCALE}, GE gamma: {GE_GAMMA}")
+        print(f"   Stage 2: Distilled model with 4-step refinement")
+        print(f"   Two-stage upscaling: {USE_TWO_STAGE}")
 
         # Check for required files
         required_files = [ckpt]
+        if USE_TWO_STAGE:
+            required_files.append(spatial_upsampler_path)
+            required_files.append(distilled_ckpt)  # Need distilled model for stage 2
 
         missing = [p for p in required_files if not os.path.exists(p)]
         if missing:
@@ -294,10 +307,17 @@ class NondistilledLTX2Engine:
         
         print("   Loading VAE decoder...")
         self._video_decoder = ledger.video_decoder()
-        
-        # Note: No spatial upsampler for single-stage pipeline
-        self._spatial_upsampler = None
-        
+
+        # Load spatial upsampler and distilled transformer for two-stage generation (HQ mode)
+        if self.use_two_stage:
+            print("   Loading spatial upsampler...")
+            self._spatial_upsampler = self._build_spatial_upsampler(ledger)
+            print("   Loading distilled transformer for stage 2...")
+            self._distilled_transformer = self._build_distilled_transformer()
+        else:
+            self._spatial_upsampler = None
+            self._distilled_transformer = None
+
         # Load audio components for A2V
         print("   Loading audio encoder...")
         self._audio_encoder = self._build_audio_encoder(ledger)
@@ -334,7 +354,58 @@ class NondistilledLTX2Engine:
             device=ledger.device,
             dtype=ledger.dtype
         ).to(ledger.device).eval()
-    
+
+    def _build_spatial_upsampler(self, ledger):
+        """Build the spatial upsampler for two-stage generation."""
+        from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+        from ltx_core.model.upsampler import LatentUpsamplerConfigurator
+
+        upsampler_builder = Builder(
+            model_path=self.spatial_upsampler_path,
+            model_class_configurator=LatentUpsamplerConfigurator,
+            registry=ledger.registry,
+        )
+
+        return upsampler_builder.build(
+            device=ledger.device,
+            dtype=ledger.dtype
+        ).to(ledger.device).eval()
+
+    def _build_distilled_transformer(self):
+        """Build the distilled transformer for stage 2 refinement."""
+        import torch
+        from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+        from ltx_core.model.transformer import (
+            LTXV_MODEL_COMFY_RENAMING_MAP,
+            LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
+            UPCAST_DURING_INFERENCE,
+            LTXModelConfigurator,
+            X0Model,
+        )
+
+        device = self.pipeline.device
+        dtype = torch.bfloat16
+
+        if self.use_fp8:
+            # FP8 distilled transformer
+            transformer_builder = Builder(
+                model_path=self.distilled_checkpoint_path,
+                model_class_configurator=LTXModelConfigurator,
+                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
+                module_ops=(UPCAST_DURING_INFERENCE,),
+            )
+            transformer = X0Model(transformer_builder.build(device=device)).to(device).eval()
+        else:
+            # BF16 distilled transformer
+            transformer_builder = Builder(
+                model_path=self.distilled_checkpoint_path,
+                model_class_configurator=LTXModelConfigurator,
+                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+            )
+            transformer = X0Model(transformer_builder.build(device=device, dtype=dtype)).to(device).eval()
+
+        return transformer
+
     def _patch_model_ledger(self, ledger):
         """Patch ModelLedger methods to return cached models instead of reloading."""
         # Create patched methods that return cached models
@@ -342,6 +413,7 @@ class NondistilledLTX2Engine:
         cached_transformer = self._transformer
         cached_video_encoder = self._video_encoder
         cached_video_decoder = self._video_decoder
+        cached_spatial_upsampler = self._spatial_upsampler
         cached_audio_encoder = self._audio_encoder
         cached_audio_decoder = self._audio_decoder
         cached_vocoder = self._vocoder
@@ -358,6 +430,9 @@ class NondistilledLTX2Engine:
         def patched_video_decoder():
             return cached_video_decoder
 
+        def patched_spatial_upsampler():
+            return cached_spatial_upsampler
+
         def patched_audio_encoder():
             return cached_audio_encoder
 
@@ -372,16 +447,18 @@ class NondistilledLTX2Engine:
         ledger.transformer = patched_transformer
         ledger.video_encoder = patched_video_encoder
         ledger.video_decoder = patched_video_decoder
+        if cached_spatial_upsampler is not None:
+            ledger.spatial_upsampler = patched_spatial_upsampler
         ledger.audio_encoder = patched_audio_encoder
         ledger.audio_decoder = patched_audio_decoder
         ledger.vocoder = patched_vocoder
-        
+
         # Also disable cleanup_memory to prevent model unloading
         def noop_cleanup(*args, **kwargs):
             pass
-        
+
         ledger.cleanup_memory = noop_cleanup
-        
+
         print("   ModelLedger patched - models will stay in VRAM!")
         
         # Patch the pipeline to support FL2V (first+last frame conditioning)
@@ -1918,16 +1995,23 @@ class NondistilledLTX2Engine:
         width: int,
         num_frames: int,
         frame_rate: float,
-        use_second_stage: bool = False,  # Ignored for non-distilled (single stage only)
+        use_second_stage: bool = True,  # Use two-stage for HQ mode by default
         is_first_segment: bool = True,
+        start_frame_latent: "torch.Tensor | None" = None,
         end_frame_latent: "torch.Tensor | None" = None,
     ):
         """
         Generator that yields frames for real-time streaming (non-distilled with CFG).
 
+        HQ mode uses two-stage generation:
+        - Stage 1: Generate at half resolution with CFG guidance (30 steps)
+        - Stage 2: Upsample and refine with distilled sigmas (4 steps)
+
         Args:
             is_first_segment: If True, starts fresh. If False, conditions on previous segment.
+            start_frame_latent: Optional latent for start-frame conditioning (first frame image).
             end_frame_latent: Optional latent for end-frame conditioning (target image).
+            use_second_stage: If True, use two-stage with upscaling for HQ output.
 
         Yields:
             dict with either:
@@ -1948,13 +2032,17 @@ class NondistilledLTX2Engine:
         from ltx_core.conditioning import VideoConditionByKeyframeIndex
         from ltx_core.model.video_vae import decode_video as vae_decode_video
         from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+        from ltx_core.model.upsampler import upsample_video
         from ltx_core.text_encoders.gemma import encode_text
         from ltx_core.types import VideoPixelShape
+        from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES
         from ltx_pipelines.utils.helpers import (
+            euler_denoising_loop,
             gradient_estimating_euler_denoising_loop,
             noise_video_state,
             noise_audio_state,
             guider_denoising_func,
+            simple_denoising_func,
         )
 
         device = self.pipeline.device
@@ -1962,6 +2050,9 @@ class NondistilledLTX2Engine:
 
         # Use 49 frames per segment (like the streaming app)
         segment_frames = num_frames
+
+        # Determine if we're using two-stage (respects both parameter and config)
+        use_two_stage = use_second_stage and self.use_two_stage and self._spatial_upsampler is not None
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1980,16 +2071,20 @@ class NondistilledLTX2Engine:
             v_context_n, a_context_n = context_n
 
             # Sigmas from scheduler (non-distilled uses more steps)
-            sigmas = LTX2Scheduler().execute(steps=self.num_inference_steps).to(dtype=torch.float32, device=device)
+            stage_1_sigmas = LTX2Scheduler().execute(steps=self.num_inference_steps).to(dtype=torch.float32, device=device)
+            stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device) if use_two_stage else None
             print(f"   Streaming: Using {self.num_inference_steps} inference steps, CFG scale {self.cfg_guidance_scale}", flush=True)
+            if use_two_stage:
+                print(f"   Streaming: Two-stage enabled - Stage 1 at half res, Stage 2 refinement ({len(STAGE_2_DISTILLED_SIGMA_VALUES)} steps)", flush=True)
 
-            # CFG guider for classifier-free guidance
+            # CFG guider for classifier-free guidance (stage 1 only)
             cfg_guider = CFGGuider(self.cfg_guidance_scale)
 
             # Capture ge_gamma for the closure
             _ge_gamma = self.ge_gamma
 
-            def denoising_loop(sigmas, video_state, audio_state, stepper):
+            def stage_1_denoising_loop(sigmas, video_state, audio_state, stepper):
+                """Stage 1: CFG guidance with gradient estimation (high quality)"""
                 return gradient_estimating_euler_denoising_loop(
                     sigmas=sigmas,
                     video_state=video_state,
@@ -2006,15 +2101,35 @@ class NondistilledLTX2Engine:
                     ge_gamma=_ge_gamma,
                 )
 
+            # Stage 2 uses the DISTILLED transformer for proper refinement
+            distilled_transformer = self._distilled_transformer if use_two_stage else None
+
+            def stage_2_denoising_loop(sigmas, video_state, audio_state, stepper):
+                """Stage 2: Simple denoising without CFG (distilled refinement)"""
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=v_context_p,
+                        audio_context=a_context_p,
+                        transformer=distilled_transformer,  # Use distilled model!
+                    ),
+                )
+
             generator = torch.Generator(device=device).manual_seed(seed)
             noiser = GaussianNoiser(generator=generator)
             stepper = EulerDiffusionStep()
 
-            output_shape = VideoPixelShape(
+            # Stage 1 output shape (half resolution if two-stage)
+            stage_1_width = width // 2 if use_two_stage else width
+            stage_1_height = height // 2 if use_two_stage else height
+            stage_1_shape = VideoPixelShape(
                 batch=1,
                 frames=segment_frames,
-                width=width,
-                height=height,
+                width=stage_1_width,
+                height=stage_1_height,
                 fps=frame_rate,
             )
 
@@ -2037,20 +2152,55 @@ class NondistilledLTX2Engine:
                 # Clear any previous latent when starting fresh
                 print(f"   Streaming: First segment - clearing previous latent", flush=True)
                 self._streaming_last_latent = None
+                # Use provided start image for first frame conditioning if available
+                if start_frame_latent is not None:
+                    # Resize start latent to stage 1 resolution if needed
+                    if use_two_stage:
+                        start_latent = torch.nn.functional.interpolate(
+                            start_frame_latent.squeeze(2),
+                            scale_factor=0.5,
+                            mode='bilinear',
+                            align_corners=False,
+                        ).unsqueeze(2)
+                        print(f"   Streaming: Downsampled start latent from {start_frame_latent.shape} to {start_latent.shape} for stage 1", flush=True)
+                    else:
+                        start_latent = start_frame_latent
+                    print(f"   Streaming: Adding start-frame conditioning (start image), shape: {start_latent.shape}", flush=True)
+                    start_conditioning = VideoConditionByKeyframeIndex(
+                        keyframes=start_latent,
+                        frame_idx=0,
+                        strength=1.0,
+                    )
+                    conditionings.append(start_conditioning)
 
             # Add end-frame conditioning (target image) if provided
+            # Note: target image latent should be at stage 1 resolution for two-stage
             if end_frame_latent is not None:
-                print(f"   Streaming: Adding end-frame conditioning (target image), shape: {end_frame_latent.shape}", flush=True)
+                # Resize target latent to stage 1 resolution if needed
+                if use_two_stage:
+                    # Target latent was encoded at full res, need to downsample for stage 1
+                    # Latent spatial compression is ~8x, so half-res output means half-res latent
+                    target_latent = torch.nn.functional.interpolate(
+                        end_frame_latent.squeeze(2),  # Remove temporal dim for spatial interpolation
+                        scale_factor=0.5,
+                        mode='bilinear',
+                        align_corners=False,
+                    ).unsqueeze(2)  # Add temporal dim back
+                    print(f"   Streaming: Downsampled target latent from {end_frame_latent.shape} to {target_latent.shape} for stage 1", flush=True)
+                else:
+                    target_latent = end_frame_latent
+
+                print(f"   Streaming: Adding end-frame conditioning (target image), shape: {target_latent.shape}", flush=True)
                 end_conditioning = VideoConditionByKeyframeIndex(
-                    keyframes=end_frame_latent,
+                    keyframes=target_latent,
                     frame_idx=segment_frames - 1,  # Last frame
                     strength=1.0,
                 )
                 conditionings.append(end_conditioning)
 
-            # Initialize video state
+            # Initialize video state for stage 1
             video_state, video_tools = noise_video_state(
-                output_shape=output_shape,
+                output_shape=stage_1_shape,
                 noiser=noiser,
                 conditionings=conditionings,
                 components=self.pipeline.pipeline_components,
@@ -2073,7 +2223,7 @@ class NondistilledLTX2Engine:
 
                 # Get expected audio latent shape for this segment
                 from ltx_core.types import AudioLatentShape
-                expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+                expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_1_shape)
                 expected_frames = expected_audio_shape.frames
 
                 # Resize previous audio latent to match expected frames if needed
@@ -2095,7 +2245,7 @@ class NondistilledLTX2Engine:
                 self._streaming_last_audio_latent = None
 
             audio_state, audio_tools = noise_audio_state(
-                output_shape=output_shape,
+                output_shape=stage_1_shape,
                 noiser=noiser,
                 conditionings=[],
                 components=self.pipeline.pipeline_components,
@@ -2105,32 +2255,90 @@ class NondistilledLTX2Engine:
                 initial_latent=audio_initial_latent,
             )
 
-            # Run denoising (non-distilled uses more steps with CFG)
-            print(f"   Streaming: Denoising ({len(sigmas)} steps with CFG)...", flush=True)
-            video_state, audio_state = denoising_loop(sigmas, video_state, audio_state, stepper)
+            # Run Stage 1 denoising (CFG guidance with gradient estimation)
+            print(f"   Streaming: Stage 1 denoising ({len(stage_1_sigmas)} steps with CFG at {stage_1_width}x{stage_1_height})...", flush=True)
+            video_state, audio_state = stage_1_denoising_loop(stage_1_sigmas, video_state, audio_state, stepper)
 
-            # Clear conditioning and unpatchify
+            # Clear conditioning and unpatchify for stage 1
             video_state = video_tools.clear_conditioning(video_state)
             video_state = video_tools.unpatchify(video_state)
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
 
-            # Store LAST latent frames for next segment conditioning
+            # Store LAST latent frames for next segment conditioning (at stage 1 resolution)
             # Temporal compression is ~8x, so overlap_frames=16 -> 2 latent frames
-            # More overlap frames = better continuity but more redundant frames to skip
             overlap_frames = 16  # ~0.5s at 30fps
             latent_overlap = max(1, overlap_frames // 8)  # 2 latent frames
             self._streaming_last_latent = video_state.latent[:, :, -latent_overlap:, :, :].clone()
             self._streaming_overlap_frames = overlap_frames  # Store for frame skipping
             print(f"   Streaming: Stored last {latent_overlap} latent frame(s) ({overlap_frames} video frames) for conditioning, shape: {self._streaming_last_latent.shape}", flush=True)
 
-            # Store audio latent for next segment conditioning (audio continuity)
-            self._streaming_last_audio_latent = audio_state.latent.clone()
-            print(f"   Streaming: Stored audio latent for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
+            # Stage 2: Upsample and refine (if two-stage enabled)
+            if use_two_stage:
+                print(f"   Streaming: Stage 2 upsampling to {width}x{height}...", flush=True)
 
-            # Single stage only for non-distilled - use latent directly
-            video_latent_for_decode = video_state.latent
-            final_audio_state = audio_state
+                # Upsample video latent
+                upsampled_latent = upsample_video(
+                    latent=video_state.latent[:1],
+                    video_encoder=video_encoder,
+                    upsampler=self._spatial_upsampler,
+                )
+                print(f"   Streaming: Upsampled latent shape: {upsampled_latent.shape}", flush=True)
+
+                # Stage 2 output shape at full resolution
+                stage_2_shape = VideoPixelShape(
+                    batch=1,
+                    frames=segment_frames,
+                    width=width,
+                    height=height,
+                    fps=frame_rate,
+                )
+
+                # Re-initialize for stage 2 with upsampled latent
+                video_state_2, video_tools_2 = noise_video_state(
+                    output_shape=stage_2_shape,
+                    noiser=noiser,
+                    conditionings=[],
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=stage_2_sigmas[0].item(),
+                    initial_latent=upsampled_latent,
+                )
+
+                audio_state_2, audio_tools_2 = noise_audio_state(
+                    output_shape=stage_2_shape,
+                    noiser=noiser,
+                    conditionings=[],
+                    components=self.pipeline.pipeline_components,
+                    dtype=dtype,
+                    device=device,
+                    noise_scale=stage_2_sigmas[0].item(),
+                    initial_latent=audio_state.latent,
+                )
+
+                # Run stage 2 denoising (distilled refinement, no CFG)
+                print(f"   Streaming: Stage 2 denoising ({len(stage_2_sigmas)} steps)...", flush=True)
+                video_state_2, audio_state_2 = stage_2_denoising_loop(stage_2_sigmas, video_state_2, audio_state_2, stepper)
+
+                # Clear and unpatchify
+                video_state_2 = video_tools_2.clear_conditioning(video_state_2)
+                video_state_2 = video_tools_2.unpatchify(video_state_2)
+                audio_state_2 = audio_tools_2.clear_conditioning(audio_state_2)
+                audio_state_2 = audio_tools_2.unpatchify(audio_state_2)
+
+                video_latent_for_decode = video_state_2.latent
+                final_audio_state = audio_state_2
+                # Update stored audio latent with refined stage 2 audio
+                self._streaming_last_audio_latent = audio_state_2.latent.clone()
+            else:
+                # Single stage - use latent directly
+                video_latent_for_decode = video_state.latent
+                final_audio_state = audio_state
+                # Store audio latent for next segment conditioning
+                self._streaming_last_audio_latent = audio_state.latent.clone()
+
+            print(f"   Streaming: Stored audio latent for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
 
             # Decode audio
             print(f"   Streaming: Decoding audio...", flush=True)
@@ -2555,7 +2763,31 @@ class NondistilledLTX2Engine:
                             use_second_stage = msg.get("use_second_stage", False)
                             max_segments = msg.get("max_segments", 10)
 
-                            await websocket.send_json({"type": "started", "prompt": current_prompt})
+                            # Encode optional start/end images for the first segment
+                            start_image_latent = None
+                            end_image_latent = None
+                            started_response = {"type": "started", "prompt": current_prompt}
+
+                            if msg.get("start_image"):
+                                try:
+                                    start_image_latent = engine.encode_target_image(msg["start_image"], height, width)
+                                    started_response["start_image_set"] = True
+                                    print(f"   WebSocket: Start image encoded for first segment", flush=True)
+                                except Exception as e:
+                                    started_response["start_image_error"] = str(e)
+                                    print(f"   WebSocket: Failed to encode start image: {e}", flush=True)
+
+                            if msg.get("end_image"):
+                                try:
+                                    end_image_latent = engine.encode_target_image(msg["end_image"], height, width)
+                                    target_image_latent = end_image_latent  # Use as target for first segment
+                                    started_response["end_image_set"] = True
+                                    print(f"   WebSocket: End image encoded for first segment", flush=True)
+                                except Exception as e:
+                                    started_response["end_image_error"] = str(e)
+                                    print(f"   WebSocket: Failed to encode end image: {e}", flush=True)
+
+                            await websocket.send_json(started_response)
 
                             segment_count = 0
                             should_stop = False
@@ -2636,12 +2868,19 @@ class NondistilledLTX2Engine:
                                 _stage2 = use_second_stage
                                 _is_first = (segment_count == 1)
                                 _target_latent = target_image_latent  # Capture for this segment
-                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}", flush=True)
+                                # Start image only applies to first segment
+                                _start_latent = start_image_latent if _is_first else None
+                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}", flush=True)
 
                                 # Clear target image after capturing (one-shot use)
                                 if target_image_latent is not None:
                                     target_image_latent = None
                                     await websocket.send_json({"type": "target_image_used"})
+
+                                # Clear start image after first segment
+                                if _is_first and start_image_latent is not None:
+                                    start_image_latent = None
+                                    await websocket.send_json({"type": "start_image_used"})
 
                                 def run_generation():
                                     return list(engine.generate_streaming(
@@ -2653,6 +2892,7 @@ class NondistilledLTX2Engine:
                                         frame_rate=_fps,
                                         use_second_stage=_stage2,
                                         is_first_segment=_is_first,
+                                        start_frame_latent=_start_latent,
                                         end_frame_latent=_target_latent,
                                     ))
 
@@ -3827,6 +4067,31 @@ STREAMING_HTML = """
                     <label for="useSecondStage">2x Upsampling (960x1664)</label>
                 </div>
 
+                <!-- First Segment Image Conditioning -->
+                <div class="image-inputs" style="margin: 12px 0;">
+                    <label style="font-size: 0.85rem; color: #aaa; margin-bottom: 8px; display: block;">First Segment Images (optional)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <div class="image-input-box" style="flex: 1;">
+                            <input type="file" id="startImageInput" accept="image/*" style="display: none;" onchange="handleStartImage(this)">
+                            <div id="startImageBox" onclick="document.getElementById('startImageInput').click()"
+                                 style="border: 2px dashed #444; border-radius: 8px; padding: 8px; text-align: center; cursor: pointer; min-height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative;">
+                                <img id="startImagePreview" src="" style="max-width: 100%; max-height: 50px; display: none; border-radius: 4px;">
+                                <span id="startImageLabel" style="font-size: 0.75rem; color: #888;">Start Frame</span>
+                                <button id="clearStartImage" onclick="event.stopPropagation(); clearStartImage();" style="display: none; position: absolute; top: 2px; right: 2px; background: rgba(255,0,0,0.7); border: none; color: white; border-radius: 50%; width: 18px; height: 18px; cursor: pointer; font-size: 10px;">✕</button>
+                            </div>
+                        </div>
+                        <div class="image-input-box" style="flex: 1;">
+                            <input type="file" id="endImageInput" accept="image/*" style="display: none;" onchange="handleEndImage(this)">
+                            <div id="endImageBox" onclick="document.getElementById('endImageInput').click()"
+                                 style="border: 2px dashed #444; border-radius: 8px; padding: 8px; text-align: center; cursor: pointer; min-height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative;">
+                                <img id="endImagePreview" src="" style="max-width: 100%; max-height: 50px; display: none; border-radius: 4px;">
+                                <span id="endImageLabel" style="font-size: 0.75rem; color: #888;">End Frame</span>
+                                <button id="clearEndImage" onclick="event.stopPropagation(); clearEndImage();" style="display: none; position: absolute; top: 2px; right: 2px; background: rgba(255,0,0,0.7); border: none; color: white; border-radius: 50%; width: 18px; height: 18px; cursor: pointer; font-size: 10px;">✕</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <button class="btn btn-start" id="startBtn" onclick="startStream()">▶ Start Streaming</button>
                 <button class="btn btn-stop" id="stopBtn" onclick="stopStream()" style="display:none;">⏹ Stop</button>
                 <button class="btn btn-update" id="updateBtn" onclick="updatePrompt()" style="display:none;">🔄 Update Prompt</button>
@@ -3880,8 +4145,12 @@ STREAMING_HTML = """
         let audioSources = [];  // Track active audio sources for rate changes
         let nextAudioTime = 0;
 
-        // Target image
+        // Target image (drag-drop during streaming)
         let targetImageData = null;
+
+        // First segment images (set before starting)
+        let startImageData = null;
+        let endImageData = null;
 
         // Canvas
         const canvas = document.getElementById('videoCanvas');
@@ -3913,13 +4182,10 @@ STREAMING_HTML = """
                 clearInterval(playbackInterval);
                 playbackInterval = setInterval(playFrame, 1000 / playbackFps);
             }
-            // Update audio playback rate for active sources
-            const audioRate = playbackFps / generationFps;
-            audioSources.forEach(source => {
-                if (source && source.playbackRate) {
-                    source.playbackRate.value = audioRate;
-                }
-            });
+            // Note: Audio is pre-stretched for pitch preservation, so FPS changes
+            // only affect new audio chunks. Currently playing audio continues at
+            // its original stretched rate. This is a trade-off for pitch preservation.
+            log(`FPS changed to ${value} - new audio will be time-stretched accordingly`);
         }
 
         function updateStatus(text, className) {
@@ -3982,6 +4248,66 @@ STREAMING_HTML = """
             isPlaying = false;
         }
 
+        // Time-stretch audio buffer using granular synthesis (preserves pitch)
+        function timeStretchBuffer(ctx, buffer, rate) {
+            if (Math.abs(rate - 1.0) < 0.01) {
+                return buffer; // No stretching needed
+            }
+
+            const grainSize = 0.03; // 30ms grains
+            const overlap = 0.6; // 60% overlap for smoother output
+
+            const inputLength = buffer.length;
+            const outputLength = Math.floor(inputLength / rate);
+            const numChannels = buffer.numberOfChannels;
+            const sampleRate = buffer.sampleRate;
+
+            const outputBuffer = ctx.createBuffer(numChannels, outputLength, sampleRate);
+
+            const grainSamples = Math.floor(grainSize * sampleRate);
+            const hopIn = Math.floor(grainSamples * (1 - overlap));
+            const hopOut = Math.floor(hopIn / rate);
+
+            for (let ch = 0; ch < numChannels; ch++) {
+                const input = buffer.getChannelData(ch);
+                const output = outputBuffer.getChannelData(ch);
+
+                // Fill with zeros first
+                output.fill(0);
+
+                let inPos = 0;
+                let outPos = 0;
+
+                while (inPos < inputLength - grainSamples && outPos < outputLength - grainSamples) {
+                    // Copy grain with Hann window for smooth crossfade
+                    for (let i = 0; i < grainSamples && outPos + i < outputLength; i++) {
+                        const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / grainSamples));
+                        output[outPos + i] += input[inPos + i] * window;
+                    }
+
+                    inPos += hopIn;
+                    outPos += hopOut;
+                }
+            }
+
+            // Normalize to prevent clipping
+            for (let ch = 0; ch < numChannels; ch++) {
+                const output = outputBuffer.getChannelData(ch);
+                let maxVal = 0;
+                for (let i = 0; i < output.length; i++) {
+                    maxVal = Math.max(maxVal, Math.abs(output[i]));
+                }
+                if (maxVal > 1.0) {
+                    const scale = 0.95 / maxVal;
+                    for (let i = 0; i < output.length; i++) {
+                        output[i] *= scale;
+                    }
+                }
+            }
+
+            return outputBuffer;
+        }
+
         function playAudioChunk(base64Audio) {
             if (!audioContext) {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -3996,15 +4322,20 @@ STREAMING_HTML = """
             }
 
             audioContext.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
+                // Calculate playback rate
+                const audioRate = playbackFps / generationFps;
+
+                // Time-stretch the buffer to preserve pitch
+                const stretchedBuffer = timeStretchBuffer(audioContext, buffer, audioRate);
+
                 const source = audioContext.createBufferSource();
-                source.buffer = buffer;
+                source.buffer = stretchedBuffer;
                 source.connect(audioContext.destination);
 
-                // Adjust playback rate to match video playback speed
-                const audioRate = playbackFps / generationFps;
-                source.playbackRate.value = audioRate;
+                // Play at normal rate (stretching already adjusted duration)
+                source.playbackRate.value = 1.0;
 
-                // Track this source so we can update its rate if FPS changes
+                // Track this source
                 audioSources.push(source);
                 source.onended = () => {
                     const idx = audioSources.indexOf(source);
@@ -4012,12 +4343,12 @@ STREAMING_HTML = """
                 };
 
                 // Schedule audio to play at the right time
-                // Adjust duration based on playback rate
                 const startTime = Math.max(audioContext.currentTime, nextAudioTime);
                 source.start(startTime);
-                nextAudioTime = startTime + (buffer.duration / audioRate);
+                // Duration is now the stretched buffer duration
+                nextAudioTime = startTime + stretchedBuffer.duration;
 
-                log(`Audio: rate=${audioRate.toFixed(2)}x (${playbackFps}/${generationFps} FPS)`);
+                log(`Audio: time-stretched ${audioRate.toFixed(2)}x (pitch preserved)`);
             }, (err) => {
                 console.error('Audio decode error:', err);
             });
@@ -4137,6 +4468,92 @@ STREAMING_HTML = """
             }
         }
 
+        // ============ Start/End Image Functions ============
+
+        function handleStartImage(input) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // Resize to match generation resolution
+                        const targetWidth = parseInt(document.getElementById('width').value);
+                        const targetHeight = parseInt(document.getElementById('height').value);
+                        const canvas = document.createElement('canvas');
+                        canvas.width = targetWidth;
+                        canvas.height = targetHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+                        startImageData = canvas.toDataURL('image/jpeg', 0.9);
+
+                        // Show preview
+                        document.getElementById('startImagePreview').src = startImageData;
+                        document.getElementById('startImagePreview').style.display = 'block';
+                        document.getElementById('startImageLabel').style.display = 'none';
+                        document.getElementById('clearStartImage').style.display = 'block';
+                        document.getElementById('startImageBox').style.borderColor = '#4a9eff';
+                        log('Start image set');
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function clearStartImage() {
+            startImageData = null;
+            document.getElementById('startImageInput').value = '';
+            document.getElementById('startImagePreview').src = '';
+            document.getElementById('startImagePreview').style.display = 'none';
+            document.getElementById('startImageLabel').style.display = 'block';
+            document.getElementById('clearStartImage').style.display = 'none';
+            document.getElementById('startImageBox').style.borderColor = '#444';
+            log('Start image cleared');
+        }
+
+        function handleEndImage(input) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // Resize to match generation resolution
+                        const targetWidth = parseInt(document.getElementById('width').value);
+                        const targetHeight = parseInt(document.getElementById('height').value);
+                        const canvas = document.createElement('canvas');
+                        canvas.width = targetWidth;
+                        canvas.height = targetHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+                        endImageData = canvas.toDataURL('image/jpeg', 0.9);
+
+                        // Show preview
+                        document.getElementById('endImagePreview').src = endImageData;
+                        document.getElementById('endImagePreview').style.display = 'block';
+                        document.getElementById('endImageLabel').style.display = 'none';
+                        document.getElementById('clearEndImage').style.display = 'block';
+                        document.getElementById('endImageBox').style.borderColor = '#4a9eff';
+                        log('End image set');
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function clearEndImage() {
+            endImageData = null;
+            document.getElementById('endImageInput').value = '';
+            document.getElementById('endImagePreview').src = '';
+            document.getElementById('endImagePreview').style.display = 'none';
+            document.getElementById('endImageLabel').style.display = 'block';
+            document.getElementById('clearEndImage').style.display = 'none';
+            document.getElementById('endImageBox').style.borderColor = '#444';
+            log('End image cleared');
+        }
+
         // ============ Streaming Functions ============
 
         function startStream() {
@@ -4179,6 +4596,16 @@ STREAMING_HTML = """
                     max_segments: parseInt(document.getElementById('maxSegments').value),
                 };
 
+                // Add start/end images for first segment if set
+                if (startImageData) {
+                    config.start_image = startImageData;
+                    log('Including start image for first segment');
+                }
+                if (endImageData) {
+                    config.end_image = endImageData;
+                    log('Including end image for first segment');
+                }
+
                 // Update canvas size
                 canvas.width = config.use_second_stage ? config.width * 2 : config.width;
                 canvas.height = config.use_second_stage ? config.height * 2 : config.height;
@@ -4186,7 +4613,7 @@ STREAMING_HTML = """
                 ws.send(JSON.stringify(config));
                 log('Generation started: ' + config.prompt.substring(0, 40) + '...');
 
-                // Send staged target image if any
+                // Send staged target image if any (for subsequent segments)
                 if (targetImageData) {
                     sendTargetImage(targetImageData);
                 }
@@ -4244,6 +4671,17 @@ STREAMING_HTML = """
                 }
                 else if (msg.type === 'target_image_cleared') {
                     log('Target image cleared');
+                }
+                else if (msg.type === 'start_image_used') {
+                    log('Start image applied to first segment');
+                    // Clear the start image UI
+                    clearStartImage();
+                }
+                else if (msg.type === 'started') {
+                    if (msg.start_image_set) log('Start image encoded successfully');
+                    if (msg.start_image_error) log('Start image error: ' + msg.start_image_error);
+                    if (msg.end_image_set) log('End image encoded successfully');
+                    if (msg.end_image_error) log('End image error: ' + msg.end_image_error);
                 }
                 else if (msg.type === 'complete') {
                     log(`Complete! ${msg.segments} segments`);

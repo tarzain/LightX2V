@@ -1945,6 +1945,7 @@ class OfficialLTX2Engine:
         frame_rate: float,
         use_second_stage: bool = False,
         is_first_segment: bool = True,
+        start_frame_latent: "torch.Tensor | None" = None,
         end_frame_latent: "torch.Tensor | None" = None,
     ):
         """
@@ -1952,6 +1953,7 @@ class OfficialLTX2Engine:
 
         Args:
             is_first_segment: If True, starts fresh. If False, conditions on previous segment.
+            start_frame_latent: Optional latent for start-frame conditioning (first frame image).
             end_frame_latent: Optional latent for end-frame conditioning (target image).
 
         Yields:
@@ -2050,6 +2052,15 @@ class OfficialLTX2Engine:
                 # Clear any previous latent when starting fresh
                 print(f"   Streaming: First segment - clearing previous latent", flush=True)
                 self._streaming_last_latent = None
+                # Use provided start image for first frame conditioning if available
+                if start_frame_latent is not None:
+                    print(f"   Streaming: Adding start-frame conditioning (start image), shape: {start_frame_latent.shape}", flush=True)
+                    start_conditioning = VideoConditionByKeyframeIndex(
+                        keyframes=start_frame_latent,
+                        frame_idx=0,
+                        strength=1.0,
+                    )
+                    conditionings.append(start_conditioning)
 
             # Add end-frame conditioning (target image) if provided
             if end_frame_latent is not None:
@@ -2623,7 +2634,31 @@ class OfficialLTX2Engine:
                             use_second_stage = msg.get("use_second_stage", False)
                             max_segments = msg.get("max_segments", 10)
 
-                            await websocket.send_json({"type": "started", "prompt": current_prompt})
+                            # Encode optional start/end images for the first segment
+                            start_image_latent = None
+                            end_image_latent = None
+                            started_response = {"type": "started", "prompt": current_prompt}
+
+                            if msg.get("start_image"):
+                                try:
+                                    start_image_latent = engine.encode_target_image(msg["start_image"], height, width)
+                                    started_response["start_image_set"] = True
+                                    print(f"   WebSocket: Start image encoded for first segment", flush=True)
+                                except Exception as e:
+                                    started_response["start_image_error"] = str(e)
+                                    print(f"   WebSocket: Failed to encode start image: {e}", flush=True)
+
+                            if msg.get("end_image"):
+                                try:
+                                    end_image_latent = engine.encode_target_image(msg["end_image"], height, width)
+                                    target_image_latent = end_image_latent  # Use as target for first segment
+                                    started_response["end_image_set"] = True
+                                    print(f"   WebSocket: End image encoded for first segment", flush=True)
+                                except Exception as e:
+                                    started_response["end_image_error"] = str(e)
+                                    print(f"   WebSocket: Failed to encode end image: {e}", flush=True)
+
+                            await websocket.send_json(started_response)
 
                             segment_count = 0
                             should_stop = False
@@ -2704,12 +2739,19 @@ class OfficialLTX2Engine:
                                 _stage2 = use_second_stage
                                 _is_first = (segment_count == 1)
                                 _target_latent = target_image_latent  # Capture for this segment
-                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}", flush=True)
+                                # Start image only applies to first segment
+                                _start_latent = start_image_latent if _is_first else None
+                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}", flush=True)
 
                                 # Clear target image after capturing (one-shot use)
                                 if target_image_latent is not None:
                                     target_image_latent = None
                                     await websocket.send_json({"type": "target_image_used"})
+
+                                # Clear start image after first segment
+                                if _is_first and start_image_latent is not None:
+                                    start_image_latent = None
+                                    await websocket.send_json({"type": "start_image_used"})
 
                                 def run_generation():
                                     return list(engine.generate_streaming(
@@ -2721,6 +2763,7 @@ class OfficialLTX2Engine:
                                         frame_rate=_fps,
                                         use_second_stage=_stage2,
                                         is_first_segment=_is_first,
+                                        start_frame_latent=_start_latent,
                                         end_frame_latent=_target_latent,
                                     ))
 
@@ -3902,6 +3945,31 @@ STREAMING_HTML = """
                     <label for="useSecondStage">2x Upsampling (960x1664)</label>
                 </div>
 
+                <!-- First Segment Image Conditioning -->
+                <div class="image-inputs" style="margin: 12px 0;">
+                    <label style="font-size: 0.85rem; color: #aaa; margin-bottom: 8px; display: block;">First Segment Images (optional)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <div class="image-input-box" style="flex: 1;">
+                            <input type="file" id="startImageInput" accept="image/*" style="display: none;" onchange="handleStartImage(this)">
+                            <div id="startImageBox" onclick="document.getElementById('startImageInput').click()"
+                                 style="border: 2px dashed #444; border-radius: 8px; padding: 8px; text-align: center; cursor: pointer; min-height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative;">
+                                <img id="startImagePreview" src="" style="max-width: 100%; max-height: 50px; display: none; border-radius: 4px;">
+                                <span id="startImageLabel" style="font-size: 0.75rem; color: #888;">Start Frame</span>
+                                <button id="clearStartImage" onclick="event.stopPropagation(); clearStartImage();" style="display: none; position: absolute; top: 2px; right: 2px; background: rgba(255,0,0,0.7); border: none; color: white; border-radius: 50%; width: 18px; height: 18px; cursor: pointer; font-size: 10px;">✕</button>
+                            </div>
+                        </div>
+                        <div class="image-input-box" style="flex: 1;">
+                            <input type="file" id="endImageInput" accept="image/*" style="display: none;" onchange="handleEndImage(this)">
+                            <div id="endImageBox" onclick="document.getElementById('endImageInput').click()"
+                                 style="border: 2px dashed #444; border-radius: 8px; padding: 8px; text-align: center; cursor: pointer; min-height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative;">
+                                <img id="endImagePreview" src="" style="max-width: 100%; max-height: 50px; display: none; border-radius: 4px;">
+                                <span id="endImageLabel" style="font-size: 0.75rem; color: #888;">End Frame</span>
+                                <button id="clearEndImage" onclick="event.stopPropagation(); clearEndImage();" style="display: none; position: absolute; top: 2px; right: 2px; background: rgba(255,0,0,0.7); border: none; color: white; border-radius: 50%; width: 18px; height: 18px; cursor: pointer; font-size: 10px;">✕</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="btn-row" style="display: flex; gap: 10px;">
                     <button class="btn btn-start btn-turbo" id="startTurboBtn" onclick="startStream('turbo')">⚡ Start Turbo</button>
                     <button class="btn btn-start btn-hq" id="startHQBtn" onclick="startStream('hq')">✨ Start HQ</button>
@@ -3962,8 +4030,12 @@ STREAMING_HTML = """
         let audioSources = [];  // Track active audio sources for rate changes
         let nextAudioTime = 0;
 
-        // Target image
+        // Target image (drag-drop during streaming)
         let targetImageData = null;
+
+        // First segment images (set before starting)
+        let startImageData = null;
+        let endImageData = null;
 
         // Canvas
         const canvas = document.getElementById('videoCanvas');
@@ -3995,13 +4067,10 @@ STREAMING_HTML = """
                 clearInterval(playbackInterval);
                 playbackInterval = setInterval(playFrame, 1000 / playbackFps);
             }
-            // Update audio playback rate for active sources
-            const audioRate = playbackFps / generationFps;
-            audioSources.forEach(source => {
-                if (source && source.playbackRate) {
-                    source.playbackRate.value = audioRate;
-                }
-            });
+            // Note: Audio is pre-stretched for pitch preservation, so FPS changes
+            // only affect new audio chunks. Currently playing audio continues at
+            // its original stretched rate. This is a trade-off for pitch preservation.
+            log(`FPS changed to ${value} - new audio will be time-stretched accordingly`);
         }
 
         function updateStatus(text, className) {
@@ -4064,6 +4133,66 @@ STREAMING_HTML = """
             isPlaying = false;
         }
 
+        // Time-stretch audio buffer using granular synthesis (preserves pitch)
+        function timeStretchBuffer(ctx, buffer, rate) {
+            if (Math.abs(rate - 1.0) < 0.01) {
+                return buffer; // No stretching needed
+            }
+
+            const grainSize = 0.03; // 30ms grains
+            const overlap = 0.6; // 60% overlap for smoother output
+
+            const inputLength = buffer.length;
+            const outputLength = Math.floor(inputLength / rate);
+            const numChannels = buffer.numberOfChannels;
+            const sampleRate = buffer.sampleRate;
+
+            const outputBuffer = ctx.createBuffer(numChannels, outputLength, sampleRate);
+
+            const grainSamples = Math.floor(grainSize * sampleRate);
+            const hopIn = Math.floor(grainSamples * (1 - overlap));
+            const hopOut = Math.floor(hopIn / rate);
+
+            for (let ch = 0; ch < numChannels; ch++) {
+                const input = buffer.getChannelData(ch);
+                const output = outputBuffer.getChannelData(ch);
+
+                // Fill with zeros first
+                output.fill(0);
+
+                let inPos = 0;
+                let outPos = 0;
+
+                while (inPos < inputLength - grainSamples && outPos < outputLength - grainSamples) {
+                    // Copy grain with Hann window for smooth crossfade
+                    for (let i = 0; i < grainSamples && outPos + i < outputLength; i++) {
+                        const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / grainSamples));
+                        output[outPos + i] += input[inPos + i] * window;
+                    }
+
+                    inPos += hopIn;
+                    outPos += hopOut;
+                }
+            }
+
+            // Normalize to prevent clipping
+            for (let ch = 0; ch < numChannels; ch++) {
+                const output = outputBuffer.getChannelData(ch);
+                let maxVal = 0;
+                for (let i = 0; i < output.length; i++) {
+                    maxVal = Math.max(maxVal, Math.abs(output[i]));
+                }
+                if (maxVal > 1.0) {
+                    const scale = 0.95 / maxVal;
+                    for (let i = 0; i < output.length; i++) {
+                        output[i] *= scale;
+                    }
+                }
+            }
+
+            return outputBuffer;
+        }
+
         function playAudioChunk(base64Audio) {
             if (!audioContext) {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -4078,15 +4207,20 @@ STREAMING_HTML = """
             }
 
             audioContext.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
+                // Calculate playback rate
+                const audioRate = playbackFps / generationFps;
+
+                // Time-stretch the buffer to preserve pitch
+                const stretchedBuffer = timeStretchBuffer(audioContext, buffer, audioRate);
+
                 const source = audioContext.createBufferSource();
-                source.buffer = buffer;
+                source.buffer = stretchedBuffer;
                 source.connect(audioContext.destination);
 
-                // Adjust playback rate to match video playback speed
-                const audioRate = playbackFps / generationFps;
-                source.playbackRate.value = audioRate;
+                // Play at normal rate (stretching already adjusted duration)
+                source.playbackRate.value = 1.0;
 
-                // Track this source so we can update its rate if FPS changes
+                // Track this source
                 audioSources.push(source);
                 source.onended = () => {
                     const idx = audioSources.indexOf(source);
@@ -4094,12 +4228,12 @@ STREAMING_HTML = """
                 };
 
                 // Schedule audio to play at the right time
-                // Adjust duration based on playback rate
                 const startTime = Math.max(audioContext.currentTime, nextAudioTime);
                 source.start(startTime);
-                nextAudioTime = startTime + (buffer.duration / audioRate);
+                // Duration is now the stretched buffer duration
+                nextAudioTime = startTime + stretchedBuffer.duration;
 
-                log(`Audio: rate=${audioRate.toFixed(2)}x (${playbackFps}/${generationFps} FPS)`);
+                log(`Audio: time-stretched ${audioRate.toFixed(2)}x (pitch preserved)`);
             }, (err) => {
                 console.error('Audio decode error:', err);
             });
@@ -4219,6 +4353,92 @@ STREAMING_HTML = """
             }
         }
 
+        // ============ Start/End Image Functions ============
+
+        function handleStartImage(input) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // Resize to match generation resolution
+                        const targetWidth = parseInt(document.getElementById('width').value);
+                        const targetHeight = parseInt(document.getElementById('height').value);
+                        const canvas = document.createElement('canvas');
+                        canvas.width = targetWidth;
+                        canvas.height = targetHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+                        startImageData = canvas.toDataURL('image/jpeg', 0.9);
+
+                        // Show preview
+                        document.getElementById('startImagePreview').src = startImageData;
+                        document.getElementById('startImagePreview').style.display = 'block';
+                        document.getElementById('startImageLabel').style.display = 'none';
+                        document.getElementById('clearStartImage').style.display = 'block';
+                        document.getElementById('startImageBox').style.borderColor = '#4a9eff';
+                        log('Start image set');
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function clearStartImage() {
+            startImageData = null;
+            document.getElementById('startImageInput').value = '';
+            document.getElementById('startImagePreview').src = '';
+            document.getElementById('startImagePreview').style.display = 'none';
+            document.getElementById('startImageLabel').style.display = 'block';
+            document.getElementById('clearStartImage').style.display = 'none';
+            document.getElementById('startImageBox').style.borderColor = '#444';
+            log('Start image cleared');
+        }
+
+        function handleEndImage(input) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // Resize to match generation resolution
+                        const targetWidth = parseInt(document.getElementById('width').value);
+                        const targetHeight = parseInt(document.getElementById('height').value);
+                        const canvas = document.createElement('canvas');
+                        canvas.width = targetWidth;
+                        canvas.height = targetHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+                        endImageData = canvas.toDataURL('image/jpeg', 0.9);
+
+                        // Show preview
+                        document.getElementById('endImagePreview').src = endImageData;
+                        document.getElementById('endImagePreview').style.display = 'block';
+                        document.getElementById('endImageLabel').style.display = 'none';
+                        document.getElementById('clearEndImage').style.display = 'block';
+                        document.getElementById('endImageBox').style.borderColor = '#4a9eff';
+                        log('End image set');
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function clearEndImage() {
+            endImageData = null;
+            document.getElementById('endImageInput').value = '';
+            document.getElementById('endImagePreview').src = '';
+            document.getElementById('endImagePreview').style.display = 'none';
+            document.getElementById('endImageLabel').style.display = 'block';
+            document.getElementById('clearEndImage').style.display = 'none';
+            document.getElementById('endImageBox').style.borderColor = '#444';
+            log('End image cleared');
+        }
+
         // ============ Streaming Functions ============
 
         let currentMode = 'turbo';  // Track current streaming mode
@@ -4264,6 +4484,16 @@ STREAMING_HTML = """
                     max_segments: parseInt(document.getElementById('maxSegments').value),
                 };
 
+                // Add start/end images for first segment if set
+                if (startImageData) {
+                    config.start_image = startImageData;
+                    log('Including start image for first segment');
+                }
+                if (endImageData) {
+                    config.end_image = endImageData;
+                    log('Including end image for first segment');
+                }
+
                 // Update canvas size
                 canvas.width = config.use_second_stage ? config.width * 2 : config.width;
                 canvas.height = config.use_second_stage ? config.height * 2 : config.height;
@@ -4271,7 +4501,7 @@ STREAMING_HTML = """
                 ws.send(JSON.stringify(config));
                 log('Generation started: ' + config.prompt.substring(0, 40) + '...');
 
-                // Send staged target image if any
+                // Send staged target image if any (for subsequent segments)
                 if (targetImageData) {
                     sendTargetImage(targetImageData);
                 }
@@ -4303,6 +4533,12 @@ STREAMING_HTML = """
                     log('Audio chunk received');
                     playAudioChunk(msg.data);
                 }
+                else if (msg.type === 'started') {
+                    if (msg.start_image_set) log('Start image encoded successfully');
+                    if (msg.start_image_error) log('Start image error: ' + msg.start_image_error);
+                    if (msg.end_image_set) log('End image encoded successfully');
+                    if (msg.end_image_error) log('End image error: ' + msg.end_image_error);
+                }
                 else if (msg.type === 'segment_start') {
                     log(`Segment ${msg.segment}: ${msg.prompt.substring(0, 30)}...`);
                 }
@@ -4330,6 +4566,11 @@ STREAMING_HTML = """
                 }
                 else if (msg.type === 'target_image_cleared') {
                     log('Target image cleared');
+                }
+                else if (msg.type === 'start_image_used') {
+                    log('Start image applied to first segment');
+                    // Clear the start image UI
+                    clearStartImage();
                 }
                 else if (msg.type === 'complete') {
                     log(`Complete! ${msg.segments} segments`);

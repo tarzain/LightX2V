@@ -44,6 +44,9 @@ DEFAULT_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 USE_FP8 = False  # False = BF16 checkpoint (~38GB), True = FP8 checkpoint (~19GB)
 SKIP_UPSCALING = True  # True = generate at full res, skip stage 2 (faster), False = 2-stage with upscaling
 
+# WebSocket endpoint URL (GPU container) - UI served separately from lightweight CPU container
+WEBSOCKET_ENDPOINT = "wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream"
+
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
     .apt_install(
@@ -126,6 +129,51 @@ def download_models():
             token=hf_token,
         )
         print(f"✅ Downloaded Gemma model: {gemma_repo_id} -> {GEMMA_DIR}")
+
+
+@app.function(timeout=60)
+@modal.asgi_app()
+def streaming_ui():
+    """
+    Lightweight CPU-only function to serve the streaming UI.
+
+    This serves the HTML page instantly without waiting for GPU/model loading.
+    The page connects to the GPU container's WebSocket endpoint for actual streaming.
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse
+    from fastapi.middleware.cors import CORSMiddleware
+
+    ui_app = FastAPI(title="LTX-2 Streaming UI")
+    ui_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @ui_app.get("/", response_class=HTMLResponse)
+    async def index():
+        # Inject the WebSocket endpoint URL into the HTML
+        html = STREAMING_HTML.replace(
+            "const wsUrl = `${protocol}//${window.location.host}/ws/stream`;",
+            f'const wsUrl = "{WEBSOCKET_ENDPOINT}";'
+        )
+        return HTMLResponse(html)
+
+    @ui_app.get("/stream", response_class=HTMLResponse)
+    async def stream():
+        html = STREAMING_HTML.replace(
+            "const wsUrl = `${protocol}//${window.location.host}/ws/stream`;",
+            f'const wsUrl = "{WEBSOCKET_ENDPOINT}";'
+        )
+        return HTMLResponse(html)
+
+    @ui_app.get("/health")
+    async def health():
+        return {"status": "healthy", "service": "streaming-ui"}
+
+    return ui_app
 
 
 @app.cls(

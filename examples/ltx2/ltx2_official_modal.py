@@ -5995,7 +5995,6 @@ MINIMAL_HTML = """
 
         function toggleSettings() {
             settingsPanel.classList.toggle('open');
-            settingsBtn.classList.toggle('hidden', settingsPanel.classList.contains('open'));
         }
 
         function showToast(message) {

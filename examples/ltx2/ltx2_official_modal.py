@@ -5076,7 +5076,7 @@ MINIMAL_HTML = """
         /* Settings panel */
         .settings-panel {
             position: fixed;
-            bottom: 80px;
+            top: 70px;
             right: 20px;
             width: 280px;
             background: var(--bg-secondary);

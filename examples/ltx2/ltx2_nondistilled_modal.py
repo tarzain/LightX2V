@@ -42,7 +42,7 @@ DEFAULT_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 
 # Pipeline configuration
 USE_FP8 = False  # False = BF16 checkpoint (~43GB), True = FP8 checkpoint (~27GB)
-NUM_INFERENCE_STEPS = 30  # Number of denoising steps (more = better quality, slower)
+NUM_INFERENCE_STEPS = 20  # Number of denoising steps (gradient estimation allows 20-30 instead of 40)
 CFG_GUIDANCE_SCALE = 3.0  # Classifier-free guidance scale (higher = more prompt adherence)
 NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
@@ -1949,7 +1949,7 @@ class NondistilledLTX2Engine:
         from ltx_core.text_encoders.gemma import encode_text
         from ltx_core.types import VideoPixelShape
         from ltx_pipelines.utils.helpers import (
-            euler_denoising_loop,
+            gradient_estimating_euler_denoising_loop,
             noise_video_state,
             noise_audio_state,
             guider_denoising_func,
@@ -1985,7 +1985,7 @@ class NondistilledLTX2Engine:
             cfg_guider = CFGGuider(self.cfg_guidance_scale)
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
-                return euler_denoising_loop(
+                return gradient_estimating_euler_denoising_loop(
                     sigmas=sigmas,
                     video_state=video_state,
                     audio_state=audio_state,
@@ -1998,6 +1998,7 @@ class NondistilledLTX2Engine:
                         a_context_n,
                         transformer=transformer,
                     ),
+                    ge_gamma=2.0,  # Gradient estimation coefficient for faster convergence
                 )
 
             generator = torch.Generator(device=device).manual_seed(seed)

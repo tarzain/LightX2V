@@ -1999,6 +1999,7 @@ class NondistilledLTX2Engine:
         is_first_segment: bool = True,
         start_frame_latent: "torch.Tensor | None" = None,
         end_frame_latent: "torch.Tensor | None" = None,
+        target_frame_position: float = 1.0,
     ):
         """
         Generator that yields frames for real-time streaming (non-distilled with CFG).
@@ -2011,6 +2012,7 @@ class NondistilledLTX2Engine:
             is_first_segment: If True, starts fresh. If False, conditions on previous segment.
             start_frame_latent: Optional latent for start-frame conditioning (first frame image).
             end_frame_latent: Optional latent for end-frame conditioning (target image).
+            target_frame_position: Position for target frame (0.0=start, 0.5=middle, 1.0=end).
             use_second_stage: If True, use two-stage with upscaling for HQ output.
 
         Yields:
@@ -2176,6 +2178,10 @@ class NondistilledLTX2Engine:
             # Add end-frame conditioning (target image) if provided
             # Note: target image latent should be at stage 1 resolution for two-stage
             if end_frame_latent is not None:
+                # Calculate target frame index based on position
+                target_frame_idx = int(target_frame_position * (segment_frames - 1))
+                target_frame_idx = max(0, min(segment_frames - 1, target_frame_idx))  # Clamp
+
                 # Resize target latent to stage 1 resolution if needed
                 if use_two_stage:
                     # Target latent was encoded at full res, need to downsample for stage 1
@@ -2190,10 +2196,10 @@ class NondistilledLTX2Engine:
                 else:
                     target_latent = end_frame_latent
 
-                print(f"   Streaming: Adding end-frame conditioning (target image), shape: {target_latent.shape}", flush=True)
+                print(f"   Streaming: Adding target-frame conditioning at frame {target_frame_idx}/{segment_frames-1} (pos={target_frame_position:.2f}), shape: {target_latent.shape}", flush=True)
                 end_conditioning = VideoConditionByKeyframeIndex(
                     keyframes=target_latent,
-                    frame_idx=segment_frames - 1,  # Last frame
+                    frame_idx=target_frame_idx,
                     strength=1.0,
                 )
                 conditionings.append(end_conditioning)
@@ -2692,6 +2698,7 @@ class NondistilledLTX2Engine:
             should_stop = False
             segment_count = 0
             target_image_latent = None  # For end-frame conditioning
+            target_frame_position = 1.0  # Default: end of segment (0.0=start, 0.5=middle, 1.0=end)
 
             try:
                 while True:
@@ -2718,8 +2725,11 @@ class NondistilledLTX2Engine:
                                     target_image_latent = engine.encode_target_image(
                                         image_data, target_height, target_width
                                     )
-                                    await websocket.send_json({"type": "target_image_set", "success": True})
-                                    print(f"   WebSocket: Target image set", flush=True)
+                                    # Get target frame position (0.0=start, 0.5=middle, 1.0=end)
+                                    target_frame_position = float(msg.get("position", 1.0))
+                                    target_frame_position = max(0.0, min(1.0, target_frame_position))
+                                    await websocket.send_json({"type": "target_image_set", "success": True, "position": target_frame_position})
+                                    print(f"   WebSocket: Target image set at position {target_frame_position:.2f}", flush=True)
                                 except Exception as e:
                                     print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
                                     await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
@@ -2751,6 +2761,11 @@ class NondistilledLTX2Engine:
                                         response["target_image_set"] = False
                                         response["target_image_error"] = str(e)
                                         print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
+                            # Update target frame position if provided
+                            if "position" in msg:
+                                target_frame_position = float(msg.get("position", 1.0))
+                                target_frame_position = max(0.0, min(1.0, target_frame_position))
+                                response["position"] = target_frame_position
                             await websocket.send_json(response)
 
                         elif msg.get("action") == "start":
@@ -2812,8 +2827,11 @@ class NondistilledLTX2Engine:
                                         if image_data:
                                             try:
                                                 target_image_latent = engine.encode_target_image(image_data, height, width)
-                                                await websocket.send_json({"type": "target_image_set", "success": True})
-                                                print(f"   WebSocket: Target image set (pre-segment)", flush=True)
+                                                # Get target frame position
+                                                target_frame_position = float(check_msg.get("position", 1.0))
+                                                target_frame_position = max(0.0, min(1.0, target_frame_position))
+                                                await websocket.send_json({"type": "target_image_set", "success": True, "position": target_frame_position})
+                                                print(f"   WebSocket: Target image set (pre-segment) at position {target_frame_position:.2f}", flush=True)
                                             except Exception as e:
                                                 print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
                                                 await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
@@ -2837,6 +2855,11 @@ class NondistilledLTX2Engine:
                                                 except Exception as e:
                                                     response["target_image_set"] = False
                                                     response["target_image_error"] = str(e)
+                                        # Update target frame position if provided
+                                        if "position" in check_msg:
+                                            target_frame_position = float(check_msg.get("position", 1.0))
+                                            target_frame_position = max(0.0, min(1.0, target_frame_position))
+                                            response["position"] = target_frame_position
                                         await websocket.send_json(response)
                                 except asyncio.TimeoutError:
                                     pass
@@ -2868,9 +2891,10 @@ class NondistilledLTX2Engine:
                                 _stage2 = use_second_stage
                                 _is_first = (segment_count == 1)
                                 _target_latent = target_image_latent  # Capture for this segment
+                                _target_position = target_frame_position  # Capture position for this segment
                                 # Start image only applies to first segment
                                 _start_latent = start_image_latent if _is_first else None
-                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}", flush=True)
+                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}, target_pos={_target_position:.2f}", flush=True)
 
                                 # Clear target image after capturing (one-shot use)
                                 if target_image_latent is not None:
@@ -2894,6 +2918,7 @@ class NondistilledLTX2Engine:
                                         is_first_segment=_is_first,
                                         start_frame_latent=_start_latent,
                                         end_frame_latent=_target_latent,
+                                        target_frame_position=_target_position,
                                     ))
 
                                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -2922,8 +2947,11 @@ class NondistilledLTX2Engine:
                                             if image_data:
                                                 try:
                                                     target_image_latent = engine.encode_target_image(image_data, height, width)
-                                                    await websocket.send_json({"type": "target_image_set", "success": True})
-                                                    print(f"   WebSocket: Target image set (mid-segment, will apply to next segment)", flush=True)
+                                                    # Get target frame position
+                                                    target_frame_position = float(check_msg.get("position", 1.0))
+                                                    target_frame_position = max(0.0, min(1.0, target_frame_position))
+                                                    await websocket.send_json({"type": "target_image_set", "success": True, "position": target_frame_position})
+                                                    print(f"   WebSocket: Target image set (mid-segment) at position {target_frame_position:.2f}", flush=True)
                                                 except Exception as e:
                                                     print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
                                                     await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
@@ -2947,6 +2975,11 @@ class NondistilledLTX2Engine:
                                                     except Exception as e:
                                                         response["target_image_set"] = False
                                                         response["target_image_error"] = str(e)
+                                            # Update target frame position if provided
+                                            if "position" in check_msg:
+                                                target_frame_position = float(check_msg.get("position", 1.0))
+                                                target_frame_position = max(0.0, min(1.0, target_frame_position))
+                                                response["position"] = target_frame_position
                                             await websocket.send_json(response)
                                     except asyncio.TimeoutError:
                                         pass
@@ -4092,6 +4125,23 @@ STREAMING_HTML = """
                     </div>
                 </div>
 
+                <!-- Target Frame Position -->
+                <div class="slider-group" style="margin: 12px 0;">
+                    <label style="font-size: 0.85rem; color: #aaa; margin-bottom: 4px; display: block;">
+                        Target Frame Position: <span id="targetPositionLabel">End</span>
+                    </label>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="font-size: 0.7rem; color: #666;">Start</span>
+                        <input type="range" id="targetFramePosition" min="0" max="1" step="0.1" value="1"
+                               style="flex: 1; accent-color: #6366f1;"
+                               oninput="updateTargetPositionLabel(this.value)">
+                        <span style="font-size: 0.7rem; color: #666;">End</span>
+                    </div>
+                    <div style="font-size: 0.7rem; color: #666; text-align: center; margin-top: 2px;">
+                        Where in the next segment the dropped target image appears
+                    </div>
+                </div>
+
                 <button class="btn btn-start" id="startBtn" onclick="startStream()">▶ Start Streaming</button>
                 <button class="btn btn-stop" id="stopBtn" onclick="stopStream()" style="display:none;">⏹ Stop</button>
                 <button class="btn btn-update" id="updateBtn" onclick="updatePrompt()" style="display:none;">🔄 Update Prompt</button>
@@ -4441,20 +4491,40 @@ STREAMING_HTML = """
                 try {
                     const height = parseInt(document.getElementById('height').value);
                     const width = parseInt(document.getElementById('width').value);
+                    const position = parseFloat(document.getElementById('targetFramePosition').value);
                     const message = JSON.stringify({
                         action: 'set_target_image',
                         image: imageData,
                         height: height,
-                        width: width
+                        width: width,
+                        position: position
                     });
                     const sizeMB = (message.length / (1024 * 1024)).toFixed(2);
-                    log(`Sending target image (${sizeMB}MB)...`);
+                    const posLabel = position <= 0.33 ? 'start' : (position <= 0.66 ? 'middle' : 'end');
+                    log(`Sending target image (${sizeMB}MB) at ${posLabel} of segment...`);
                     ws.send(message);
                 } catch (err) {
                     log('Error sending target image: ' + err.message);
                     console.error('Send error:', err);
                 }
             }
+        }
+
+        function updateTargetPositionLabel(value) {
+            const val = parseFloat(value);
+            let label;
+            if (val <= 0.15) {
+                label = 'Start (0%)';
+            } else if (val <= 0.35) {
+                label = 'Early (25%)';
+            } else if (val <= 0.65) {
+                label = 'Middle (50%)';
+            } else if (val <= 0.85) {
+                label = 'Late (75%)';
+            } else {
+                label = 'End (100%)';
+            }
+            document.getElementById('targetPositionLabel').textContent = label;
         }
 
         function clearTargetImage() {

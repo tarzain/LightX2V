@@ -4880,7 +4880,7 @@ MINIMAL_HTML = """
             height: 4px;
             -webkit-appearance: none;
             appearance: none;
-            background: rgba(255,255,255,0.2);
+            background: var(--bg-hover);
             border-radius: 2px;
             cursor: pointer;
         }
@@ -4890,7 +4890,22 @@ MINIMAL_HTML = """
             width: 14px;
             height: 14px;
             border-radius: 50%;
-            background: #fff;
+            background: var(--text-primary);
+            cursor: pointer;
+        }
+
+        .seek-bar::-moz-range-track {
+            background: var(--bg-hover);
+            border-radius: 2px;
+            height: 4px;
+        }
+
+        .seek-bar::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--text-primary);
+            border: none;
             cursor: pointer;
         }
 
@@ -5789,6 +5804,13 @@ MINIMAL_HTML = """
             isPaused = !isPaused;
             playPauseBtn.textContent = isPaused ? '▶' : '⏸';
             liveIndicator.classList.toggle('paused', isPaused);
+
+            if (isPaused) {
+                // When pausing, exit live mode so user can seek
+                isLive = false;
+                frameBuffer = []; // Clear buffer
+                updateLiveIndicator();
+            }
         }
 
         function handleSeek() {

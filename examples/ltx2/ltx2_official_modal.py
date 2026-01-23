@@ -524,9 +524,41 @@ class OfficialLTX2Engine:
         # Encode to latent
         with torch.no_grad():
             audio_latent = self._audio_encoder(mel.to(self.pipeline.dtype))
-        
+
         print(f"   Audio encoded: {audio_path} -> latent shape {audio_latent.shape}")
         return audio_latent
+
+    def encode_audio_for_streaming(
+        self,
+        audio_b64: str,
+        num_frames: int,
+        frame_rate: float,
+    ) -> "torch.Tensor":
+        """
+        Encode audio from base64 for streaming segment conditioning.
+
+        Args:
+            audio_b64: Base64-encoded audio data (any format torchaudio supports)
+            num_frames: Number of frames in the segment
+            frame_rate: Frame rate of the video
+
+        Returns:
+            Audio latent tensor for conditioning
+        """
+        import base64
+        import tempfile
+
+        # Calculate target duration based on segment parameters
+        target_duration = num_frames / frame_rate
+
+        # Decode and save to temp file (torchaudio needs a file path)
+        audio_data = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_data)
+            audio_path = tmp.name
+
+        # Use existing _encode_audio method
+        return self._encode_audio(audio_path, target_duration)
 
     def _warmup(self):
         """Run a single warmup to ensure CUDA kernels are ready."""
@@ -1948,6 +1980,8 @@ class OfficialLTX2Engine:
         start_frame_latent: "torch.Tensor | None" = None,
         end_frame_latent: "torch.Tensor | None" = None,
         target_frame_position: float = 1.0,
+        audio_latent: "torch.Tensor | None" = None,
+        audio_conditioning_strength: float = 0.3,
     ):
         """
         Generator that yields frames for real-time streaming.
@@ -1957,6 +1991,8 @@ class OfficialLTX2Engine:
             start_frame_latent: Optional latent for start-frame conditioning (first frame image).
             end_frame_latent: Optional latent for end-frame conditioning (target image).
             target_frame_position: Position for target frame (0.0=start, 0.5=middle, 1.0=end).
+            audio_latent: Optional audio latent for audio-to-video conditioning.
+            audio_conditioning_strength: Strength of audio conditioning (0.0-1.0).
 
         Yields:
             dict with either:
@@ -2089,37 +2125,61 @@ class OfficialLTX2Engine:
                 initial_latent=None,
             )
 
-            # Initialize audio state - use previous audio latent for continuity
+            # Initialize audio state - use provided audio or previous latent for continuity
             audio_initial_latent = None
             audio_noise_scale = 1.0  # Default: generate fresh audio
 
-            has_audio_latent = hasattr(self, '_streaming_last_audio_latent') and self._streaming_last_audio_latent is not None
-            if not is_first_segment and has_audio_latent:
-                # Use stored audio latent for conditioning
-                # Audio latent shape is [B, C, T, H]
-                prev_audio = self._streaming_last_audio_latent
-                print(f"   Streaming: Using previous audio latent for conditioning, shape: {prev_audio.shape}", flush=True)
+            # Get expected audio latent shape for this segment
+            from ltx_core.types import AudioLatentShape
+            expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+            expected_frames = expected_audio_shape.frames
 
-                # Get expected audio latent shape for this segment
-                from ltx_core.types import AudioLatentShape
-                expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
-                expected_frames = expected_audio_shape.frames
+            # Priority: provided audio_latent > previous segment audio > fresh generation
+            if audio_latent is not None:
+                # External audio conditioning provided for this segment
+                print(f"   Streaming: Using provided audio conditioning, shape: {audio_latent.shape}", flush=True)
 
-                # Resize previous audio latent to match expected frames if needed
-                actual_frames = prev_audio.shape[2]
+                # Resize audio latent to match expected frames if needed
+                actual_frames = audio_latent.shape[2]
                 if actual_frames != expected_frames:
-                    B, C, T, H = prev_audio.shape
-                    audio_flat = prev_audio.reshape(B * C, 1, T, H)
+                    print(f"   Streaming: Resizing audio latent from {actual_frames} to {expected_frames} frames", flush=True)
+                    B, C, T, H = audio_latent.shape
+                    audio_flat = audio_latent.reshape(B * C, 1, T, H)
                     audio_resized = torch.nn.functional.interpolate(
                         audio_flat, size=(expected_frames, H), mode='bilinear', align_corners=False
                     )
                     audio_initial_latent = audio_resized.reshape(B, C, expected_frames, H)
                 else:
-                    audio_initial_latent = prev_audio
+                    audio_initial_latent = audio_latent
 
-                # Use lower noise scale to preserve more of the audio conditioning
-                audio_noise_scale = 0.7  # Preserve ~30% of previous audio characteristics
-            elif is_first_segment:
+                # Use provided conditioning strength
+                audio_noise_scale = audio_conditioning_strength
+                print(f"   Streaming: Audio conditioning strength: {audio_noise_scale}", flush=True)
+
+            elif not is_first_segment:
+                has_audio_latent = hasattr(self, '_streaming_last_audio_latent') and self._streaming_last_audio_latent is not None
+                if has_audio_latent:
+                    # Use stored audio latent for conditioning
+                    # Audio latent shape is [B, C, T, H]
+                    prev_audio = self._streaming_last_audio_latent
+                    print(f"   Streaming: Using previous audio latent for conditioning, shape: {prev_audio.shape}", flush=True)
+
+                    # Resize previous audio latent to match expected frames if needed
+                    actual_frames = prev_audio.shape[2]
+                    if actual_frames != expected_frames:
+                        B, C, T, H = prev_audio.shape
+                        audio_flat = prev_audio.reshape(B * C, 1, T, H)
+                        audio_resized = torch.nn.functional.interpolate(
+                            audio_flat, size=(expected_frames, H), mode='bilinear', align_corners=False
+                        )
+                        audio_initial_latent = audio_resized.reshape(B, C, expected_frames, H)
+                    else:
+                        audio_initial_latent = prev_audio
+
+                    # Use lower noise scale to preserve more of the audio conditioning
+                    audio_noise_scale = 0.7  # Preserve ~30% of previous audio characteristics
+
+            if is_first_segment:
                 # Clear previous audio latent when starting fresh
                 self._streaming_last_audio_latent = None
 
@@ -2567,8 +2627,14 @@ class OfficialLTX2Engine:
             current_prompt = None
             should_stop = False
             segment_count = 0
+            # Queues for conditioning - items are consumed in order per segment
+            target_image_queue = []  # List of (latent, position) tuples
+            audio_queue = []  # List of (latent, strength) tuples
+            # Legacy single-item support (for backwards compatibility)
             target_image_latent = None  # For target-frame conditioning
             target_frame_position = 1.0  # Default: end of segment (0.0=start, 0.5=middle, 1.0=end)
+            audio_latent = None  # For audio conditioning
+            audio_conditioning_strength = 0.3  # Default strength
             reset_next_segment = False  # Flag to treat next segment as first (history reset)
 
             try:
@@ -2587,20 +2653,27 @@ class OfficialLTX2Engine:
                             await websocket.send_json({"type": "prompt_updated", "prompt": current_prompt})
 
                         elif msg.get("action") == "set_target_image":
-                            # Encode target image for target-frame conditioning
+                            # Encode target image for target-frame conditioning (queued for upcoming segments)
                             image_data = msg.get("image")
                             if image_data:
                                 try:
                                     target_height = msg.get("height", 480)
                                     target_width = msg.get("width", 832)
-                                    target_image_latent = engine.encode_target_image(
+                                    latent = engine.encode_target_image(
                                         image_data, target_height, target_width
                                     )
                                     # Get target frame position (0.0=start, 0.5=middle, 1.0=end)
-                                    target_frame_position = float(msg.get("position", 1.0))
-                                    target_frame_position = max(0.0, min(1.0, target_frame_position))
-                                    await websocket.send_json({"type": "target_image_set", "success": True, "position": target_frame_position})
-                                    print(f"   WebSocket: Target image set at position {target_frame_position:.2f}", flush=True)
+                                    position = float(msg.get("position", 1.0))
+                                    position = max(0.0, min(1.0, position))
+                                    # Add to queue for upcoming segments
+                                    target_image_queue.append((latent, position))
+                                    await websocket.send_json({
+                                        "type": "target_image_set",
+                                        "success": True,
+                                        "position": position,
+                                        "queue_length": len(target_image_queue)
+                                    })
+                                    print(f"   WebSocket: Target image queued at position {position:.2f} (queue: {len(target_image_queue)})", flush=True)
                                 except Exception as e:
                                     print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
                                     await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
@@ -2619,8 +2692,46 @@ class OfficialLTX2Engine:
                             await websocket.send_json({"type": "history_reset"})
                             print(f"   WebSocket: History reset - next segment will start fresh", flush=True)
 
+                        elif msg.get("action") == "set_audio":
+                            # Encode audio for conditioning (queued for upcoming segments)
+                            audio_data = msg.get("audio")
+                            if audio_data:
+                                try:
+                                    # Get segment parameters for duration calculation
+                                    num_frames = msg.get("num_frames", 49)
+                                    frame_rate = msg.get("frame_rate", 30.0)
+                                    strength = float(msg.get("strength", 0.3))
+                                    strength = max(0.0, min(1.0, strength))
+
+                                    latent = engine.encode_audio_for_streaming(
+                                        audio_b64=audio_data,
+                                        num_frames=num_frames,
+                                        frame_rate=frame_rate,
+                                    )
+                                    # Add to queue for upcoming segments
+                                    audio_queue.append((latent, strength))
+                                    await websocket.send_json({
+                                        "type": "audio_set",
+                                        "success": True,
+                                        "strength": strength,
+                                        "queue_length": len(audio_queue)
+                                    })
+                                    print(f"   WebSocket: Audio queued with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                except Exception as e:
+                                    print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
+                                    await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
+                            else:
+                                await websocket.send_json({"type": "audio_set", "success": False, "error": "No audio data"})
+
+                        elif msg.get("action") == "clear_audio":
+                            # Clear the audio queue
+                            audio_queue.clear()
+                            audio_latent = None
+                            await websocket.send_json({"type": "audio_cleared"})
+                            print(f"   WebSocket: Audio queue cleared", flush=True)
+
                         elif msg.get("action") == "set_next_segment":
-                            # Combined action to set prompt and/or target image for next segment
+                            # Combined action to set prompt, target image, and/or audio for next segment
                             response = {"type": "next_segment_set"}
                             if "prompt" in msg:
                                 current_prompt = msg.get("prompt")
@@ -2632,18 +2743,45 @@ class OfficialLTX2Engine:
                                 img_width = msg.get("width", 832)
                                 if image_data:
                                     try:
-                                        target_image_latent = engine.encode_target_image(image_data, img_height, img_width)
+                                        latent = engine.encode_target_image(image_data, img_height, img_width)
+                                        position = float(msg.get("position", 1.0))
+                                        position = max(0.0, min(1.0, position))
+                                        target_image_queue.append((latent, position))
                                         response["target_image_set"] = True
-                                        print(f"   WebSocket: Next segment target image set", flush=True)
+                                        response["target_image_queue_length"] = len(target_image_queue)
+                                        print(f"   WebSocket: Next segment target image queued (queue: {len(target_image_queue)})", flush=True)
                                     except Exception as e:
                                         response["target_image_set"] = False
                                         response["target_image_error"] = str(e)
                                         print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
-                            # Update target frame position if provided
-                            if "position" in msg:
+                            # Update target frame position if provided (legacy single-item support)
+                            if "position" in msg and "target_image" not in msg:
                                 target_frame_position = float(msg.get("position", 1.0))
                                 target_frame_position = max(0.0, min(1.0, target_frame_position))
                                 response["position"] = target_frame_position
+                            # Add audio for next segment
+                            if "audio" in msg:
+                                audio_data = msg.get("audio")
+                                if audio_data:
+                                    try:
+                                        # Get segment parameters
+                                        seg_frames = msg.get("num_frames", 49)
+                                        seg_fps = msg.get("frame_rate", 30.0)
+                                        latent = engine.encode_audio_for_streaming(
+                                            audio_b64=audio_data,
+                                            num_frames=seg_frames,
+                                            frame_rate=seg_fps,
+                                        )
+                                        strength = float(msg.get("audio_strength", 0.3))
+                                        strength = max(0.0, min(1.0, strength))
+                                        audio_queue.append((latent, strength))
+                                        response["audio_set"] = True
+                                        response["audio_queue_length"] = len(audio_queue)
+                                        print(f"   WebSocket: Next segment audio queued (queue: {len(audio_queue)})", flush=True)
+                                    except Exception as e:
+                                        response["audio_set"] = False
+                                        response["audio_error"] = str(e)
+                                        print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                             await websocket.send_json(response)
 
                         elif msg.get("action") == "start":
@@ -2704,18 +2842,50 @@ class OfficialLTX2Engine:
                                         image_data = check_msg.get("image")
                                         if image_data:
                                             try:
-                                                target_image_latent = engine.encode_target_image(image_data, height, width)
-                                                # Get target frame position
-                                                target_frame_position = float(check_msg.get("position", 1.0))
-                                                target_frame_position = max(0.0, min(1.0, target_frame_position))
-                                                await websocket.send_json({"type": "target_image_set", "success": True, "position": target_frame_position})
-                                                print(f"   WebSocket: Target image set (pre-segment) at position {target_frame_position:.2f}", flush=True)
+                                                latent = engine.encode_target_image(image_data, height, width)
+                                                position = float(check_msg.get("position", 1.0))
+                                                position = max(0.0, min(1.0, position))
+                                                target_image_queue.append((latent, position))
+                                                await websocket.send_json({
+                                                    "type": "target_image_set",
+                                                    "success": True,
+                                                    "position": position,
+                                                    "queue_length": len(target_image_queue)
+                                                })
+                                                print(f"   WebSocket: Target image queued (pre-segment) at position {position:.2f} (queue: {len(target_image_queue)})", flush=True)
                                             except Exception as e:
                                                 print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
                                                 await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
                                     elif check_msg.get("action") == "clear_target_image":
+                                        target_image_queue.clear()
                                         target_image_latent = None
                                         await websocket.send_json({"type": "target_image_cleared"})
+                                    elif check_msg.get("action") == "set_audio":
+                                        audio_data = check_msg.get("audio")
+                                        if audio_data:
+                                            try:
+                                                latent = engine.encode_audio_for_streaming(
+                                                    audio_b64=audio_data,
+                                                    num_frames=num_frames,
+                                                    frame_rate=frame_rate,
+                                                )
+                                                strength = float(check_msg.get("strength", 0.3))
+                                                strength = max(0.0, min(1.0, strength))
+                                                audio_queue.append((latent, strength))
+                                                await websocket.send_json({
+                                                    "type": "audio_set",
+                                                    "success": True,
+                                                    "strength": strength,
+                                                    "queue_length": len(audio_queue)
+                                                })
+                                                print(f"   WebSocket: Audio queued (pre-segment) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                            except Exception as e:
+                                                print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
+                                                await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
+                                    elif check_msg.get("action") == "clear_audio":
+                                        audio_queue.clear()
+                                        audio_latent = None
+                                        await websocket.send_json({"type": "audio_cleared"})
                                     elif check_msg.get("action") == "reset_history":
                                         # Clear the model's conditioning state - next segment will be generated fresh
                                         engine._streaming_last_latent = None
@@ -2723,7 +2893,7 @@ class OfficialLTX2Engine:
                                         await websocket.send_json({"type": "history_reset"})
                                         print(f"   WebSocket: History reset (pre-segment) - next segment will start fresh", flush=True)
                                     elif check_msg.get("action") == "set_next_segment":
-                                        # Combined action to set prompt and/or target image
+                                        # Combined action to set prompt, target image, and/or audio
                                         response = {"type": "next_segment_set"}
                                         if "prompt" in check_msg:
                                             current_prompt = check_msg.get("prompt")
@@ -2733,17 +2903,35 @@ class OfficialLTX2Engine:
                                             image_data = check_msg.get("target_image")
                                             if image_data:
                                                 try:
-                                                    target_image_latent = engine.encode_target_image(image_data, height, width)
+                                                    latent = engine.encode_target_image(image_data, height, width)
+                                                    position = float(check_msg.get("position", 1.0))
+                                                    position = max(0.0, min(1.0, position))
+                                                    target_image_queue.append((latent, position))
                                                     response["target_image_set"] = True
-                                                    print(f"   WebSocket: Next segment target image set (pre-segment)", flush=True)
+                                                    response["target_image_queue_length"] = len(target_image_queue)
+                                                    print(f"   WebSocket: Next segment target image queued (pre-segment) (queue: {len(target_image_queue)})", flush=True)
                                                 except Exception as e:
                                                     response["target_image_set"] = False
                                                     response["target_image_error"] = str(e)
-                                        # Update target frame position if provided
-                                        if "position" in check_msg:
-                                            target_frame_position = float(check_msg.get("position", 1.0))
-                                            target_frame_position = max(0.0, min(1.0, target_frame_position))
-                                            response["position"] = target_frame_position
+                                        # Add audio for next segment
+                                        if "audio" in check_msg:
+                                            audio_data = check_msg.get("audio")
+                                            if audio_data:
+                                                try:
+                                                    latent = engine.encode_audio_for_streaming(
+                                                        audio_b64=audio_data,
+                                                        num_frames=num_frames,
+                                                        frame_rate=frame_rate,
+                                                    )
+                                                    strength = float(check_msg.get("audio_strength", 0.3))
+                                                    strength = max(0.0, min(1.0, strength))
+                                                    audio_queue.append((latent, strength))
+                                                    response["audio_set"] = True
+                                                    response["audio_queue_length"] = len(audio_queue)
+                                                    print(f"   WebSocket: Next segment audio queued (pre-segment) (queue: {len(audio_queue)})", flush=True)
+                                                except Exception as e:
+                                                    response["audio_set"] = False
+                                                    response["audio_error"] = str(e)
                                         await websocket.send_json(response)
                                 except asyncio.TimeoutError:
                                     pass
@@ -2765,7 +2953,19 @@ class OfficialLTX2Engine:
                                 import concurrent.futures
                                 loop = asyncio.get_event_loop()
 
-                                # Capture variables for closure (including target image)
+                                # Pop from queues if available, otherwise use single-item variables
+                                if target_image_queue:
+                                    target_image_latent, target_frame_position = target_image_queue.pop(0)
+                                    print(f"   WebSocket: Popped target image from queue (remaining: {len(target_image_queue)})", flush=True)
+
+                                if audio_queue:
+                                    audio_latent, audio_conditioning_strength = audio_queue.pop(0)
+                                    print(f"   WebSocket: Popped audio from queue (remaining: {len(audio_queue)})", flush=True)
+                                else:
+                                    audio_latent = None
+                                    audio_conditioning_strength = 0.3
+
+                                # Capture variables for closure (including target image and audio)
                                 _prompt = current_prompt
                                 _seed = seg_seed
                                 _height = height
@@ -2779,9 +2979,11 @@ class OfficialLTX2Engine:
                                     print(f"   WebSocket: History reset applied - treating as first segment", flush=True)
                                 _target_latent = target_image_latent  # Capture for this segment
                                 _target_position = target_frame_position  # Capture position for this segment
+                                _audio_latent = audio_latent  # Capture for this segment
+                                _audio_strength = audio_conditioning_strength  # Capture for this segment
                                 # Start image only applies to first segment
                                 _start_latent = start_image_latent if _is_first else None
-                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}, target_pos={_target_position:.2f}", flush=True)
+                                print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}, has_audio={_audio_latent is not None}, target_pos={_target_position:.2f}", flush=True)
 
                                 # Clear target image after capturing (one-shot use)
                                 if target_image_latent is not None:
@@ -2792,6 +2994,10 @@ class OfficialLTX2Engine:
                                 if _is_first and start_image_latent is not None:
                                     start_image_latent = None
                                     await websocket.send_json({"type": "start_image_used"})
+
+                                # Notify if audio was used (one-shot)
+                                if _audio_latent is not None:
+                                    await websocket.send_json({"type": "audio_used"})
 
                                 def run_generation():
                                     return list(engine.generate_streaming(
@@ -2806,6 +3012,8 @@ class OfficialLTX2Engine:
                                         start_frame_latent=_start_latent,
                                         end_frame_latent=_target_latent,
                                         target_frame_position=_target_position,
+                                        audio_latent=_audio_latent,
+                                        audio_conditioning_strength=_audio_strength,
                                     ))
 
                                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -2833,18 +3041,50 @@ class OfficialLTX2Engine:
                                             image_data = check_msg.get("image")
                                             if image_data:
                                                 try:
-                                                    target_image_latent = engine.encode_target_image(image_data, height, width)
-                                                    # Get target frame position
-                                                    target_frame_position = float(check_msg.get("position", 1.0))
-                                                    target_frame_position = max(0.0, min(1.0, target_frame_position))
-                                                    await websocket.send_json({"type": "target_image_set", "success": True, "position": target_frame_position})
-                                                    print(f"   WebSocket: Target image set (mid-segment) at position {target_frame_position:.2f}", flush=True)
+                                                    latent = engine.encode_target_image(image_data, height, width)
+                                                    position = float(check_msg.get("position", 1.0))
+                                                    position = max(0.0, min(1.0, position))
+                                                    target_image_queue.append((latent, position))
+                                                    await websocket.send_json({
+                                                        "type": "target_image_set",
+                                                        "success": True,
+                                                        "position": position,
+                                                        "queue_length": len(target_image_queue)
+                                                    })
+                                                    print(f"   WebSocket: Target image queued (mid-segment) at position {position:.2f} (queue: {len(target_image_queue)})", flush=True)
                                                 except Exception as e:
                                                     print(f"   WebSocket: Failed to encode target image: {e}", flush=True)
                                                     await websocket.send_json({"type": "target_image_set", "success": False, "error": str(e)})
                                         elif check_msg.get("action") == "clear_target_image":
+                                            target_image_queue.clear()
                                             target_image_latent = None
                                             await websocket.send_json({"type": "target_image_cleared"})
+                                        elif check_msg.get("action") == "set_audio":
+                                            audio_data = check_msg.get("audio")
+                                            if audio_data:
+                                                try:
+                                                    latent = engine.encode_audio_for_streaming(
+                                                        audio_b64=audio_data,
+                                                        num_frames=num_frames,
+                                                        frame_rate=frame_rate,
+                                                    )
+                                                    strength = float(check_msg.get("strength", 0.3))
+                                                    strength = max(0.0, min(1.0, strength))
+                                                    audio_queue.append((latent, strength))
+                                                    await websocket.send_json({
+                                                        "type": "audio_set",
+                                                        "success": True,
+                                                        "strength": strength,
+                                                        "queue_length": len(audio_queue)
+                                                    })
+                                                    print(f"   WebSocket: Audio queued (mid-segment) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                                except Exception as e:
+                                                    print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
+                                                    await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
+                                        elif check_msg.get("action") == "clear_audio":
+                                            audio_queue.clear()
+                                            audio_latent = None
+                                            await websocket.send_json({"type": "audio_cleared"})
                                         elif check_msg.get("action") == "reset_history":
                                             # Clear the model's conditioning state - next segment will be generated fresh
                                             engine._streaming_last_latent = None
@@ -2852,7 +3092,7 @@ class OfficialLTX2Engine:
                                             await websocket.send_json({"type": "history_reset"})
                                             print(f"   WebSocket: History reset (mid-segment) - next segment will start fresh", flush=True)
                                         elif check_msg.get("action") == "set_next_segment":
-                                            # Combined action to set prompt and/or target image
+                                            # Combined action to set prompt, target image, and/or audio
                                             response = {"type": "next_segment_set"}
                                             if "prompt" in check_msg:
                                                 current_prompt = check_msg.get("prompt")
@@ -2862,17 +3102,35 @@ class OfficialLTX2Engine:
                                                 image_data = check_msg.get("target_image")
                                                 if image_data:
                                                     try:
-                                                        target_image_latent = engine.encode_target_image(image_data, height, width)
+                                                        latent = engine.encode_target_image(image_data, height, width)
+                                                        position = float(check_msg.get("position", 1.0))
+                                                        position = max(0.0, min(1.0, position))
+                                                        target_image_queue.append((latent, position))
                                                         response["target_image_set"] = True
-                                                        print(f"   WebSocket: Next segment target image set (mid-segment)", flush=True)
+                                                        response["target_image_queue_length"] = len(target_image_queue)
+                                                        print(f"   WebSocket: Next segment target image queued (mid-segment) (queue: {len(target_image_queue)})", flush=True)
                                                     except Exception as e:
                                                         response["target_image_set"] = False
                                                         response["target_image_error"] = str(e)
-                                            # Update target frame position if provided
-                                            if "position" in check_msg:
-                                                target_frame_position = float(check_msg.get("position", 1.0))
-                                                target_frame_position = max(0.0, min(1.0, target_frame_position))
-                                                response["position"] = target_frame_position
+                                            # Add audio for next segment
+                                            if "audio" in check_msg:
+                                                audio_data = check_msg.get("audio")
+                                                if audio_data:
+                                                    try:
+                                                        latent = engine.encode_audio_for_streaming(
+                                                            audio_b64=audio_data,
+                                                            num_frames=num_frames,
+                                                            frame_rate=frame_rate,
+                                                        )
+                                                        strength = float(check_msg.get("audio_strength", 0.3))
+                                                        strength = max(0.0, min(1.0, strength))
+                                                        audio_queue.append((latent, strength))
+                                                        response["audio_set"] = True
+                                                        response["audio_queue_length"] = len(audio_queue)
+                                                        print(f"   WebSocket: Next segment audio queued (mid-segment) (queue: {len(audio_queue)})", flush=True)
+                                                    except Exception as e:
+                                                        response["audio_set"] = False
+                                                        response["audio_error"] = str(e)
                                             await websocket.send_json(response)
                                     except asyncio.TimeoutError:
                                         pass

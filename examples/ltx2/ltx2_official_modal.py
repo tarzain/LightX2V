@@ -560,6 +560,95 @@ class OfficialLTX2Engine:
         # Use existing _encode_audio method
         return self._encode_audio(audio_path, target_duration)
 
+    def encode_audio_chunks_for_streaming(
+        self,
+        audio_b64: str,
+        num_frames: int,
+        frame_rate: float,
+    ) -> list:
+        """
+        Encode audio from base64, automatically splitting into segment-sized chunks.
+
+        If the audio is longer than one segment, it will be split into multiple
+        chunks and each chunk encoded separately. This allows clients to send
+        longer audio (e.g., music, speech) and have it automatically queued
+        for multiple upcoming segments.
+
+        Args:
+            audio_b64: Base64-encoded audio data (any format torchaudio supports)
+            num_frames: Number of frames per segment
+            frame_rate: Frame rate of the video
+
+        Returns:
+            List of audio latent tensors, one per segment chunk
+        """
+        import base64
+        import tempfile
+        import torch
+        import torchaudio
+
+        # Calculate segment duration
+        segment_duration = num_frames / frame_rate
+
+        # Decode and load audio
+        audio_data = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_data)
+            audio_path = tmp.name
+
+        # Load audio to get duration
+        waveform, sr = torchaudio.load(audio_path)
+        audio_duration = waveform.shape[1] / sr
+
+        print(f"   Audio chunking: {audio_duration:.2f}s audio, {segment_duration:.2f}s per segment", flush=True)
+
+        # If audio fits in one segment, just encode it directly
+        if audio_duration <= segment_duration * 1.1:  # 10% tolerance
+            latent = self._encode_audio(audio_path, segment_duration)
+            return [latent]
+
+        # Split into chunks
+        latents = []
+        num_chunks = int(audio_duration / segment_duration) + (1 if audio_duration % segment_duration > 0.1 else 0)
+
+        # Audio parameters for chunking
+        sample_rate = 16000  # Target sample rate for encoder
+        if sr != sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, sample_rate)
+            waveform = resampler(waveform)
+
+        # Ensure stereo
+        if waveform.shape[0] == 1:
+            waveform = waveform.repeat(2, 1)
+        elif waveform.shape[0] > 2:
+            waveform = waveform[:2]
+
+        samples_per_chunk = int(segment_duration * sample_rate)
+        total_samples = waveform.shape[1]
+
+        for i in range(num_chunks):
+            start_sample = i * samples_per_chunk
+            end_sample = min(start_sample + samples_per_chunk, total_samples)
+
+            # Extract chunk
+            chunk_waveform = waveform[:, start_sample:end_sample]
+
+            # Pad if needed (last chunk might be shorter)
+            if chunk_waveform.shape[1] < samples_per_chunk:
+                padding = torch.zeros(2, samples_per_chunk - chunk_waveform.shape[1])
+                chunk_waveform = torch.cat([chunk_waveform, padding], dim=1)
+
+            # Save chunk to temp file and encode
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                torchaudio.save(tmp.name, chunk_waveform, sample_rate)
+                chunk_path = tmp.name
+
+            latent = self._encode_audio(chunk_path, segment_duration)
+            latents.append(latent)
+            print(f"   Audio chunk {i+1}/{num_chunks} encoded", flush=True)
+
+        return latents
+
     def _warmup(self):
         """Run a single warmup to ensure CUDA kernels are ready."""
         import torch
@@ -2694,29 +2783,33 @@ class OfficialLTX2Engine:
 
                         elif msg.get("action") == "set_audio":
                             # Encode audio for conditioning (queued for upcoming segments)
+                            # Automatically splits longer audio into segment-sized chunks
                             audio_data = msg.get("audio")
                             if audio_data:
                                 try:
                                     # Get segment parameters for duration calculation
-                                    num_frames = msg.get("num_frames", 49)
-                                    frame_rate = msg.get("frame_rate", 30.0)
+                                    seg_num_frames = msg.get("num_frames", 49)
+                                    seg_frame_rate = msg.get("frame_rate", 30.0)
                                     strength = float(msg.get("strength", 0.3))
                                     strength = max(0.0, min(1.0, strength))
 
-                                    latent = engine.encode_audio_for_streaming(
+                                    # Encode and auto-chunk if needed
+                                    latents = engine.encode_audio_chunks_for_streaming(
                                         audio_b64=audio_data,
-                                        num_frames=num_frames,
-                                        frame_rate=frame_rate,
+                                        num_frames=seg_num_frames,
+                                        frame_rate=seg_frame_rate,
                                     )
-                                    # Add to queue for upcoming segments
-                                    audio_queue.append((latent, strength))
+                                    # Add all chunks to queue
+                                    for latent in latents:
+                                        audio_queue.append((latent, strength))
                                     await websocket.send_json({
                                         "type": "audio_set",
                                         "success": True,
                                         "strength": strength,
+                                        "chunks_added": len(latents),
                                         "queue_length": len(audio_queue)
                                     })
-                                    print(f"   WebSocket: Audio queued with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                    print(f"   WebSocket: Audio queued ({len(latents)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
                                 except Exception as e:
                                     print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                                     await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
@@ -2759,7 +2852,7 @@ class OfficialLTX2Engine:
                                 target_frame_position = float(msg.get("position", 1.0))
                                 target_frame_position = max(0.0, min(1.0, target_frame_position))
                                 response["position"] = target_frame_position
-                            # Add audio for next segment
+                            # Add audio for next segment(s) - auto-chunks longer audio
                             if "audio" in msg:
                                 audio_data = msg.get("audio")
                                 if audio_data:
@@ -2767,17 +2860,19 @@ class OfficialLTX2Engine:
                                         # Get segment parameters
                                         seg_frames = msg.get("num_frames", 49)
                                         seg_fps = msg.get("frame_rate", 30.0)
-                                        latent = engine.encode_audio_for_streaming(
+                                        strength = float(msg.get("audio_strength", 0.3))
+                                        strength = max(0.0, min(1.0, strength))
+                                        latents = engine.encode_audio_chunks_for_streaming(
                                             audio_b64=audio_data,
                                             num_frames=seg_frames,
                                             frame_rate=seg_fps,
                                         )
-                                        strength = float(msg.get("audio_strength", 0.3))
-                                        strength = max(0.0, min(1.0, strength))
-                                        audio_queue.append((latent, strength))
+                                        for latent in latents:
+                                            audio_queue.append((latent, strength))
                                         response["audio_set"] = True
+                                        response["audio_chunks_added"] = len(latents)
                                         response["audio_queue_length"] = len(audio_queue)
-                                        print(f"   WebSocket: Next segment audio queued (queue: {len(audio_queue)})", flush=True)
+                                        print(f"   WebSocket: Next segment audio queued ({len(latents)} chunks) (queue: {len(audio_queue)})", flush=True)
                                     except Exception as e:
                                         response["audio_set"] = False
                                         response["audio_error"] = str(e)
@@ -2864,21 +2959,23 @@ class OfficialLTX2Engine:
                                         audio_data = check_msg.get("audio")
                                         if audio_data:
                                             try:
-                                                latent = engine.encode_audio_for_streaming(
+                                                strength = float(check_msg.get("strength", 0.3))
+                                                strength = max(0.0, min(1.0, strength))
+                                                latents = engine.encode_audio_chunks_for_streaming(
                                                     audio_b64=audio_data,
                                                     num_frames=num_frames,
                                                     frame_rate=frame_rate,
                                                 )
-                                                strength = float(check_msg.get("strength", 0.3))
-                                                strength = max(0.0, min(1.0, strength))
-                                                audio_queue.append((latent, strength))
+                                                for latent in latents:
+                                                    audio_queue.append((latent, strength))
                                                 await websocket.send_json({
                                                     "type": "audio_set",
                                                     "success": True,
                                                     "strength": strength,
+                                                    "chunks_added": len(latents),
                                                     "queue_length": len(audio_queue)
                                                 })
-                                                print(f"   WebSocket: Audio queued (pre-segment) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                                print(f"   WebSocket: Audio queued (pre-segment) ({len(latents)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
                                             except Exception as e:
                                                 print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                                                 await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
@@ -2913,22 +3010,24 @@ class OfficialLTX2Engine:
                                                 except Exception as e:
                                                     response["target_image_set"] = False
                                                     response["target_image_error"] = str(e)
-                                        # Add audio for next segment
+                                        # Add audio for next segment(s) - auto-chunks longer audio
                                         if "audio" in check_msg:
                                             audio_data = check_msg.get("audio")
                                             if audio_data:
                                                 try:
-                                                    latent = engine.encode_audio_for_streaming(
+                                                    strength = float(check_msg.get("audio_strength", 0.3))
+                                                    strength = max(0.0, min(1.0, strength))
+                                                    latents = engine.encode_audio_chunks_for_streaming(
                                                         audio_b64=audio_data,
                                                         num_frames=num_frames,
                                                         frame_rate=frame_rate,
                                                     )
-                                                    strength = float(check_msg.get("audio_strength", 0.3))
-                                                    strength = max(0.0, min(1.0, strength))
-                                                    audio_queue.append((latent, strength))
+                                                    for latent in latents:
+                                                        audio_queue.append((latent, strength))
                                                     response["audio_set"] = True
+                                                    response["audio_chunks_added"] = len(latents)
                                                     response["audio_queue_length"] = len(audio_queue)
-                                                    print(f"   WebSocket: Next segment audio queued (pre-segment) (queue: {len(audio_queue)})", flush=True)
+                                                    print(f"   WebSocket: Next segment audio queued (pre-segment) ({len(latents)} chunks) (queue: {len(audio_queue)})", flush=True)
                                                 except Exception as e:
                                                     response["audio_set"] = False
                                                     response["audio_error"] = str(e)
@@ -3063,21 +3162,23 @@ class OfficialLTX2Engine:
                                             audio_data = check_msg.get("audio")
                                             if audio_data:
                                                 try:
-                                                    latent = engine.encode_audio_for_streaming(
+                                                    strength = float(check_msg.get("strength", 0.3))
+                                                    strength = max(0.0, min(1.0, strength))
+                                                    latents = engine.encode_audio_chunks_for_streaming(
                                                         audio_b64=audio_data,
                                                         num_frames=num_frames,
                                                         frame_rate=frame_rate,
                                                     )
-                                                    strength = float(check_msg.get("strength", 0.3))
-                                                    strength = max(0.0, min(1.0, strength))
-                                                    audio_queue.append((latent, strength))
+                                                    for latent in latents:
+                                                        audio_queue.append((latent, strength))
                                                     await websocket.send_json({
                                                         "type": "audio_set",
                                                         "success": True,
                                                         "strength": strength,
+                                                        "chunks_added": len(latents),
                                                         "queue_length": len(audio_queue)
                                                     })
-                                                    print(f"   WebSocket: Audio queued (mid-segment) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                                    print(f"   WebSocket: Audio queued (mid-segment) ({len(latents)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
                                                 except Exception as e:
                                                     print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                                                     await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
@@ -3112,22 +3213,24 @@ class OfficialLTX2Engine:
                                                     except Exception as e:
                                                         response["target_image_set"] = False
                                                         response["target_image_error"] = str(e)
-                                            # Add audio for next segment
+                                            # Add audio for next segment(s) - auto-chunks longer audio
                                             if "audio" in check_msg:
                                                 audio_data = check_msg.get("audio")
                                                 if audio_data:
                                                     try:
-                                                        latent = engine.encode_audio_for_streaming(
+                                                        strength = float(check_msg.get("audio_strength", 0.3))
+                                                        strength = max(0.0, min(1.0, strength))
+                                                        latents = engine.encode_audio_chunks_for_streaming(
                                                             audio_b64=audio_data,
                                                             num_frames=num_frames,
                                                             frame_rate=frame_rate,
                                                         )
-                                                        strength = float(check_msg.get("audio_strength", 0.3))
-                                                        strength = max(0.0, min(1.0, strength))
-                                                        audio_queue.append((latent, strength))
+                                                        for latent in latents:
+                                                            audio_queue.append((latent, strength))
                                                         response["audio_set"] = True
+                                                        response["audio_chunks_added"] = len(latents)
                                                         response["audio_queue_length"] = len(audio_queue)
-                                                        print(f"   WebSocket: Next segment audio queued (mid-segment) (queue: {len(audio_queue)})", flush=True)
+                                                        print(f"   WebSocket: Next segment audio queued (mid-segment) ({len(latents)} chunks) (queue: {len(audio_queue)})", flush=True)
                                                     except Exception as e:
                                                         response["audio_set"] = False
                                                         response["audio_error"] = str(e)

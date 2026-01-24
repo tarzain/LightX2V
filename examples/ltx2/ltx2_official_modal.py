@@ -460,28 +460,30 @@ class OfficialLTX2Engine:
         """
         print("   Audio conditioning: Using direct injection method")
     
-    def _encode_audio(self, audio_path: str, target_duration_seconds: float):
+    def _encode_audio(self, audio_path: str, target_duration_seconds: float, return_waveform: bool = False):
         """
         Load and encode audio to latent representation.
-        
+
         Args:
             audio_path: Path to audio file (WAV, MP3, etc.)
             target_duration_seconds: Target duration in seconds
-            
+            return_waveform: If True, also return the waveform at 24kHz for pass-through
+
         Returns:
-            Audio latent tensor for conditioning
+            Audio latent tensor for conditioning (and optionally waveform at 24kHz)
         """
         import torch
         import torchaudio
         from ltx_core.model.audio_vae.ops import AudioProcessor
         from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
-        
+
         # Audio encoder parameters (from AudioEncoderConfigurator defaults)
         sample_rate = 16000
         mel_hop_length = 160
         n_fft = 1024
         mel_bins = 64
-        
+        output_sample_rate = 24000  # Vocoder output rate
+
         # Create audio processor
         audio_processor = AudioProcessor(
             sample_rate=sample_rate,
@@ -489,10 +491,10 @@ class OfficialLTX2Engine:
             mel_hop_length=mel_hop_length,
             n_fft=n_fft,
         ).to(self.pipeline.device)
-        
+
         # Load audio
         waveform, sr = torchaudio.load(audio_path)
-        
+
         # AudioEncoder expects stereo (2 channels)
         if waveform.shape[0] == 1:
             # Duplicate mono to stereo
@@ -500,12 +502,28 @@ class OfficialLTX2Engine:
         elif waveform.shape[0] > 2:
             # Take first 2 channels if more than stereo
             waveform = waveform[:2]
-        
-        # Resample if needed
+
+        # Store original waveform resampled to output rate (24kHz) for pass-through
+        waveform_24k = None
+        if return_waveform:
+            if sr != output_sample_rate:
+                resampler_24k = torchaudio.transforms.Resample(sr, output_sample_rate)
+                waveform_24k = resampler_24k(waveform)
+            else:
+                waveform_24k = waveform.clone()
+            # Trim/pad to target duration at 24kHz
+            target_samples_24k = int(target_duration_seconds * output_sample_rate)
+            if waveform_24k.shape[1] > target_samples_24k:
+                waveform_24k = waveform_24k[:, :target_samples_24k]
+            elif waveform_24k.shape[1] < target_samples_24k:
+                padding = torch.zeros(2, target_samples_24k - waveform_24k.shape[1])
+                waveform_24k = torch.cat([waveform_24k, padding], dim=1)
+
+        # Resample to encoder rate (16kHz) if needed
         if sr != sample_rate:
             resampler = torchaudio.transforms.Resample(sr, sample_rate)
             waveform = resampler(waveform)
-        
+
         # Trim or pad to target duration
         target_samples = int(target_duration_seconds * sample_rate)
         num_channels = waveform.shape[0]  # Should be 2 (stereo)
@@ -514,18 +532,21 @@ class OfficialLTX2Engine:
         elif waveform.shape[1] < target_samples:
             padding = torch.zeros(num_channels, target_samples - waveform.shape[1])
             waveform = torch.cat([waveform, padding], dim=1)
-        
+
         # Add batch dimension: [1, channels, samples]
         waveform = waveform.unsqueeze(0).to(self.pipeline.device, dtype=torch.float32)
-        
+
         # Convert to mel spectrogram
         mel = audio_processor.waveform_to_mel(waveform, sample_rate)
-        
+
         # Encode to latent
         with torch.no_grad():
             audio_latent = self._audio_encoder(mel.to(self.pipeline.dtype))
 
         print(f"   Audio encoded: {audio_path} -> latent shape {audio_latent.shape}")
+
+        if return_waveform:
+            return audio_latent, waveform_24k
         return audio_latent
 
     def encode_audio_for_streaming(
@@ -580,7 +601,8 @@ class OfficialLTX2Engine:
             frame_rate: Frame rate of the video
 
         Returns:
-            List of audio latent tensors, one per segment chunk
+            List of (latent, waveform_24k) tuples, one per segment chunk.
+            waveform_24k is at 24kHz for direct pass-through output.
         """
         import base64
         import tempfile
@@ -602,52 +624,109 @@ class OfficialLTX2Engine:
 
         print(f"   Audio chunking: {audio_duration:.2f}s audio, {segment_duration:.2f}s per segment", flush=True)
 
-        # If audio fits in one segment, just encode it directly
+        # If audio fits in one segment, just encode it directly (with waveform for pass-through)
         if audio_duration <= segment_duration * 1.1:  # 10% tolerance
-            latent = self._encode_audio(audio_path, segment_duration)
-            return [latent]
+            latent, waveform_24k = self._encode_audio(audio_path, segment_duration, return_waveform=True)
+            return [(latent, waveform_24k)]
 
-        # Split into chunks
-        latents = []
-        num_chunks = int(audio_duration / segment_duration) + (1 if audio_duration % segment_duration > 0.1 else 0)
+        # Split into chunks WITH OVERLAP to match video segment overlap
+        # The overlap ensures that when the output audio is trimmed (to match video overlap),
+        # we don't lose any of the original audio
+        results = []  # List of (latent, waveform_24k) tuples
 
         # Audio parameters for chunking
         sample_rate = 16000  # Target sample rate for encoder
+        output_sample_rate = 24000  # Vocoder output rate for pass-through
+
+        # Resample to both rates
         if sr != sample_rate:
             resampler = torchaudio.transforms.Resample(sr, sample_rate)
-            waveform = resampler(waveform)
+            waveform_16k = resampler(waveform)
+        else:
+            waveform_16k = waveform
 
-        # Ensure stereo
-        if waveform.shape[0] == 1:
-            waveform = waveform.repeat(2, 1)
-        elif waveform.shape[0] > 2:
-            waveform = waveform[:2]
+        if sr != output_sample_rate:
+            resampler_24k = torchaudio.transforms.Resample(sr, output_sample_rate)
+            waveform_24k_full = resampler_24k(waveform)
+        else:
+            waveform_24k_full = waveform.clone()
 
-        samples_per_chunk = int(segment_duration * sample_rate)
-        total_samples = waveform.shape[1]
+        # Ensure stereo for both
+        for wav in [waveform_16k, waveform_24k_full]:
+            if wav.shape[0] == 1:
+                wav = wav.repeat(2, 1)
+            elif wav.shape[0] > 2:
+                wav = wav[:2]
+
+        # Re-assign after ensuring stereo
+        if waveform_16k.shape[0] == 1:
+            waveform_16k = waveform_16k.repeat(2, 1)
+        elif waveform_16k.shape[0] > 2:
+            waveform_16k = waveform_16k[:2]
+
+        if waveform_24k_full.shape[0] == 1:
+            waveform_24k_full = waveform_24k_full.repeat(2, 1)
+        elif waveform_24k_full.shape[0] > 2:
+            waveform_24k_full = waveform_24k_full[:2]
+
+        samples_per_chunk_16k = int(segment_duration * sample_rate)
+        samples_per_chunk_24k = int(segment_duration * output_sample_rate)
+        total_samples_16k = waveform_16k.shape[1]
+
+        # Calculate overlap in samples (same ratio as video: 16 frames out of 49)
+        # This matches the overlap_frames = 16 used in generate_streaming
+        overlap_frames = 16
+        overlap_ratio = overlap_frames / num_frames
+        overlap_samples_16k = int(samples_per_chunk_16k * overlap_ratio)
+        overlap_samples_24k = int(samples_per_chunk_24k * overlap_ratio)
+
+        # Calculate how many chunks we need, accounting for overlap
+        # Each chunk after the first starts overlap_samples earlier
+        effective_chunk_advance_16k = samples_per_chunk_16k - overlap_samples_16k
+        effective_chunk_advance_24k = samples_per_chunk_24k - overlap_samples_24k
+        num_chunks = 1 + max(0, int((total_samples_16k - samples_per_chunk_16k) / effective_chunk_advance_16k) + 1)
+
+        print(f"   Audio chunking: {num_chunks} chunks with overlap (16k: {overlap_samples_16k}, 24k: {overlap_samples_24k} samples)", flush=True)
 
         for i in range(num_chunks):
-            start_sample = i * samples_per_chunk
-            end_sample = min(start_sample + samples_per_chunk, total_samples)
+            if i == 0:
+                start_sample_16k = 0
+                start_sample_24k = 0
+            else:
+                # Start earlier to include overlap (this part will be trimmed at output)
+                start_sample_16k = i * effective_chunk_advance_16k
+                start_sample_24k = i * effective_chunk_advance_24k
 
-            # Extract chunk
-            chunk_waveform = waveform[:, start_sample:end_sample]
+            end_sample_16k = min(start_sample_16k + samples_per_chunk_16k, waveform_16k.shape[1])
+            end_sample_24k = min(start_sample_24k + samples_per_chunk_24k, waveform_24k_full.shape[1])
+
+            # Don't create chunks that are too short
+            if end_sample_16k - start_sample_16k < samples_per_chunk_16k * 0.5:
+                break
+
+            # Extract chunks at both sample rates
+            chunk_waveform_16k = waveform_16k[:, start_sample_16k:end_sample_16k]
+            chunk_waveform_24k = waveform_24k_full[:, start_sample_24k:end_sample_24k]
 
             # Pad if needed (last chunk might be shorter)
-            if chunk_waveform.shape[1] < samples_per_chunk:
-                padding = torch.zeros(2, samples_per_chunk - chunk_waveform.shape[1])
-                chunk_waveform = torch.cat([chunk_waveform, padding], dim=1)
+            if chunk_waveform_16k.shape[1] < samples_per_chunk_16k:
+                padding = torch.zeros(2, samples_per_chunk_16k - chunk_waveform_16k.shape[1])
+                chunk_waveform_16k = torch.cat([chunk_waveform_16k, padding], dim=1)
+
+            if chunk_waveform_24k.shape[1] < samples_per_chunk_24k:
+                padding = torch.zeros(2, samples_per_chunk_24k - chunk_waveform_24k.shape[1])
+                chunk_waveform_24k = torch.cat([chunk_waveform_24k, padding], dim=1)
 
             # Save chunk to temp file and encode
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                torchaudio.save(tmp.name, chunk_waveform, sample_rate)
+                torchaudio.save(tmp.name, chunk_waveform_16k, sample_rate)
                 chunk_path = tmp.name
 
             latent = self._encode_audio(chunk_path, segment_duration)
-            latents.append(latent)
-            print(f"   Audio chunk {i+1}/{num_chunks} encoded", flush=True)
+            results.append((latent, chunk_waveform_24k))
+            print(f"   Audio chunk {i+1}/{num_chunks} encoded (16k samples {start_sample_16k}-{end_sample_16k})", flush=True)
 
-        return latents
+        return results
 
     def _warmup(self):
         """Run a single warmup to ensure CUDA kernels are ready."""
@@ -2071,6 +2150,7 @@ class OfficialLTX2Engine:
         target_frame_position: float = 1.0,
         audio_latent: "torch.Tensor | None" = None,
         audio_conditioning_strength: float = 0.3,
+        original_audio_waveform: "torch.Tensor | None" = None,
     ):
         """
         Generator that yields frames for real-time streaming.
@@ -2082,6 +2162,7 @@ class OfficialLTX2Engine:
             target_frame_position: Position for target frame (0.0=start, 0.5=middle, 1.0=end).
             audio_latent: Optional audio latent for audio-to-video conditioning.
             audio_conditioning_strength: Strength of audio conditioning (0.0-1.0).
+            original_audio_waveform: Original audio waveform at 24kHz for pass-through output.
 
         Yields:
             dict with either:
@@ -2241,37 +2322,30 @@ class OfficialLTX2Engine:
                 else:
                     audio_initial_latent = audio_latent
 
-                # Use provided conditioning strength
+                # Use the provided conditioning strength (controlled by UI slider)
+                # If original_audio_waveform is provided, we'll use it for output (pass-through)
+                # but the noise_scale still affects how the latent participates in denoising
                 audio_noise_scale = audio_conditioning_strength
-                print(f"   Streaming: Audio conditioning strength: {audio_noise_scale}", flush=True)
-
-            elif not is_first_segment:
-                has_audio_latent = hasattr(self, '_streaming_last_audio_latent') and self._streaming_last_audio_latent is not None
-                if has_audio_latent:
-                    # Use stored audio latent for conditioning
-                    # Audio latent shape is [B, C, T, H]
-                    prev_audio = self._streaming_last_audio_latent
-                    print(f"   Streaming: Using previous audio latent for conditioning, shape: {prev_audio.shape}", flush=True)
-
-                    # Resize previous audio latent to match expected frames if needed
-                    actual_frames = prev_audio.shape[2]
-                    if actual_frames != expected_frames:
-                        B, C, T, H = prev_audio.shape
-                        audio_flat = prev_audio.reshape(B * C, 1, T, H)
-                        audio_resized = torch.nn.functional.interpolate(
-                            audio_flat, size=(expected_frames, H), mode='bilinear', align_corners=False
-                        )
-                        audio_initial_latent = audio_resized.reshape(B, C, expected_frames, H)
-                    else:
-                        audio_initial_latent = prev_audio
-
-                    # Use lower noise scale to preserve more of the audio conditioning
-                    audio_noise_scale = 0.7  # Preserve ~30% of previous audio characteristics
+                if original_audio_waveform is not None:
+                    print(f"   Streaming: Audio with pass-through output, noise_scale={audio_noise_scale}", flush=True)
+                else:
+                    print(f"   Streaming: Audio conditioning strength: {audio_noise_scale}", flush=True)
 
             if is_first_segment:
                 # Clear previous audio latent when starting fresh
                 self._streaming_last_audio_latent = None
 
+            # Track if we need to apply audio continuity blending after denoising
+            apply_audio_continuity = False
+            prev_audio_overlap = None
+            if not is_first_segment and audio_latent is None:
+                has_prev_audio = hasattr(self, '_streaming_last_audio_latent') and self._streaming_last_audio_latent is not None
+                if has_prev_audio:
+                    prev_audio_overlap = self._streaming_last_audio_latent
+                    apply_audio_continuity = True
+                    print(f"   Streaming: Will apply audio continuity blending after denoising, overlap shape: {prev_audio_overlap.shape}", flush=True)
+
+            # Create the noised audio state (always start fresh for now)
             audio_state, audio_tools = noise_audio_state(
                 output_shape=output_shape,
                 noiser=noiser,
@@ -2293,6 +2367,19 @@ class OfficialLTX2Engine:
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
 
+            # Apply audio continuity (keyframe-style conditioning)
+            # Directly inject the previous segment's overlap at frame 0, like video keyframe conditioning
+            # The overlap portion is trimmed from output, so no blending needed
+            if apply_audio_continuity and prev_audio_overlap is not None:
+                overlap_frame_count = prev_audio_overlap.shape[2]
+                total_audio_frames = audio_state.latent.shape[2]
+                if overlap_frame_count <= total_audio_frames:
+                    # Direct replacement at frame 0 (same as video keyframe conditioning)
+                    audio_state.latent[:, :, :overlap_frame_count, :] = prev_audio_overlap
+                    print(f"   Streaming: Injected {overlap_frame_count} audio frames at position 0", flush=True)
+                else:
+                    print(f"   Streaming: Warning - overlap ({overlap_frame_count}) > total frames ({total_audio_frames}), skipping", flush=True)
+
             # Store LAST latent frames for next segment conditioning
             # Temporal compression is ~8x, so overlap_frames=16 -> 2 latent frames
             # More overlap frames = better continuity but more redundant frames to skip
@@ -2302,9 +2389,13 @@ class OfficialLTX2Engine:
             self._streaming_overlap_frames = overlap_frames  # Store for frame skipping
             print(f"   Streaming: Stored last {latent_overlap} latent frame(s) ({overlap_frames} video frames) for conditioning, shape: {self._streaming_last_latent.shape}", flush=True)
 
-            # Store audio latent for next segment conditioning (audio continuity)
-            self._streaming_last_audio_latent = audio_state.latent.clone()
-            print(f"   Streaming: Stored audio latent for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
+            # Store audio latent overlap for next segment conditioning (audio continuity)
+            # Audio latent shape is [B, C, T, H] - store last N frames matching video overlap ratio
+            audio_latent_frames = audio_state.latent.shape[2]
+            # Use same overlap ratio as video (overlap_frames / segment_frames)
+            audio_overlap_frames = max(1, int(audio_latent_frames * overlap_frames / segment_frames))
+            self._streaming_last_audio_latent = audio_state.latent[:, :, -audio_overlap_frames:, :].clone()
+            print(f"   Streaming: Stored last {audio_overlap_frames}/{audio_latent_frames} audio latent frames for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
 
             # Determine latent for decode
             if use_second_stage:
@@ -2359,24 +2450,36 @@ class OfficialLTX2Engine:
 
                 video_latent_for_decode = video_state_2.latent
                 final_audio_state = audio_state_2
-                # Update stored audio latent with refined stage 2 audio
-                self._streaming_last_audio_latent = audio_state_2.latent.clone()
+                # Update stored audio latent overlap with refined stage 2 audio
+                audio_latent_frames_2 = audio_state_2.latent.shape[2]
+                audio_overlap_frames_2 = max(1, int(audio_latent_frames_2 * overlap_frames / segment_frames))
+                self._streaming_last_audio_latent = audio_state_2.latent[:, :, -audio_overlap_frames_2:, :].clone()
             else:
                 video_latent_for_decode = video_state.latent
                 final_audio_state = audio_state
 
-            # Decode audio
-            print(f"   Streaming: Decoding audio...", flush=True)
-            audio_waveform = vae_decode_audio(
-                latent=final_audio_state.latent[:1],
-                audio_decoder=self._audio_decoder,
-                vocoder=self._vocoder,
-            )
-            audio_np = audio_waveform.cpu().numpy()
-            audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+            # Get audio output - either pass-through original or decode from latent
+            audio_sample_rate = 24000  # Output rate (vocoder or pass-through)
+
+            if original_audio_waveform is not None:
+                # Pass-through mode: use original waveform directly (no VAE round-trip)
+                print(f"   Streaming: Using original audio waveform (pass-through)", flush=True)
+                # original_audio_waveform is [2, samples] at 24kHz
+                audio_np = original_audio_waveform.cpu().numpy()
+                # Normalize to int16 range
+                audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+            else:
+                # Traditional mode: decode audio from latent
+                print(f"   Streaming: Decoding audio...", flush=True)
+                audio_waveform = vae_decode_audio(
+                    latent=final_audio_state.latent[:1],
+                    audio_decoder=self._audio_decoder,
+                    vocoder=self._vocoder,
+                )
+                audio_np = audio_waveform.cpu().numpy()
+                audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
 
             # Trim audio to match skipped video frames (for non-first segments)
-            audio_sample_rate = 24000  # Vocoder output rate
             if not is_first_segment and overlap_frames > 0:
                 # Calculate samples to skip based on overlap frames and frame rate
                 overlap_duration = overlap_frames / frame_rate  # seconds
@@ -2718,12 +2821,13 @@ class OfficialLTX2Engine:
             segment_count = 0
             # Queues for conditioning - items are consumed in order per segment
             target_image_queue = []  # List of (latent, position) tuples
-            audio_queue = []  # List of (latent, strength) tuples
+            audio_queue = []  # List of (latent, strength, waveform_24k) tuples for pass-through
             # Legacy single-item support (for backwards compatibility)
             target_image_latent = None  # For target-frame conditioning
             target_frame_position = 1.0  # Default: end of segment (0.0=start, 0.5=middle, 1.0=end)
             audio_latent = None  # For audio conditioning
             audio_conditioning_strength = 0.3  # Default strength
+            original_audio_waveform = None  # For audio pass-through (24kHz)
             reset_next_segment = False  # Flag to treat next segment as first (history reset)
 
             try:
@@ -2793,23 +2897,23 @@ class OfficialLTX2Engine:
                                     strength = float(msg.get("strength", 0.3))
                                     strength = max(0.0, min(1.0, strength))
 
-                                    # Encode and auto-chunk if needed
-                                    latents = engine.encode_audio_chunks_for_streaming(
+                                    # Encode and auto-chunk if needed (returns list of (latent, waveform) tuples)
+                                    chunks = engine.encode_audio_chunks_for_streaming(
                                         audio_b64=audio_data,
                                         num_frames=seg_num_frames,
                                         frame_rate=seg_frame_rate,
                                     )
-                                    # Add all chunks to queue
-                                    for latent in latents:
-                                        audio_queue.append((latent, strength))
+                                    # Add all chunks to queue with waveform for pass-through
+                                    for latent, waveform in chunks:
+                                        audio_queue.append((latent, strength, waveform))
                                     await websocket.send_json({
                                         "type": "audio_set",
                                         "success": True,
                                         "strength": strength,
-                                        "chunks_added": len(latents),
+                                        "chunks_added": len(chunks),
                                         "queue_length": len(audio_queue)
                                     })
-                                    print(f"   WebSocket: Audio queued ({len(latents)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                    print(f"   WebSocket: Audio queued ({len(chunks)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
                                 except Exception as e:
                                     print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                                     await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
@@ -2862,17 +2966,17 @@ class OfficialLTX2Engine:
                                         seg_fps = msg.get("frame_rate", 30.0)
                                         strength = float(msg.get("audio_strength", 0.3))
                                         strength = max(0.0, min(1.0, strength))
-                                        latents = engine.encode_audio_chunks_for_streaming(
+                                        chunks = engine.encode_audio_chunks_for_streaming(
                                             audio_b64=audio_data,
                                             num_frames=seg_frames,
                                             frame_rate=seg_fps,
                                         )
-                                        for latent in latents:
-                                            audio_queue.append((latent, strength))
+                                        for latent, waveform in chunks:
+                                            audio_queue.append((latent, strength, waveform))
                                         response["audio_set"] = True
-                                        response["audio_chunks_added"] = len(latents)
+                                        response["audio_chunks_added"] = len(chunks)
                                         response["audio_queue_length"] = len(audio_queue)
-                                        print(f"   WebSocket: Next segment audio queued ({len(latents)} chunks) (queue: {len(audio_queue)})", flush=True)
+                                        print(f"   WebSocket: Next segment audio queued ({len(chunks)} chunks) (queue: {len(audio_queue)})", flush=True)
                                     except Exception as e:
                                         response["audio_set"] = False
                                         response["audio_error"] = str(e)
@@ -2912,6 +3016,26 @@ class OfficialLTX2Engine:
                                 except Exception as e:
                                     started_response["end_image_error"] = str(e)
                                     print(f"   WebSocket: Failed to encode end image: {e}", flush=True)
+
+                            # Handle start_audio - encode and queue for first segment(s)
+                            if msg.get("start_audio"):
+                                try:
+                                    audio_data = msg["start_audio"]
+                                    audio_strength = float(msg.get("audio_strength", 0.3))
+                                    # Use auto-chunking to split long audio into segment-sized chunks
+                                    chunks = engine.encode_audio_chunks_for_streaming(
+                                        audio_b64=audio_data,
+                                        num_frames=num_frames,
+                                        frame_rate=frame_rate,
+                                    )
+                                    for latent, waveform in chunks:
+                                        audio_queue.append((latent, audio_strength, waveform))
+                                    started_response["start_audio_set"] = True
+                                    started_response["audio_chunks"] = len(chunks)
+                                    print(f"   WebSocket: Start audio encoded ({len(chunks)} chunks) for first segment(s)", flush=True)
+                                except Exception as e:
+                                    started_response["start_audio_error"] = str(e)
+                                    print(f"   WebSocket: Failed to encode start audio: {e}", flush=True)
 
                             await websocket.send_json(started_response)
 
@@ -2961,21 +3085,21 @@ class OfficialLTX2Engine:
                                             try:
                                                 strength = float(check_msg.get("strength", 0.3))
                                                 strength = max(0.0, min(1.0, strength))
-                                                latents = engine.encode_audio_chunks_for_streaming(
+                                                chunks = engine.encode_audio_chunks_for_streaming(
                                                     audio_b64=audio_data,
                                                     num_frames=num_frames,
                                                     frame_rate=frame_rate,
                                                 )
-                                                for latent in latents:
-                                                    audio_queue.append((latent, strength))
+                                                for latent, waveform in chunks:
+                                                    audio_queue.append((latent, strength, waveform))
                                                 await websocket.send_json({
                                                     "type": "audio_set",
                                                     "success": True,
                                                     "strength": strength,
-                                                    "chunks_added": len(latents),
+                                                    "chunks_added": len(chunks),
                                                     "queue_length": len(audio_queue)
                                                 })
-                                                print(f"   WebSocket: Audio queued (pre-segment) ({len(latents)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                                print(f"   WebSocket: Audio queued (pre-segment) ({len(chunks)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
                                             except Exception as e:
                                                 print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                                                 await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
@@ -3017,17 +3141,17 @@ class OfficialLTX2Engine:
                                                 try:
                                                     strength = float(check_msg.get("audio_strength", 0.3))
                                                     strength = max(0.0, min(1.0, strength))
-                                                    latents = engine.encode_audio_chunks_for_streaming(
+                                                    chunks = engine.encode_audio_chunks_for_streaming(
                                                         audio_b64=audio_data,
                                                         num_frames=num_frames,
                                                         frame_rate=frame_rate,
                                                     )
-                                                    for latent in latents:
-                                                        audio_queue.append((latent, strength))
+                                                    for latent, waveform in chunks:
+                                                        audio_queue.append((latent, strength, waveform))
                                                     response["audio_set"] = True
-                                                    response["audio_chunks_added"] = len(latents)
+                                                    response["audio_chunks_added"] = len(chunks)
                                                     response["audio_queue_length"] = len(audio_queue)
-                                                    print(f"   WebSocket: Next segment audio queued (pre-segment) ({len(latents)} chunks) (queue: {len(audio_queue)})", flush=True)
+                                                    print(f"   WebSocket: Next segment audio queued (pre-segment) ({len(chunks)} chunks) (queue: {len(audio_queue)})", flush=True)
                                                 except Exception as e:
                                                     response["audio_set"] = False
                                                     response["audio_error"] = str(e)
@@ -3058,11 +3182,12 @@ class OfficialLTX2Engine:
                                     print(f"   WebSocket: Popped target image from queue (remaining: {len(target_image_queue)})", flush=True)
 
                                 if audio_queue:
-                                    audio_latent, audio_conditioning_strength = audio_queue.pop(0)
+                                    audio_latent, audio_conditioning_strength, original_audio_waveform = audio_queue.pop(0)
                                     print(f"   WebSocket: Popped audio from queue (remaining: {len(audio_queue)})", flush=True)
                                 else:
                                     audio_latent = None
                                     audio_conditioning_strength = 0.3
+                                    original_audio_waveform = None
 
                                 # Capture variables for closure (including target image and audio)
                                 _prompt = current_prompt
@@ -3080,6 +3205,7 @@ class OfficialLTX2Engine:
                                 _target_position = target_frame_position  # Capture position for this segment
                                 _audio_latent = audio_latent  # Capture for this segment
                                 _audio_strength = audio_conditioning_strength  # Capture for this segment
+                                _original_audio_waveform = original_audio_waveform  # Capture for pass-through
                                 # Start image only applies to first segment
                                 _start_latent = start_image_latent if _is_first else None
                                 print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}, has_audio={_audio_latent is not None}, target_pos={_target_position:.2f}", flush=True)
@@ -3113,6 +3239,7 @@ class OfficialLTX2Engine:
                                         target_frame_position=_target_position,
                                         audio_latent=_audio_latent,
                                         audio_conditioning_strength=_audio_strength,
+                                        original_audio_waveform=_original_audio_waveform,
                                     ))
 
                                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -3164,21 +3291,21 @@ class OfficialLTX2Engine:
                                                 try:
                                                     strength = float(check_msg.get("strength", 0.3))
                                                     strength = max(0.0, min(1.0, strength))
-                                                    latents = engine.encode_audio_chunks_for_streaming(
+                                                    chunks = engine.encode_audio_chunks_for_streaming(
                                                         audio_b64=audio_data,
                                                         num_frames=num_frames,
                                                         frame_rate=frame_rate,
                                                     )
-                                                    for latent in latents:
-                                                        audio_queue.append((latent, strength))
+                                                    for latent, waveform in chunks:
+                                                        audio_queue.append((latent, strength, waveform))
                                                     await websocket.send_json({
                                                         "type": "audio_set",
                                                         "success": True,
                                                         "strength": strength,
-                                                        "chunks_added": len(latents),
+                                                        "chunks_added": len(chunks),
                                                         "queue_length": len(audio_queue)
                                                     })
-                                                    print(f"   WebSocket: Audio queued (mid-segment) ({len(latents)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
+                                                    print(f"   WebSocket: Audio queued (mid-segment) ({len(chunks)} chunks) with strength {strength:.2f} (queue: {len(audio_queue)})", flush=True)
                                                 except Exception as e:
                                                     print(f"   WebSocket: Failed to encode audio: {e}", flush=True)
                                                     await websocket.send_json({"type": "audio_set", "success": False, "error": str(e)})
@@ -3220,17 +3347,17 @@ class OfficialLTX2Engine:
                                                     try:
                                                         strength = float(check_msg.get("audio_strength", 0.3))
                                                         strength = max(0.0, min(1.0, strength))
-                                                        latents = engine.encode_audio_chunks_for_streaming(
+                                                        chunks = engine.encode_audio_chunks_for_streaming(
                                                             audio_b64=audio_data,
                                                             num_frames=num_frames,
                                                             frame_rate=frame_rate,
                                                         )
-                                                        for latent in latents:
-                                                            audio_queue.append((latent, strength))
+                                                        for latent, waveform in chunks:
+                                                            audio_queue.append((latent, strength, waveform))
                                                         response["audio_set"] = True
-                                                        response["audio_chunks_added"] = len(latents)
+                                                        response["audio_chunks_added"] = len(chunks)
                                                         response["audio_queue_length"] = len(audio_queue)
-                                                        print(f"   WebSocket: Next segment audio queued (mid-segment) ({len(latents)} chunks) (queue: {len(audio_queue)})", flush=True)
+                                                        print(f"   WebSocket: Next segment audio queued (mid-segment) ({len(chunks)} chunks) (queue: {len(audio_queue)})", flush=True)
                                                     except Exception as e:
                                                         response["audio_set"] = False
                                                         response["audio_error"] = str(e)
@@ -5701,7 +5828,7 @@ MINIMAL_HTML = """
     <div class="video-wrapper" id="videoWrapper">
         <canvas id="videoCanvas" width="832" height="480"></canvas>
         <div class="drop-overlay" id="dropOverlay">
-            <div class="drop-overlay-text">Drop image to guide next segment</div>
+            <div class="drop-overlay-text">Drop image or audio to condition video</div>
         </div>
     </div>
 
@@ -5710,7 +5837,7 @@ MINIMAL_HTML = """
         <div class="placeholder-title">vidi</div>
         <div class="placeholder-subtitle">a realtime interactive video stream</div>
         <div class="placeholder-text">Enter a prompt to start generating</div>
-        <div class="placeholder-hint">Or drop an image to begin with image-to-video</div>
+        <div class="placeholder-hint">Or drop image/audio to condition the video</div>
     </div>
 
     <!-- Status indicator -->
@@ -5735,6 +5862,7 @@ MINIMAL_HTML = """
         </div>
         <button class="ctrl-btn" id="liveBtn" title="Jump to Live" disabled>⏭</button>
         <button class="ctrl-btn" id="resetBtn" title="Reset History" disabled>🔄</button>
+        <button class="ctrl-btn" id="muteBtn" title="Mute/Unmute Audio">🔊</button>
         <div class="live-indicator" id="liveIndicator">
             <div class="live-dot"></div>
             <span>LIVE</span>
@@ -5798,6 +5926,15 @@ MINIMAL_HTML = """
             <input type="range" class="setting-slider" id="targetPosSlider" min="0" max="1" step="0.1" value="1">
             <div style="font-size: 10px; color: #666; margin-top: 4px;">Where dropped images appear in segment</div>
         </div>
+
+        <div class="setting-group">
+            <label class="setting-label">
+                <span>Audio Noise Scale</span>
+                <span class="setting-value" id="audioNoiseScaleValue">0.0</span>
+            </label>
+            <input type="range" class="setting-slider" id="audioNoiseScaleSlider" min="0" max="1" step="0.1" value="0">
+            <div style="font-size: 10px; color: #666; margin-top: 4px;">0=pass-through (clean), 1=full denoise (more artifacts)</div>
+        </div>
     </div>
 
     <!-- Toast -->
@@ -5821,8 +5958,23 @@ MINIMAL_HTML = """
         let playbackFps = 12;
         let lastFrameTime = 0;
 
+        // Audio playback state
+        let audioContext = null;
+        let audioQueue = [];          // Queue of audio buffers to play
+        let nextAudioTime = 0;        // When the next audio chunk should start
+        let audioSources = [];        // Active audio source nodes
+        let isAudioMuted = false;
+        const generationFps = 24;     // Server generates at 24fps
+
+        // Audio history for playback
+        let audioHistory = [];        // Array of {startFrame, endFrame, buffer} for each segment
+        let currentAudioSegment = -1; // Currently playing audio segment index
+        let segmentFrameCount = 0;    // Frames received in current segment
+
         // Pending data
         let pendingImage = null;
+        let pendingAudio = null;
+        let pendingAudioName = null;
         let currentPrompt = "";
 
         // Elements
@@ -5851,8 +6003,11 @@ MINIMAL_HTML = """
         const fpsValue = document.getElementById('fpsValue');
         const targetPosSlider = document.getElementById('targetPosSlider');
         const targetPosValue = document.getElementById('targetPosValue');
+        const audioNoiseScaleSlider = document.getElementById('audioNoiseScaleSlider');
+        const audioNoiseScaleValue = document.getElementById('audioNoiseScaleValue');
         const dropOverlay = document.getElementById('dropOverlay');
         const themeToggle = document.getElementById('themeToggle');
+        const muteBtn = document.getElementById('muteBtn');
 
         // Initialize
         function init() {
@@ -5888,6 +6043,7 @@ MINIMAL_HTML = """
             liveBtn.addEventListener('click', jumpToLive);
             resetBtn.addEventListener('click', resetHistory);
             seekBar.addEventListener('input', handleSeek);
+            muteBtn.addEventListener('click', toggleMute);
 
             settingsBtn.addEventListener('click', toggleSettings);
 
@@ -5907,6 +6063,10 @@ MINIMAL_HTML = """
                 else if (val <= 0.65) targetPosValue.textContent = 'Middle';
                 else if (val <= 0.85) targetPosValue.textContent = 'Late';
                 else targetPosValue.textContent = 'End';
+            });
+
+            audioNoiseScaleSlider.addEventListener('input', (e) => {
+                audioNoiseScaleValue.textContent = parseFloat(e.target.value).toFixed(1);
             });
 
             // Drag and drop
@@ -5946,8 +6106,12 @@ MINIMAL_HTML = """
             wrapper.addEventListener('drop', (e) => {
                 dropOverlay.classList.remove('active');
                 const file = e.dataTransfer.files[0];
-                if (file && file.type.startsWith('image/')) {
-                    processImageFile(file);
+                if (file) {
+                    if (file.type.startsWith('image/')) {
+                        processImageFile(file);
+                    } else if (file.type.startsWith('audio/') || file.name.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i)) {
+                        processAudioFile(file);
+                    }
                 }
             });
         }
@@ -6003,6 +6167,262 @@ MINIMAL_HTML = """
             attachedImage.style.display = 'none';
             attachedPreview.src = '';
             imageInput.value = '';
+        }
+
+        // Audio handling
+        function processAudioFile(file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                // Store as base64 (remove data URL prefix)
+                const base64 = e.target.result.split(',')[1];
+                pendingAudio = base64;
+                pendingAudioName = file.name;
+
+                if (isStreaming && ws && ws.readyState === WebSocket.OPEN) {
+                    // If streaming, send as audio conditioning for upcoming segments
+                    sendAudio(pendingAudio);
+                    showToast('Audio queued for upcoming segments');
+                    pendingAudio = null;
+                    pendingAudioName = null;
+                } else {
+                    // If not streaming, store for start message
+                    showToast('Audio set: ' + file.name.substring(0, 20) + ' - will sync when streaming starts');
+                    updateAudioIndicator();
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function updateAudioIndicator() {
+            // Show audio indicator in the placeholder if audio is pending
+            const placeholder = document.getElementById('placeholder');
+            let indicator = document.getElementById('audioIndicator');
+            if (pendingAudio && !isStreaming) {
+                if (!indicator) {
+                    indicator = document.createElement('div');
+                    indicator.id = 'audioIndicator';
+                    indicator.style.cssText = 'margin-top: 10px; padding: 8px 16px; background: var(--bg-tertiary); border-radius: 8px; font-size: 12px; display: flex; align-items: center; gap: 8px;';
+                    indicator.innerHTML = '<span style="font-size: 16px;">🎵</span><span id="audioIndicatorText"></span><button onclick="clearPendingAudio()" style="background: none; border: none; color: var(--text-secondary); cursor: pointer; margin-left: 8px;">✕</button>';
+                    placeholder.appendChild(indicator);
+                }
+                document.getElementById('audioIndicatorText').textContent = pendingAudioName || 'Audio ready';
+            } else if (indicator) {
+                indicator.remove();
+            }
+        }
+
+        function clearPendingAudio() {
+            pendingAudio = null;
+            pendingAudioName = null;
+            updateAudioIndicator();
+            showToast('Audio cleared');
+        }
+
+        function sendAudio(audioData) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const numFrames = parseInt(document.getElementById('numFramesInput').value);
+            const frameRate = 24;
+            const audioStrength = parseFloat(audioNoiseScaleSlider.value);
+
+            ws.send(JSON.stringify({
+                action: 'set_audio',
+                audio: audioData,
+                strength: audioStrength,
+                num_frames: numFrames,
+                frame_rate: frameRate
+            }));
+        }
+
+        // Audio playback functions
+        function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                nextAudioTime = audioContext.currentTime;
+            }
+            // Resume if suspended (browsers require user interaction)
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+        }
+
+        function decodeBase64Audio(base64Audio) {
+            const binaryString = atob(base64Audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer.slice(0);
+        }
+
+        function playAudioChunk(base64Audio) {
+            initAudioContext();
+
+            // Store audio in history with current frame position
+            const startFrame = frameHistory.length;
+            const audioData = decodeBase64Audio(base64Audio);
+
+            // Decode and store for history playback
+            audioContext.decodeAudioData(audioData.slice(0), (buffer) => {
+                // Store in history
+                audioHistory.push({
+                    startFrame: startFrame,
+                    buffer: buffer,
+                    base64: base64Audio // Keep for re-decoding if needed
+                });
+
+                // Update end frame of previous segment
+                if (audioHistory.length > 1) {
+                    audioHistory[audioHistory.length - 2].endFrame = startFrame - 1;
+                }
+
+                // Play immediately if live and not muted
+                if (isLive && !isAudioMuted && !isPaused) {
+                    playBuffer(buffer);
+                }
+            }, (err) => {
+                console.error('Audio decode error:', err);
+            });
+        }
+
+        function playBuffer(buffer) {
+            if (!audioContext || isAudioMuted) return;
+
+            // Calculate playback rate adjustment for FPS difference
+            const audioRate = playbackFps / generationFps;
+
+            // Time-stretch the buffer to match playback FPS while preserving pitch
+            const stretchedBuffer = timeStretchBuffer(buffer, audioRate);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = stretchedBuffer;
+            source.connect(audioContext.destination);
+            source.playbackRate.value = 1.0;
+
+            // Track this source for pause/stop
+            audioSources.push(source);
+            source.onended = () => {
+                const idx = audioSources.indexOf(source);
+                if (idx > -1) audioSources.splice(idx, 1);
+            };
+
+            // Schedule audio to play at the right time
+            const startTime = Math.max(audioContext.currentTime, nextAudioTime);
+            source.start(startTime);
+            nextAudioTime = startTime + stretchedBuffer.duration;
+        }
+
+        function playAudioForFrame(frameIndex) {
+            if (!audioContext || isAudioMuted || audioHistory.length === 0) return;
+
+            // Find which audio segment this frame belongs to
+            for (let i = 0; i < audioHistory.length; i++) {
+                const segment = audioHistory[i];
+                const endFrame = segment.endFrame !== undefined ? segment.endFrame :
+                    (i < audioHistory.length - 1 ? audioHistory[i + 1].startFrame - 1 : frameHistory.length);
+
+                if (frameIndex >= segment.startFrame && frameIndex <= endFrame) {
+                    // Only play if this is a different segment than currently playing
+                    if (currentAudioSegment !== i) {
+                        currentAudioSegment = i;
+                        stopAllAudio();
+                        nextAudioTime = audioContext.currentTime;
+                        playBuffer(segment.buffer);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Time-stretch audio buffer using granular synthesis (preserves pitch)
+        function timeStretchBuffer(buffer, rate) {
+            if (Math.abs(rate - 1.0) < 0.01) {
+                return buffer; // No stretching needed
+            }
+
+            const grainSize = 0.03; // 30ms grains
+            const overlap = 0.6; // 60% overlap for smoother output
+
+            const inputLength = buffer.length;
+            const outputLength = Math.floor(inputLength / rate);
+            const numChannels = buffer.numberOfChannels;
+            const sampleRate = buffer.sampleRate;
+
+            const outputBuffer = audioContext.createBuffer(numChannels, outputLength, sampleRate);
+
+            const grainSamples = Math.floor(grainSize * sampleRate);
+            const hopIn = Math.floor(grainSamples * (1 - overlap));
+            const hopOut = Math.floor(hopIn / rate);
+
+            for (let ch = 0; ch < numChannels; ch++) {
+                const input = buffer.getChannelData(ch);
+                const output = outputBuffer.getChannelData(ch);
+
+                // Fill with zeros first
+                output.fill(0);
+
+                let inPos = 0;
+                let outPos = 0;
+
+                while (inPos < inputLength - grainSamples && outPos < outputLength - grainSamples) {
+                    // Copy grain with Hann window for smooth crossfade
+                    for (let i = 0; i < grainSamples && outPos + i < outputLength; i++) {
+                        const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / grainSamples));
+                        output[outPos + i] += input[inPos + i] * window;
+                    }
+
+                    inPos += hopIn;
+                    outPos += hopOut;
+                }
+            }
+
+            // Normalize to prevent clipping
+            for (let ch = 0; ch < numChannels; ch++) {
+                const output = outputBuffer.getChannelData(ch);
+                let maxVal = 0;
+                for (let i = 0; i < output.length; i++) {
+                    maxVal = Math.max(maxVal, Math.abs(output[i]));
+                }
+                if (maxVal > 1.0) {
+                    const scale = 0.95 / maxVal;
+                    for (let i = 0; i < output.length; i++) {
+                        output[i] *= scale;
+                    }
+                }
+            }
+
+            return outputBuffer;
+        }
+
+        function stopAllAudio() {
+            audioSources.forEach(source => {
+                try { source.stop(); } catch(e) {}
+            });
+            audioSources = [];
+            nextAudioTime = 0;
+            if (audioContext) {
+                nextAudioTime = audioContext.currentTime;
+            }
+        }
+
+        function pauseAudio() {
+            if (audioContext && audioContext.state === 'running') {
+                audioContext.suspend();
+            }
+        }
+
+        function resumeAudio() {
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+        }
+
+        function toggleMute() {
+            isAudioMuted = !isAudioMuted;
+            muteBtn.textContent = isAudioMuted ? '🔇' : '🔊';
+            if (isAudioMuted) {
+                stopAllAudio();
+            }
         }
 
         // Send handling
@@ -6063,6 +6483,10 @@ MINIMAL_HTML = """
                 case 'frame':
                     handleFrame(msg);
                     break;
+                case 'audio':
+                    // Play audio chunk from segment
+                    playAudioChunk(msg.data);
+                    break;
                 case 'started':
                     isStreaming = true;
                     isPaused = false;
@@ -6070,6 +6494,12 @@ MINIMAL_HTML = """
                     placeholder.classList.add('hidden');
                     videoControls.classList.add('visible');
                     updateControlsState();
+                    // Show audio status if included in start
+                    if (msg.start_audio_set) {
+                        showToast(`Audio ready (${msg.audio_chunks} chunk${msg.audio_chunks > 1 ? 's' : ''})`);
+                    } else if (msg.start_audio_error) {
+                        showToast('Audio encoding failed');
+                    }
                     break;
                 case 'stopped':
                 case 'complete':
@@ -6086,6 +6516,15 @@ MINIMAL_HTML = """
                 case 'history_reset':
                     showToast('History reset - next segment starts fresh');
                     setStatus('success', 'History reset');
+                    break;
+                case 'audio_set':
+                    if (msg.success) {
+                        const chunks = msg.chunks_added || 1;
+                        showToast(`Audio queued (${chunks} chunk${chunks > 1 ? 's' : ''})`);
+                    }
+                    break;
+                case 'audio_used':
+                    // Audio was consumed for a segment - could show indicator if desired
                     break;
             }
         }
@@ -6188,9 +6627,13 @@ MINIMAL_HTML = """
                         seekBar.value = currentFrameIndex;
                         updateTimeDisplay();
 
+                        // Play audio for this frame from history
+                        playAudioForFrame(currentFrameIndex);
+
                         // Auto-switch to live when caught up
                         if (currentFrameIndex >= frameHistory.length - 1) {
                             isLive = true;
+                            currentAudioSegment = -1; // Reset so live audio plays fresh
                             // Refill buffer with any frames we missed
                             frameBuffer = [];
                             updateLiveIndicator();
@@ -6210,6 +6653,9 @@ MINIMAL_HTML = """
                 isLive = false;
                 frameBuffer = []; // Clear buffer
                 updateLiveIndicator();
+                pauseAudio();
+            } else {
+                resumeAudio();
             }
         }
 
@@ -6220,6 +6666,13 @@ MINIMAL_HTML = """
             displayFrame(currentFrameIndex);
             updateTimeDisplay();
             updateLiveIndicator();
+            // Stop current audio and reset segment tracker
+            stopAllAudio();
+            currentAudioSegment = -1;
+            // If not paused, start playing audio for this position
+            if (!isPaused) {
+                playAudioForFrame(currentFrameIndex);
+            }
         }
 
         function jumpToLive() {
@@ -6230,6 +6683,9 @@ MINIMAL_HTML = """
             displayFrame(currentFrameIndex);
             updateBufferDisplay();
             updateLiveIndicator();
+            // Reset audio segment so live audio continues from current position
+            currentAudioSegment = -1;
+            stopAllAudio();
         }
 
         function resetHistory() {
@@ -6284,6 +6740,15 @@ MINIMAL_HTML = """
                     message.start_image = imageData;
                 }
 
+                // Add start audio if provided (will be chunked and queued for first segment(s))
+                if (pendingAudio) {
+                    message.start_audio = pendingAudio;
+                    message.audio_strength = parseFloat(audioNoiseScaleSlider.value);
+                    pendingAudio = null;
+                    pendingAudioName = null;
+                    updateAudioIndicator();
+                }
+
                 ws.send(JSON.stringify(message));
 
                 // Clear old frames and buffers
@@ -6295,6 +6760,12 @@ MINIMAL_HTML = """
                 isLive = true;
                 isPaused = false;
                 playPauseBtn.textContent = '⏸';
+
+                // Clear audio history and initialize context
+                audioHistory = [];
+                currentAudioSegment = -1;
+                initAudioContext();
+                stopAllAudio();
 
                 startPlayback();
 
@@ -6312,6 +6783,9 @@ MINIMAL_HTML = """
 
             // Disconnect WebSocket
             disconnect();
+
+            // Stop audio playback
+            stopAllAudio();
 
             // Reset state for fresh start
             isStreaming = false;

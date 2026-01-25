@@ -47,6 +47,7 @@ SKIP_UPSCALING = True  # True = generate at full res, skip stage 2 (faster), Fal
 # WebSocket endpoint URLs (GPU containers) - UI served separately from lightweight CPU container
 WEBSOCKET_ENDPOINT_TURBO = "wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream"
 WEBSOCKET_ENDPOINT_HQ = "wss://tmalive--ltx2-nondistilled-nondistilledltx2engine-streaming-app.modal.run/ws/stream"
+WEBSOCKET_ENDPOINT_GEMINI_LIVE = "wss://tmalive--ltx2-official-distilled-officialltx2engine-gemi-93f1dd.modal.run/ws/gemini-live"
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
@@ -75,6 +76,8 @@ image = (
         "fastapi[standard]>=0.115.0",
         "python-multipart",
         "uvicorn[standard]",
+        "google-genai",  # For Gemini Live API
+        "websockets",  # For connecting to LTX-2 WebSocket
     )
     .run_commands(
         f"git clone https://github.com/Lightricks/LTX-2.git {LTX2_REPO_DIR}",
@@ -3380,6 +3383,315 @@ class OfficialLTX2Engine:
                     await websocket.send_json({"type": "error", "message": str(e)})
                 except:
                     pass
+
+        return app
+
+    @modal.asgi_app()
+    def gemini_live_streaming_app(self):
+        """
+        ASGI app for Gemini Live driven video generation.
+
+        Server-side Gemini connection using google-genai SDK.
+        Bridges user audio to Gemini, routes Gemini audio to LTX-2.
+        """
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi.responses import HTMLResponse
+        from fastapi.middleware.cors import CORSMiddleware
+        import asyncio
+        import json
+        import os
+        import base64
+        from google import genai
+
+        app = FastAPI(title="Gemini Live × LTX-2")
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        engine = self
+
+        # Gemini Live configuration
+        GEMINI_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+
+        @app.get("/", response_class=HTMLResponse)
+        async def index():
+            html = GEMINI_LIVE_HTML.replace(
+                "__WS_ENDPOINT_TURBO__",
+                WEBSOCKET_ENDPOINT_GEMINI_LIVE
+            )
+            return HTMLResponse(html)
+
+        @app.get("/health")
+        async def health():
+            return {"status": "healthy", "service": "gemini-live-streaming"}
+
+        @app.websocket("/ws/gemini-live")
+        async def gemini_live_stream(websocket: WebSocket):
+            """
+            WebSocket endpoint that bridges client, Gemini Live, and LTX-2.
+            """
+            await websocket.accept()
+            print("Gemini Live WebSocket: Client connected", flush=True)
+
+            gemini_session = None
+            gemini_connected = False
+            current_prompt = "A beautiful abstract flowing visualization"
+            should_stop = False
+            segment_count = 0
+
+            # Audio from Gemini to feed to LTX-2
+            gemini_audio_buffer = []
+
+            # Queue for user audio to send to Gemini
+            user_audio_queue = asyncio.Queue()
+
+            async def send_audio_to_gemini():
+                """Send user audio from queue to Gemini session."""
+                while not should_stop and gemini_session:
+                    try:
+                        audio_data = await asyncio.wait_for(user_audio_queue.get(), timeout=0.1)
+                        # Decode base64 and send as raw bytes
+                        audio_bytes = base64.b64decode(audio_data)
+                        await gemini_session.send_realtime_input(
+                            audio={"data": audio_bytes, "mime_type": "audio/pcm"}
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        print(f"Error sending audio to Gemini: {e}", flush=True)
+
+            async def receive_from_gemini():
+                """Receive responses from Gemini and forward to client."""
+                nonlocal gemini_audio_buffer
+
+                while not should_stop and gemini_session:
+                    try:
+                        turn = gemini_session.receive()
+                        async for response in turn:
+                            if response.server_content and response.server_content.model_turn:
+                                for part in response.server_content.model_turn.parts:
+                                    # Handle text
+                                    if part.text:
+                                        await websocket.send_json({
+                                            "type": "gemini_text",
+                                            "text": part.text
+                                        })
+                                    # Handle audio
+                                    if part.inline_data and isinstance(part.inline_data.data, bytes):
+                                        audio_b64 = base64.b64encode(part.inline_data.data).decode()
+                                        gemini_audio_buffer.append(part.inline_data.data)
+                                        await websocket.send_json({
+                                            "type": "gemini_audio",
+                                            "data": audio_b64
+                                        })
+
+                            # Turn complete
+                            if response.server_content and response.server_content.turn_complete:
+                                await websocket.send_json({"type": "gemini_turn_complete"})
+
+                    except Exception as e:
+                        if not should_stop:
+                            print(f"Gemini receiver error: {e}", flush=True)
+                        break
+
+            def convert_gemini_audio_to_latent(audio_chunks: list):
+                """Convert Gemini audio (PCM 24kHz raw bytes) to LTX audio latent."""
+                import tempfile
+                import torchaudio
+                import torch
+                import numpy as np
+
+                if not audio_chunks:
+                    return None, None
+
+                try:
+                    # Combine all audio chunks (raw bytes, not base64)
+                    all_samples = []
+                    for chunk_bytes in audio_chunks:
+                        # Gemini outputs 16-bit PCM at 24kHz
+                        samples = np.frombuffer(chunk_bytes, dtype=np.int16)
+                        all_samples.append(samples)
+
+                    combined = np.concatenate(all_samples)
+                    waveform = torch.from_numpy(combined.astype(np.float32) / 32768.0).unsqueeze(0)
+
+                    # Save to temp file for encoding
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                        torchaudio.save(f.name, waveform, 24000)
+                        temp_path = f.name
+
+                    # Encode with LTX audio encoder
+                    segment_duration = 49 / 24.0  # ~2 seconds
+                    audio_latent, waveform_24k = engine._encode_audio(
+                        temp_path, segment_duration, return_waveform=True
+                    )
+
+                    # Clean up
+                    os.unlink(temp_path)
+
+                    return audio_latent, waveform_24k
+
+                except Exception as e:
+                    print(f"Error converting Gemini audio: {e}", flush=True)
+                    return None, None
+
+            async def video_generator():
+                """Generate video segments and send frames to client."""
+                nonlocal segment_count, gemini_audio_buffer
+
+                while not should_stop:
+                    segment_count += 1
+                    is_first = segment_count == 1
+
+                    # Convert Gemini audio to LTX latent (if any)
+                    audio_latent = None
+                    audio_waveform = None
+                    audio_strength = 0.0
+
+                    if gemini_audio_buffer:
+                        audio_latent, audio_waveform = convert_gemini_audio_to_latent(
+                            gemini_audio_buffer
+                        )
+                        if audio_latent is not None:
+                            audio_strength = 0.0  # Pass-through mode
+                        gemini_audio_buffer = []
+
+                    await websocket.send_json({
+                        "type": "segment_start",
+                        "segment": segment_count,
+                        "prompt": current_prompt,
+                        "has_gemini_audio": audio_latent is not None
+                    })
+
+                    try:
+                        for item in engine.generate_streaming(
+                            prompt=current_prompt,
+                            seed=42 + segment_count,
+                            height=480,
+                            width=832,
+                            num_frames=49,
+                            frame_rate=24.0,
+                            use_second_stage=False,
+                            is_first_segment=is_first,
+                            audio_latent=audio_latent,
+                            audio_conditioning_strength=audio_strength,
+                            original_audio_waveform=audio_waveform,
+                        ):
+                            if should_stop:
+                                break
+
+                            if item.get("type") == "frame":
+                                await websocket.send_json(item)
+                            elif item.get("type") == "audio":
+                                pass  # Gemini audio is primary
+
+                    except Exception as e:
+                        print(f"Video generation error: {e}", flush=True)
+                        await websocket.send_json({"type": "error", "message": str(e)})
+
+                    await websocket.send_json({
+                        "type": "segment_complete",
+                        "segment": segment_count
+                    })
+
+                    await asyncio.sleep(0.1)
+
+            # Main message loop
+            gemini_send_task = None
+            gemini_recv_task = None
+            video_task = None
+
+            try:
+                while True:
+                    try:
+                        data = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
+                        msg = json.loads(data)
+
+                        action = msg.get("action")
+
+                        if action == "start":
+                            api_key = msg.get("api_key")
+                            if not api_key:
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "message": "API key required"
+                                })
+                                continue
+
+                            current_prompt = msg.get("prompt", current_prompt)
+
+                            # Connect to Gemini using google-genai SDK
+                            try:
+                                client = genai.Client(api_key=api_key)
+                                config = {
+                                    "response_modalities": ["AUDIO"],
+                                    "system_instruction": """You are an AI video director controlling a real-time video generation system.
+Your voice is being used to condition the audio of the generated video - speak expressively!
+The user is watching. Engage with them and create an immersive experience.
+When you speak, your voice shapes the video. Be dramatic for drama, calm for peace.
+Describe vivid scenes and the video will show them.""",
+                                }
+
+                                gemini_session = await client.aio.live.connect(
+                                    model=GEMINI_MODEL,
+                                    config=config
+                                )
+                                gemini_connected = True
+                                print("Gemini Live: Connected via SDK", flush=True)
+
+                                await websocket.send_json({"type": "gemini_connected"})
+
+                                # Start background tasks
+                                gemini_send_task = asyncio.create_task(send_audio_to_gemini())
+                                gemini_recv_task = asyncio.create_task(receive_from_gemini())
+                                video_task = asyncio.create_task(video_generator())
+
+                            except Exception as e:
+                                print(f"Gemini connection error: {e}", flush=True)
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "message": f"Failed to connect to Gemini: {e}"
+                                })
+
+                        elif action == "audio":
+                            # Queue user audio for sending to Gemini
+                            audio_data = msg.get("data")
+                            if audio_data and gemini_connected:
+                                await user_audio_queue.put(audio_data)
+
+                        elif action == "stop":
+                            should_stop = True
+                            await websocket.send_json({"type": "stopped"})
+                            break
+
+                        elif action == "update_prompt":
+                            current_prompt = msg.get("prompt", current_prompt)
+                            await websocket.send_json({
+                                "type": "prompt_updated",
+                                "prompt": current_prompt
+                            })
+
+                    except asyncio.TimeoutError:
+                        continue
+
+            except WebSocketDisconnect:
+                print("Gemini Live WebSocket: Client disconnected", flush=True)
+            except Exception as e:
+                print(f"Gemini Live WebSocket error: {e}", flush=True)
+            finally:
+                should_stop = True
+                gemini_connected = False
+                if gemini_session:
+                    try:
+                        await gemini_session.close()
+                    except:
+                        pass
+                for task in [gemini_send_task, gemini_recv_task, video_task]:
+                    if task:
+                        task.cancel()
 
         return app
 
@@ -6852,6 +7164,1645 @@ MINIMAL_HTML = """
 </body>
 </html>
 """
+
+
+# ============================================================================
+# Gemini Live Driven UI - Voice-controlled video generation
+# ============================================================================
+
+GEMINI_LIVE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Live × LTX-2</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: rgba(20, 20, 30, 0.95);
+            --bg-tertiary: rgba(255, 255, 255, 0.1);
+            --text-primary: #fff;
+            --text-secondary: #888;
+            --accent: #8b5cf6;
+            --accent-glow: rgba(139, 92, 246, 0.5);
+            --gemini-color: #4285f4;
+            --recording-color: #ef4444;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        .video-wrapper {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+        }
+
+        #videoCanvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        /* Gemini control panel */
+        .gemini-panel {
+            position: fixed;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            z-index: 50;
+        }
+
+        /* Talk button - large circular */
+        .talk-btn {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: 3px solid var(--gemini-color);
+            background: rgba(66, 133, 244, 0.2);
+            color: var(--gemini-color);
+            font-size: 2rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .talk-btn:hover {
+            background: rgba(66, 133, 244, 0.3);
+            transform: scale(1.05);
+        }
+
+        .talk-btn.recording {
+            border-color: var(--recording-color);
+            background: rgba(239, 68, 68, 0.3);
+            animation: pulse 1.5s infinite;
+        }
+
+        .talk-btn.connecting {
+            border-color: #fbbf24;
+            background: rgba(251, 191, 36, 0.2);
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); }
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* Status display */
+        .status-bar {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-secondary);
+            padding: 10px 20px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            z-index: 50;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .status-dot.connected { background: #22c55e; }
+        .status-dot.recording { background: var(--recording-color); animation: pulse-dot 1s infinite; }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Transcript display */
+        .transcript {
+            position: fixed;
+            bottom: 150px;
+            left: 50%;
+            transform: translateX(-50%);
+            max-width: 600px;
+            width: 90%;
+            text-align: center;
+            z-index: 40;
+        }
+
+        .transcript-text {
+            background: rgba(0, 0, 0, 0.7);
+            padding: 12px 20px;
+            border-radius: 12px;
+            font-size: 1.1rem;
+            line-height: 1.4;
+            backdrop-filter: blur(10px);
+        }
+
+        .transcript-text.user { border-left: 3px solid var(--accent); }
+        .transcript-text.gemini { border-left: 3px solid var(--gemini-color); }
+
+        /* Prompt input (for manual override) */
+        .prompt-input {
+            position: fixed;
+            top: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 500px;
+            z-index: 40;
+        }
+
+        .prompt-input input {
+            width: 100%;
+            padding: 12px 20px;
+            border: 1px solid var(--bg-tertiary);
+            border-radius: 25px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            outline: none;
+        }
+
+        .prompt-input input:focus {
+            border-color: var(--accent);
+        }
+
+        .prompt-input button {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 20px;
+            color: white;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: opacity 0.2s, transform 0.1s;
+            white-space: nowrap;
+        }
+
+        .prompt-input button:hover {
+            opacity: 0.9;
+            transform: scale(1.02);
+        }
+
+        .prompt-input button:active {
+            transform: scale(0.98);
+        }
+
+        /* Settings button */
+        .settings-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            border: none;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 1.2rem;
+            z-index: 60;
+        }
+
+        /* Settings panel */
+        .settings-panel {
+            position: fixed;
+            top: 70px;
+            right: 20px;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 20px;
+            width: 280px;
+            display: none;
+            z-index: 55;
+        }
+
+        .settings-panel.open { display: block; }
+
+        .setting-group {
+            margin-bottom: 15px;
+        }
+
+        .setting-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 5px;
+            display: block;
+        }
+
+        .setting-input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid var(--bg-tertiary);
+            border-radius: 6px;
+            background: rgba(0,0,0,0.3);
+            color: var(--text-primary);
+            font-size: 0.9rem;
+        }
+
+        /* Toast notifications */
+        .toast {
+            position: fixed;
+            bottom: 250px;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            background: var(--bg-secondary);
+            padding: 12px 24px;
+            border-radius: 8px;
+            opacity: 0;
+            transition: all 0.3s ease;
+            z-index: 100;
+        }
+
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+
+        /* Audio visualizer */
+        .audio-viz {
+            display: flex;
+            gap: 3px;
+            height: 30px;
+            align-items: center;
+        }
+
+        .audio-viz .bar {
+            width: 4px;
+            background: var(--gemini-color);
+            border-radius: 2px;
+            transition: height 0.1s ease;
+        }
+
+        /* Function call indicator */
+        .function-indicator {
+            position: fixed;
+            top: 120px;
+            right: 20px;
+            background: rgba(139, 92, 246, 0.2);
+            border: 1px solid var(--accent);
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 50;
+        }
+
+        .function-indicator.show { opacity: 1; }
+
+        /* Activity Log Panel */
+        .activity-panel {
+            position: fixed;
+            left: 20px;
+            top: 70px;
+            width: 320px;
+            max-height: 50vh;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 15px;
+            overflow-y: auto;
+            z-index: 55;
+            font-size: 0.8rem;
+        }
+
+        .activity-panel h3 {
+            margin-bottom: 10px;
+            font-size: 0.9rem;
+            color: var(--gemini-color);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .activity-log {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .activity-item {
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .activity-item.audio { border-left: 3px solid #22c55e; }
+        .activity-item.text { border-left: 3px solid var(--gemini-color); }
+        .activity-item.tool { border-left: 3px solid var(--accent); }
+        .activity-item.status { border-left: 3px solid #fbbf24; }
+        .activity-item.error { border-left: 3px solid var(--recording-color); }
+
+        .activity-icon { font-size: 1rem; }
+        .activity-text { flex: 1; word-break: break-word; }
+        .activity-time { color: var(--text-secondary); font-size: 0.7rem; }
+
+        /* Gemini Speaking Indicator */
+        .gemini-speaking {
+            position: fixed;
+            bottom: 160px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: linear-gradient(135deg, rgba(66, 133, 244, 0.3), rgba(139, 92, 246, 0.3));
+            border: 2px solid var(--gemini-color);
+            padding: 12px 24px;
+            border-radius: 30px;
+            display: none;
+            align-items: center;
+            gap: 12px;
+            z-index: 45;
+            animation: speaking-glow 1.5s ease-in-out infinite;
+        }
+
+        .gemini-speaking.active { display: flex; }
+
+        @keyframes speaking-glow {
+            0%, 100% { box-shadow: 0 0 20px rgba(66, 133, 244, 0.3); }
+            50% { box-shadow: 0 0 40px rgba(66, 133, 244, 0.6); }
+        }
+
+        .speaking-wave {
+            display: flex;
+            gap: 3px;
+            align-items: center;
+        }
+
+        .speaking-wave .wave-bar {
+            width: 4px;
+            height: 20px;
+            background: var(--gemini-color);
+            border-radius: 2px;
+            animation: wave 0.8s ease-in-out infinite;
+        }
+
+        .speaking-wave .wave-bar:nth-child(1) { animation-delay: 0s; }
+        .speaking-wave .wave-bar:nth-child(2) { animation-delay: 0.1s; }
+        .speaking-wave .wave-bar:nth-child(3) { animation-delay: 0.2s; }
+        .speaking-wave .wave-bar:nth-child(4) { animation-delay: 0.3s; }
+        .speaking-wave .wave-bar:nth-child(5) { animation-delay: 0.4s; }
+
+        @keyframes wave {
+            0%, 100% { height: 8px; }
+            50% { height: 24px; }
+        }
+
+        /* Stats Counter */
+        .stats-bar {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: var(--bg-secondary);
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            display: flex;
+            gap: 15px;
+            z-index: 50;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .stat-value {
+            font-weight: bold;
+            color: var(--gemini-color);
+        }
+    </style>
+</head>
+<body>
+    <!-- Video display -->
+    <div class="video-wrapper">
+        <canvas id="videoCanvas" width="832" height="480"></canvas>
+    </div>
+
+    <!-- Status bar -->
+    <div class="status-bar">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="status-dot" id="ltxStatus"></span>
+            <span>LTX-2</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="status-dot" id="geminiStatus"></span>
+            <span>Gemini</span>
+        </div>
+        <div class="audio-viz" id="audioViz">
+            <div class="bar" style="height: 10px;"></div>
+            <div class="bar" style="height: 15px;"></div>
+            <div class="bar" style="height: 8px;"></div>
+            <div class="bar" style="height: 20px;"></div>
+            <div class="bar" style="height: 12px;"></div>
+        </div>
+    </div>
+
+    <!-- Text input for Gemini chat -->
+    <div class="prompt-input" style="display: flex; gap: 8px; align-items: center;">
+        <input type="text" id="promptInput" placeholder="Type a message for Gemini..."
+               onkeydown="if(event.key==='Enter' && !event.shiftKey) sendTextToGemini()"
+               style="flex: 1;">
+        <button onclick="sendTextToGemini()" style="background: var(--gemini-color);">Send</button>
+        <button onclick="sendDirectPrompt()" style="background: var(--accent); font-size: 0.75rem;" title="Send prompt directly to LTX-2 (bypasses Gemini)">Direct</button>
+    </div>
+
+    <!-- Transcript display -->
+    <div class="transcript" id="transcript"></div>
+
+    <!-- Gemini control panel -->
+    <div class="gemini-panel">
+        <button class="talk-btn" id="talkBtn" onclick="toggleGemini()">🎤</button>
+        <div style="font-size: 0.8rem; color: var(--text-secondary);">
+            <span id="talkLabel">Click to start</span>
+        </div>
+    </div>
+
+    <!-- Settings button -->
+    <button class="settings-btn" id="settingsBtn" onclick="toggleSettings()">⚙️</button>
+
+    <!-- Settings panel -->
+    <div class="settings-panel" id="settingsPanel">
+        <div class="setting-group">
+            <label class="setting-label">Gemini API Key</label>
+            <input type="password" class="setting-input" id="apiKeyInput"
+                   placeholder="Enter your Gemini API key">
+        </div>
+        <div class="setting-group">
+            <label class="setting-label">Video Width</label>
+            <input type="number" class="setting-input" id="widthInput" value="832" step="32">
+        </div>
+        <div class="setting-group">
+            <label class="setting-label">Video Height</label>
+            <input type="number" class="setting-input" id="heightInput" value="480" step="32">
+        </div>
+        <div class="setting-group">
+            <label class="setting-label">Initial Prompt</label>
+            <input type="text" class="setting-input" id="initialPrompt"
+                   value="A beautiful abstract flowing visualization">
+        </div>
+        <div class="setting-group">
+            <label class="setting-label">Frame Send Interval (ms)</label>
+            <input type="number" class="setting-input" id="frameSendInterval" value="2000" min="500">
+        </div>
+        <div class="setting-group">
+            <label class="setting-label" style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+                <input type="checkbox" id="skipAudioToLtx" checked style="width: 18px; height: 18px;">
+                <span>Skip audio conditioning</span>
+            </label>
+            <div style="font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px;">
+                When checked, Gemini audio plays directly without buffering through LTX-2
+            </div>
+        </div>
+    </div>
+
+    <!-- Function call indicator -->
+    <div class="function-indicator" id="functionIndicator"></div>
+
+    <!-- Stats bar -->
+    <div class="stats-bar">
+        <div class="stat-item">
+            <span>🎵 Audio:</span>
+            <span class="stat-value" id="audioChunkCount">0</span>
+        </div>
+        <div class="stat-item">
+            <span>💬 Text:</span>
+            <span class="stat-value" id="textCount">0</span>
+        </div>
+        <div class="stat-item">
+            <span>🎬 Frames:</span>
+            <span class="stat-value" id="frameCount">0</span>
+        </div>
+        <div class="stat-item">
+            <span>👁️ To Gemini:</span>
+            <span class="stat-value" id="framesToGemini">0</span>
+        </div>
+    </div>
+
+    <!-- Activity log panel -->
+    <div class="activity-panel" id="activityPanel">
+        <h3>🤖 Gemini Activity</h3>
+        <div class="activity-log" id="activityLog">
+            <div class="activity-item status">
+                <span class="activity-icon">⏳</span>
+                <span class="activity-text">Waiting for connection...</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Gemini speaking indicator -->
+    <div class="gemini-speaking" id="geminiSpeaking">
+        <div class="speaking-wave">
+            <div class="wave-bar"></div>
+            <div class="wave-bar"></div>
+            <div class="wave-bar"></div>
+            <div class="wave-bar"></div>
+            <div class="wave-bar"></div>
+        </div>
+        <span>Gemini is speaking...</span>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // ===== Configuration =====
+        // Server handles both Gemini and LTX-2 - single unified endpoint
+        const WS_ENDPOINT = "__WS_ENDPOINT_TURBO__";
+
+        // ===== State =====
+        let ws = null;  // Single WebSocket to server
+        let isConnected = false;
+        let isGeminiConnected = false;
+        let isRecording = false;
+        let audioContext = null;
+        let audioProcessor = null;
+        let currentPrompt = "A beautiful abstract flowing visualization";
+
+        // Frame buffer for video display
+        let frameBuffer = [];
+        let frameHistory = [];
+        let currentFrameIndex = 0;
+        let playbackInterval = null;
+        const playbackFps = 12;
+
+        // ===== DOM Elements =====
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        const talkBtn = document.getElementById('talkBtn');
+        const talkLabel = document.getElementById('talkLabel');
+        const ltxStatus = document.getElementById('ltxStatus');
+        const geminiStatus = document.getElementById('geminiStatus');
+        const transcript = document.getElementById('transcript');
+        const toast = document.getElementById('toast');
+        const functionIndicator = document.getElementById('functionIndicator');
+        const audioViz = document.getElementById('audioViz');
+        const activityLog = document.getElementById('activityLog');
+        const geminiSpeaking = document.getElementById('geminiSpeaking');
+
+        // Stats counters
+        let audioChunkCount = 0;
+        let textCount = 0;
+        let frameCountNum = 0;
+        let framesToGeminiCount = 0;
+        let speakingTimeout = null;
+
+        // ===== Toast Notifications =====
+        function showToast(message, duration = 3000) {
+            toast.textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), duration);
+        }
+
+        // ===== Transcript Display =====
+        function showTranscript(text, speaker = 'gemini') {
+            transcript.innerHTML = `<div class="transcript-text ${speaker}">${text}</div>`;
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                if (transcript.querySelector('.transcript-text')?.textContent === text) {
+                    transcript.innerHTML = '';
+                }
+            }, 5000);
+        }
+
+        // ===== Function Call Indicator =====
+        function showFunctionCall(name, params) {
+            functionIndicator.textContent = `🔧 ${name}`;
+            functionIndicator.classList.add('show');
+            setTimeout(() => functionIndicator.classList.remove('show'), 2000);
+            logActivity('tool', `Tool: ${name}`, '🔧');
+        }
+
+        // ===== Activity Logging =====
+        function logActivity(type, message, icon = '📝') {
+            const time = new Date().toLocaleTimeString();
+            const item = document.createElement('div');
+            item.className = `activity-item ${type}`;
+            item.innerHTML = `
+                <span class="activity-icon">${icon}</span>
+                <span class="activity-text">${message}</span>
+                <span class="activity-time">${time}</span>
+            `;
+            activityLog.insertBefore(item, activityLog.firstChild);
+
+            // Keep only last 50 items
+            while (activityLog.children.length > 50) {
+                activityLog.removeChild(activityLog.lastChild);
+            }
+        }
+
+        function updateStats() {
+            document.getElementById('audioChunkCount').textContent = audioChunkCount;
+            document.getElementById('textCount').textContent = textCount;
+            document.getElementById('frameCount').textContent = frameCountNum;
+            document.getElementById('framesToGemini').textContent = framesToGeminiCount;
+        }
+
+        function showSpeaking() {
+            geminiSpeaking.classList.add('active');
+            if (speakingTimeout) clearTimeout(speakingTimeout);
+            speakingTimeout = setTimeout(() => {
+                geminiSpeaking.classList.remove('active');
+            }, 1500);
+        }
+
+        // ===== Settings =====
+        function toggleSettings() {
+            document.getElementById('settingsPanel').classList.toggle('open');
+        }
+
+        // ===== Server Connection (handles both Gemini and LTX-2) =====
+        async function connectServer() {
+            if (ws && ws.readyState === WebSocket.OPEN) return true;
+
+            return new Promise((resolve, reject) => {
+                ws = new WebSocket(WS_ENDPOINT);
+
+                ws.onopen = () => {
+                    isConnected = true;
+                    ltxStatus.classList.add('connected');
+                    showToast('Server connected');
+                    logActivity('status', 'WebSocket connected to server', '🔌');
+                    resolve(true);
+                };
+
+                ws.onmessage = (event) => {
+                    const msg = JSON.parse(event.data);
+                    handleServerMessage(msg);
+                };
+
+                ws.onclose = () => {
+                    isConnected = false;
+                    isGeminiConnected = false;
+                    ltxStatus.classList.remove('connected');
+                    geminiStatus.classList.remove('connected');
+                    talkBtn.classList.remove('recording', 'connecting');
+                    talkLabel.textContent = 'Click to start';
+                    showToast('Server disconnected');
+                    logActivity('error', 'WebSocket disconnected', '🔌');
+                };
+
+                ws.onerror = (err) => {
+                    console.error('WebSocket error:', err);
+                    showToast('Connection error');
+                    logActivity('error', 'WebSocket error', '⚠️');
+                    reject(err);
+                };
+
+                setTimeout(() => {
+                    if (!isConnected) reject(new Error('Connection timeout'));
+                }, 10000);
+            });
+        }
+
+        function handleServerMessage(msg) {
+            console.log('Server message:', msg.type, msg);
+            switch (msg.type) {
+                case 'gemini_connected':
+                    isGeminiConnected = true;
+                    geminiStatus.classList.add('connected');
+                    talkBtn.classList.remove('connecting');
+                    talkBtn.classList.add('recording');
+                    talkLabel.textContent = 'Listening...';
+                    showToast('Gemini connected - speak to control the video!');
+                    logActivity('status', 'Gemini connected!', '✅');
+                    break;
+
+                case 'gemini_text':
+                    showTranscript(msg.text, 'gemini');
+                    textCount++;
+                    updateStats();
+                    const shortText = msg.text.length > 50 ? msg.text.substring(0, 50) + '...' : msg.text;
+                    logActivity('text', `"${shortText}"`, '💬');
+                    break;
+
+                case 'transcript':
+                    showTranscript(msg.text, msg.speaker || 'user');
+                    if (msg.speaker === 'user') {
+                        logActivity('text', `You: "${msg.text.substring(0, 40)}..."`, '👤');
+                    }
+                    break;
+
+                case 'gemini_audio':
+                    playGeminiAudio(msg.data);
+                    animateAudioViz();
+                    showSpeaking();
+                    audioChunkCount++;
+                    updateStats();
+                    const audioLen = Math.round(atob(msg.data).length / 48); // ~ms of audio at 24kHz 16-bit
+                    logActivity('audio', `Audio chunk (~${audioLen}ms)`, '🔊');
+                    break;
+
+                case 'gemini_turn_complete':
+                    logActivity('status', 'Turn complete', '✓');
+                    break;
+
+                case 'ltx_connected':
+                    // Connected to LTX-2 GPU
+                    ltxStatus.classList.add('connected');
+                    showToast('Connected to LTX-2');
+                    logActivity('status', 'LTX-2 GPU connected', '🎬');
+                    break;
+
+                case 'started':
+                    // LTX-2 started generating
+                    showToast('Video generation started');
+                    logActivity('status', 'Video generation started', '▶️');
+                    break;
+
+                case 'frame':
+                    // Video frame from LTX-2
+                    const img = new Image();
+                    img.onload = () => {
+                        frameBuffer.push(img);
+                        frameHistory.push(img);
+                    };
+                    img.src = 'data:image/jpeg;base64,' + msg.data;
+                    frameCountNum++;
+                    updateStats();
+                    break;
+
+                case 'audio':
+                    break;
+
+                case 'segment_start':
+                    console.log(`Segment ${msg.segment} starting`);
+                    logActivity('status', `Segment ${msg.segment} started`, '🎞️');
+                    break;
+
+                case 'segment_complete':
+                    console.log(`Segment ${msg.segment} complete`);
+                    break;
+
+                case 'prompt_updated':
+                    currentPrompt = msg.prompt;
+                    showToast(`Prompt updated`);
+                    logActivity('tool', `Prompt: "${msg.prompt.substring(0, 30)}..."`, '✏️');
+                    break;
+
+                case 'mood_set':
+                    showFunctionCall('set_mood', { mood: msg.mood });
+                    break;
+
+                case 'video_reset':
+                    showFunctionCall('reset_video', {});
+                    frameBuffer = [];
+                    frameHistory = [];
+                    break;
+
+                case 'status':
+                    showToast(msg.message);
+                    logActivity('status', msg.message, '📢');
+                    break;
+
+                case 'error':
+                    showToast(`Error: ${msg.message}`);
+                    talkBtn.classList.remove('connecting');
+                    logActivity('error', msg.message, '❌');
+                    break;
+
+                case 'frames_to_gemini':
+                    framesToGeminiCount = msg.count;
+                    updateStats();
+                    logActivity('status', `${msg.count} frames sent to Gemini`, '👁️');
+                    break;
+
+                case 'tool_call':
+                    // Gemini is using a tool to control the video!
+                    if (msg.name === 'set_prompt') {
+                        const shortPrompt = msg.prompt.length > 60 ? msg.prompt.substring(0, 60) + '...' : msg.prompt;
+                        showToast('🎬 Prompt updated');
+                        logActivity('tool', `Prompt: "${shortPrompt}"`, '🎬');
+                    } else if (msg.name === 'generate_target_image') {
+                        const shortDesc = msg.description && msg.description.length > 50 ? msg.description.substring(0, 50) + '...' : (msg.description || 'image');
+                        showToast('🖼️ Target image generated!');
+                        logActivity('tool', `Generated: "${shortDesc}" @ ${msg.position || 1.0}`, '🖼️');
+                    } else if (msg.name === 'reset_history') {
+                        showToast('🔄 History reset');
+                        logActivity('tool', 'Reset history - starting fresh', '🔄');
+                    }
+                    showFunctionCall(msg.name, msg);
+                    break;
+
+                case 'stopped':
+                    isGeminiConnected = false;
+                    geminiStatus.classList.remove('connected');
+                    talkBtn.classList.remove('recording');
+                    talkLabel.textContent = 'Click to start';
+                    showToast('Stopped');
+                    logActivity('status', 'Session stopped', '⏹️');
+                    break;
+
+                default:
+                    console.log('Unknown message type:', msg.type);
+            }
+        }
+
+        async function startSession() {
+            const apiKey = document.getElementById('apiKeyInput').value;
+            if (!apiKey) {
+                showToast('Please enter your Gemini API key in settings');
+                toggleSettings();
+                return false;
+            }
+
+            talkBtn.classList.add('connecting');
+            talkLabel.textContent = 'Connecting...';
+
+            const width = parseInt(document.getElementById('widthInput').value);
+            const height = parseInt(document.getElementById('heightInput').value);
+            currentPrompt = document.getElementById('initialPrompt').value;
+
+            // Send start message with API key
+            const skipAudioToLtx = document.getElementById('skipAudioToLtx').checked;
+            ws.send(JSON.stringify({
+                action: 'start',
+                api_key: apiKey,
+                prompt: currentPrompt,
+                width: width,
+                height: height,
+                skip_audio_to_ltx: skipAudioToLtx
+            }));
+
+            // Reset counters
+            audioChunkCount = 0;
+            textCount = 0;
+            frameCountNum = 0;
+            framesToGeminiCount = 0;
+            updateStats();
+
+            frameBuffer = [];
+            frameHistory = [];
+            startPlayback();
+            logActivity('status', 'Starting session...', '🚀');
+            return true;
+        }
+
+        // ===== Video Playback =====
+        function startPlayback() {
+            if (playbackInterval) clearInterval(playbackInterval);
+            playbackInterval = setInterval(() => {
+                if (frameBuffer.length > 0) {
+                    const frame = frameBuffer.shift();
+                    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                    currentFrameIndex++;
+                }
+            }, 1000 / playbackFps);
+        }
+
+        // ===== Manual Prompt Update (through server) =====
+        function updatePromptOnServer(prompt) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    action: 'update_prompt',
+                    prompt: prompt
+                }));
+            }
+        }
+
+        // ===== Audio Handling =====
+        async function startMicrophone() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(stream);
+                audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                source.connect(audioProcessor);
+                audioProcessor.connect(audioContext.destination);
+
+                audioProcessor.onaudioprocess = (e) => {
+                    if (!isGeminiConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const pcmData = convertToPCM16(inputData);
+                    const base64Audio = arrayBufferToBase64(pcmData);
+
+                    // Send user audio to server, which forwards to Gemini
+                    ws.send(JSON.stringify({
+                        action: 'audio',
+                        data: base64Audio
+                    }));
+                };
+
+                isRecording = true;
+                return true;
+            } catch (err) {
+                console.error('Microphone error:', err);
+                showToast('Microphone access denied');
+                return false;
+            }
+        }
+
+        function stopMicrophone() {
+            if (audioProcessor) {
+                audioProcessor.disconnect();
+                audioProcessor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            isRecording = false;
+        }
+
+        function convertToPCM16(float32Array) {
+            const buffer = new ArrayBuffer(float32Array.length * 2);
+            const view = new DataView(buffer);
+            for (let i = 0; i < float32Array.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32Array[i]));
+                view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+            return buffer;
+        }
+
+        function arrayBufferToBase64(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+        }
+
+        // Play Gemini audio to user (PCM 24kHz 16-bit)
+        let audioPlaybackContext = null;
+        let audioPlaybackQueue = [];
+        let isPlayingAudio = false;
+
+        function playGeminiAudio(base64Audio) {
+            try {
+                // Decode base64 to PCM samples
+                const audioData = atob(base64Audio);
+                const arrayBuffer = new ArrayBuffer(audioData.length);
+                const view = new Uint8Array(arrayBuffer);
+                for (let i = 0; i < audioData.length; i++) {
+                    view[i] = audioData.charCodeAt(i);
+                }
+
+                // Convert 16-bit PCM to float32
+                const int16Array = new Int16Array(arrayBuffer);
+                const float32Array = new Float32Array(int16Array.length);
+                for (let i = 0; i < int16Array.length; i++) {
+                    float32Array[i] = int16Array[i] / 32768.0;
+                }
+
+                // Queue the audio
+                audioPlaybackQueue.push(float32Array);
+                playNextAudioChunk();
+            } catch (err) {
+                console.error('Audio playback error:', err);
+            }
+        }
+
+        function playNextAudioChunk() {
+            if (isPlayingAudio || audioPlaybackQueue.length === 0) return;
+
+            isPlayingAudio = true;
+            const samples = audioPlaybackQueue.shift();
+
+            if (!audioPlaybackContext) {
+                audioPlaybackContext = new AudioContext({ sampleRate: 24000 });
+            }
+
+            // Create audio buffer
+            const buffer = audioPlaybackContext.createBuffer(1, samples.length, 24000);
+            buffer.getChannelData(0).set(samples);
+
+            const source = audioPlaybackContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioPlaybackContext.destination);
+            source.onended = () => {
+                isPlayingAudio = false;
+                playNextAudioChunk();
+            };
+            source.start();
+        }
+
+        function animateAudioViz() {
+            const bars = audioViz.querySelectorAll('.bar');
+            bars.forEach(bar => {
+                bar.style.height = (5 + Math.random() * 20) + 'px';
+            });
+            setTimeout(() => {
+                bars.forEach(bar => {
+                    bar.style.height = '10px';
+                });
+            }, 200);
+        }
+
+        // ===== Main Toggle =====
+        async function toggleGemini() {
+            if (isGeminiConnected) {
+                // Stop session
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ action: 'stop' }));
+                }
+                stopMicrophone();
+                isGeminiConnected = false;
+                talkBtn.classList.remove('recording');
+                talkLabel.textContent = 'Click to start';
+            } else {
+                // Start new session
+                try {
+                    // Connect to server if not already
+                    if (!ws || ws.readyState !== WebSocket.OPEN) {
+                        await connectServer();
+                    }
+
+                    // Start the session (connects Gemini server-side)
+                    await startSession();
+
+                    // Start microphone for user audio
+                    await startMicrophone();
+
+                } catch (err) {
+                    console.error('Connection error:', err);
+                    showToast('Failed to connect: ' + err.message);
+                    talkBtn.classList.remove('connecting');
+                }
+            }
+        }
+
+        // ===== Text Input to Gemini =====
+        function sendTextToGemini() {
+            const input = document.getElementById('promptInput');
+            const text = input.value.trim();
+            if (text && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    action: 'send_text_to_gemini',
+                    text: text
+                }));
+                input.value = '';
+            }
+        }
+
+        // ===== Direct Prompt to LTX-2 =====
+        function sendDirectPrompt() {
+            const input = document.getElementById('promptInput');
+            if (input.value.trim()) {
+                currentPrompt = input.value.trim();
+                updatePromptOnServer(currentPrompt);
+                showTranscript(`[Direct] ${currentPrompt}`, 'user');
+                input.value = '';
+            }
+        }
+
+        // ===== Manual Prompt Update (legacy) =====
+        function updatePrompt() {
+            sendTextToGemini();
+        }
+
+        // ===== Initialize =====
+        function init() {
+            // Load saved API key
+            const savedKey = localStorage.getItem('gemini_api_key');
+            if (savedKey) {
+                document.getElementById('apiKeyInput').value = savedKey;
+            }
+
+            // Save API key on change
+            document.getElementById('apiKeyInput').addEventListener('change', (e) => {
+                localStorage.setItem('gemini_api_key', e.target.value);
+            });
+
+            // Connect to server on load
+            setTimeout(connectServer, 500);
+        }
+
+        init();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.function(timeout=3600)
+@modal.asgi_app()
+def gemini_live_ui():
+    """
+    Gemini Live UI - CPU handles Gemini, connects server-to-server to GPU for video.
+    """
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse
+    from fastapi.middleware.cors import CORSMiddleware
+    import asyncio
+    import json
+    import base64
+    import websockets
+    from google import genai
+
+    ui_app = FastAPI(title="Gemini Live × LTX-2")
+    ui_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    GEMINI_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+    LTX_WS_URL = WEBSOCKET_ENDPOINT_TURBO
+
+    @ui_app.get("/", response_class=HTMLResponse)
+    async def index():
+        html = GEMINI_LIVE_HTML.replace(
+            "__WS_ENDPOINT_TURBO__",
+            "wss://tmalive--ltx2-official-distilled-gemini-live-ui.modal.run/ws/gemini-live"
+        )
+        return HTMLResponse(html)
+
+    @ui_app.get("/health")
+    async def health():
+        return {"status": "healthy", "service": "gemini-live-ui"}
+
+    @ui_app.websocket("/ws/gemini-live")
+    async def gemini_live_bridge(websocket: WebSocket):
+        """Bridge: Client ↔ Gemini (CPU) ↔ LTX-2 (GPU)"""
+        await websocket.accept()
+        print("Client connected", flush=True)
+
+        gemini_session = None
+        gemini_ctx = None  # Context manager for proper cleanup
+        ltx_ws = None
+        should_stop = False
+        state = {"skip_audio_conditioning": True, "last_frame_b64": None}  # Mutable state dict
+        user_audio_queue = asyncio.Queue()
+        gemini_audio_queue = asyncio.Queue()
+        video_frame_queue = asyncio.Queue()  # Queue for sending frames to Gemini
+
+        async def connect_to_ltx():
+            """Connect to GPU with timeout for cold start."""
+            nonlocal ltx_ws
+            try:
+                # open_timeout=120 controls handshake timeout, allowing for GPU cold start
+                ltx_ws = await websockets.connect(
+                    LTX_WS_URL,
+                    open_timeout=120,
+                    close_timeout=10
+                )
+                print(f"Connected to LTX-2: {LTX_WS_URL}", flush=True)
+                return True
+            except Exception as e:
+                print(f"LTX-2 connection failed: {e}", flush=True)
+                return False
+
+        async def send_to_gemini():
+            while not should_stop and gemini_session:
+                try:
+                    audio_b64 = await asyncio.wait_for(user_audio_queue.get(), timeout=0.1)
+                    await gemini_session.send_realtime_input(
+                        audio={"data": base64.b64decode(audio_b64), "mime_type": "audio/pcm"}
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    if not should_stop:
+                        print(f"Gemini send error: {e}", flush=True)
+
+        async def receive_from_gemini():
+            from google.genai import types
+            current_prompt = msg.get("prompt", "A beautiful flowing visualization")
+
+            while not should_stop and gemini_session:
+                try:
+                    turn = gemini_session.receive()
+                    async for response in turn:
+                        # Handle model content (text/audio)
+                        if response.server_content and response.server_content.model_turn:
+                            for part in response.server_content.model_turn.parts:
+                                if part.text:
+                                    await websocket.send_json({"type": "gemini_text", "text": part.text})
+                                if part.inline_data and isinstance(part.inline_data.data, bytes):
+                                    audio_b64 = base64.b64encode(part.inline_data.data).decode()
+                                    await websocket.send_json({"type": "gemini_audio", "data": audio_b64})
+                                    # Only queue for LTX conditioning if enabled
+                                    if not state["skip_audio_conditioning"]:
+                                        await gemini_audio_queue.put(part.inline_data.data)
+
+                        # Handle tool calls
+                        if response.tool_call:
+                            for func_call in response.tool_call.function_calls:
+                                func_name = func_call.name
+                                func_args = func_call.args
+                                func_id = func_call.id
+                                print(f"Tool call: {func_name}({func_args})", flush=True)
+
+                                result = {"success": True}
+
+                                if func_name == "set_prompt" and ltx_ws:
+                                    new_prompt = func_args.get("prompt", "")
+                                    if new_prompt:
+                                        current_prompt = new_prompt
+                                        await ltx_ws.send(json.dumps({
+                                            "action": "update_prompt",
+                                            "prompt": new_prompt
+                                        }))
+                                        await websocket.send_json({
+                                            "type": "tool_call",
+                                            "name": "set_prompt",
+                                            "prompt": new_prompt
+                                        })
+                                        result = {"success": True, "prompt": new_prompt}
+
+                                elif func_name == "generate_target_image" and ltx_ws:
+                                    image_desc = func_args.get("image_description", "")
+                                    video_prompt = func_args.get("prompt", image_desc)
+                                    position = float(func_args.get("position", 1.0))
+                                    position = max(0.0, min(1.0, position))
+
+                                    if image_desc and state.get("genai_client"):
+                                        try:
+                                            from google.genai import types as genai_types
+
+                                            # Generate image using Gemini, conditioned on current frame
+                                            await websocket.send_json({
+                                                "type": "status",
+                                                "message": "Generating target image..."
+                                            })
+                                            print(f"Generating image: {image_desc[:50]}...", flush=True)
+
+                                            # Build contents with current frame if available
+                                            if state.get("last_frame_b64"):
+                                                frame_bytes = base64.b64decode(state["last_frame_b64"])
+                                                contents = [
+                                                    genai_types.Part.from_bytes(data=frame_bytes, mime_type="image/jpeg"),
+                                                    f"Based on this current video frame, generate a new image: {image_desc}"
+                                                ]
+                                                print("Conditioning on current video frame", flush=True)
+                                            else:
+                                                contents = [image_desc]
+                                                print("No current frame available, generating from text only", flush=True)
+
+                                            img_response = await state["genai_client"].aio.models.generate_content(
+                                                model="gemini-2.5-flash-image",
+                                                contents=contents,
+                                            )
+
+                                            # Extract image data
+                                            image_b64 = None
+                                            for part in img_response.candidates[0].content.parts:
+                                                if part.inline_data:
+                                                    image_b64 = base64.b64encode(part.inline_data.data).decode()
+                                                    break
+
+                                            if image_b64:
+                                                # Send to LTX-2 as target image
+                                                await ltx_ws.send(json.dumps({
+                                                    "action": "set_target_image",
+                                                    "image": image_b64,
+                                                    "position": position
+                                                }))
+
+                                                # Also update the prompt
+                                                if video_prompt:
+                                                    current_prompt = video_prompt
+                                                    await ltx_ws.send(json.dumps({
+                                                        "action": "update_prompt",
+                                                        "prompt": video_prompt
+                                                    }))
+
+                                                await websocket.send_json({
+                                                    "type": "tool_call",
+                                                    "name": "generate_target_image",
+                                                    "description": image_desc[:100],
+                                                    "position": position
+                                                })
+                                                result = {"success": True, "message": f"Image generated and set at position {position}"}
+                                                print(f"Target image set at position {position}", flush=True)
+                                            else:
+                                                result = {"success": False, "error": "No image generated"}
+                                        except Exception as img_err:
+                                            print(f"Image generation error: {img_err}", flush=True)
+                                            result = {"success": False, "error": str(img_err)}
+                                    else:
+                                        result = {"success": False, "error": "Missing image description or client"}
+
+                                elif func_name == "reset_history" and ltx_ws:
+                                    await ltx_ws.send(json.dumps({
+                                        "action": "reset_history"
+                                    }))
+                                    await websocket.send_json({
+                                        "type": "tool_call",
+                                        "name": "reset_history"
+                                    })
+                                    result = {"success": True, "message": "History reset"}
+
+                                # Send tool response back to Gemini
+                                await gemini_session.send_tool_response(
+                                    function_responses=[types.FunctionResponse(
+                                        name=func_name,
+                                        response=result,
+                                        id=func_id
+                                    )]
+                                )
+
+                        if response.server_content and response.server_content.turn_complete:
+                            await websocket.send_json({"type": "gemini_turn_complete"})
+                except Exception as e:
+                    if not should_stop:
+                        print(f"Gemini recv error: {e}", flush=True)
+                    break
+
+        async def receive_from_ltx():
+            while not should_stop and ltx_ws:
+                try:
+                    msg = await ltx_ws.recv()
+                    parsed = json.loads(msg)
+                    await websocket.send_json(parsed)
+                    # If it's a frame, also queue it for Gemini and store as latest
+                    if parsed.get("type") == "frame" and parsed.get("data"):
+                        state["last_frame_b64"] = parsed["data"]
+                        await video_frame_queue.put(parsed["data"])
+                except websockets.exceptions.ConnectionClosed:
+                    break
+                except Exception as e:
+                    if not should_stop:
+                        print(f"LTX recv error: {e}", flush=True)
+
+        async def send_video_to_gemini():
+            """Send video frames to Gemini so it can see what's being generated."""
+            from google.genai import types
+            frame_count = 0
+            frames_sent = 0
+            last_send = asyncio.get_event_loop().time()
+
+            while not should_stop and gemini_session:
+                try:
+                    try:
+                        frame_b64 = await asyncio.wait_for(video_frame_queue.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    now = asyncio.get_event_loop().time()
+                    # Send every 5th frame or at least every 2 seconds to not overwhelm
+                    frame_count += 1
+                    if frame_count % 5 == 0 or (now - last_send) >= 2.0:
+                        # Decode base64 JPEG and send to Gemini
+                        frame_bytes = base64.b64decode(frame_b64)
+                        await gemini_session.send_realtime_input(
+                            media=types.Blob(data=frame_bytes, mime_type="image/jpeg")
+                        )
+                        frames_sent += 1
+                        last_send = now
+                        # Notify client every 10 frames sent
+                        if frames_sent % 10 == 0:
+                            await websocket.send_json({"type": "frames_to_gemini", "count": frames_sent})
+                        print(f"Sent frame {frames_sent} to Gemini", flush=True)
+                except Exception as e:
+                    if not should_stop:
+                        print(f"Gemini video send error: {e}", flush=True)
+
+        async def send_audio_to_ltx():
+            """Send Gemini audio to LTX-2 for conditioning."""
+            import numpy as np
+            import io
+            import struct
+            audio_buffer = []
+            last_send = asyncio.get_event_loop().time()
+
+            while not should_stop and ltx_ws:
+                try:
+                    try:
+                        chunk = await asyncio.wait_for(gemini_audio_queue.get(), timeout=0.5)
+                        audio_buffer.append(chunk)
+                    except asyncio.TimeoutError:
+                        pass
+
+                    now = asyncio.get_event_loop().time()
+                    if audio_buffer and (now - last_send) >= 2.0:
+                        samples = np.concatenate([np.frombuffer(c, dtype=np.int16) for c in audio_buffer])
+                        # Create WAV
+                        wav = io.BytesIO()
+                        wav.write(b'RIFF')
+                        wav.write(struct.pack('<I', 36 + len(samples) * 2))
+                        wav.write(b'WAVEfmt ')
+                        wav.write(struct.pack('<IHHIIHH', 16, 1, 1, 24000, 48000, 2, 16))
+                        wav.write(b'data')
+                        wav.write(struct.pack('<I', len(samples) * 2))
+                        wav.write(samples.tobytes())
+
+                        await ltx_ws.send(json.dumps({
+                            "action": "set_audio",
+                            "audio": base64.b64encode(wav.getvalue()).decode(),
+                            "strength": 0.0,
+                            "num_frames": 49,
+                            "frame_rate": 24
+                        }))
+                        audio_buffer = []
+                        last_send = now
+                except Exception as e:
+                    if not should_stop:
+                        print(f"LTX audio send error: {e}", flush=True)
+
+        tasks = []
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
+                    msg = json.loads(data)
+                    action = msg.get("action")
+
+                    if action == "start":
+                        api_key = msg.get("api_key")
+                        if not api_key:
+                            await websocket.send_json({"type": "error", "message": "API key required"})
+                            continue
+
+                        # Get audio conditioning setting
+                        state["skip_audio_conditioning"] = msg.get("skip_audio_to_ltx", True)
+
+                        # Connect to LTX-2 GPU
+                        await websocket.send_json({"type": "status", "message": "Connecting to LTX-2..."})
+                        if not await connect_to_ltx():
+                            await websocket.send_json({"type": "error", "message": "Failed to connect to LTX-2"})
+                            continue
+
+                        # Start video
+                        await ltx_ws.send(json.dumps({
+                            "action": "start",
+                            "prompt": msg.get("prompt", "A beautiful flowing visualization"),
+                            "height": msg.get("height", 480),
+                            "width": msg.get("width", 832),
+                            "seed": 42,
+                            "num_frames": 49,
+                            "frame_rate": 24,
+                            "max_segments": 1000
+                        }))
+                        tasks.append(asyncio.create_task(receive_from_ltx()))
+
+                        # Connect to Gemini
+                        await websocket.send_json({"type": "status", "message": "Connecting to Gemini..."})
+                        try:
+                            client = genai.Client(api_key=api_key)
+
+                            # Direct controls - same as user has in UI
+                            video_tools = [{
+                                "function_declarations": [
+                                    {
+                                        "name": "set_prompt",
+                                        "description": "Set the video generation prompt. This directly controls what the AI video model generates. Use descriptive text to create any scene you want.",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {
+                                                "prompt": {
+                                                    "type": "string",
+                                                    "description": "The prompt describing what to generate. Be descriptive - include subjects, actions, style, colors, lighting, camera movement, atmosphere."
+                                                }
+                                            },
+                                            "required": ["prompt"]
+                                        }
+                                    },
+                                    {
+                                        "name": "generate_target_image",
+                                        "description": "Generate a target image using AI and set it as the visual target for the video. The video will transition toward this image. Use this for precise visual control - when you want a specific look, composition, or scene. More powerful than just a text prompt.",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {
+                                                "image_description": {
+                                                    "type": "string",
+                                                    "description": "Detailed description of the image to generate. Be specific about composition, subjects, colors, lighting, style, mood."
+                                                },
+                                                "prompt": {
+                                                    "type": "string",
+                                                    "description": "Optional video prompt to set alongside the image. If not provided, a prompt will be derived from the image description."
+                                                },
+                                                "position": {
+                                                    "type": "number",
+                                                    "description": "Where in the video segment the target appears: 0.0=start, 0.5=middle, 1.0=end. Default 1.0 (end)."
+                                                }
+                                            },
+                                            "required": ["image_description"]
+                                        }
+                                    },
+                                    {
+                                        "name": "reset_history",
+                                        "description": "Reset the video generation history to start completely fresh. Use this when you want to make a dramatic change that breaks from the current visual continuity.",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {}
+                                        }
+                                    }
+                                ]
+                            }]
+
+                            # Store client for image generation
+                            state["genai_client"] = client
+
+                            # Use context manager protocol manually
+                            gemini_ctx = client.aio.live.connect(
+                                model=GEMINI_MODEL,
+                                config={
+                                    "response_modalities": ["AUDIO"],
+                                    "tools": video_tools,
+                                    "system_instruction": """You are an AI video director with real-time vision controlling LTX-2, a live AI video generation model.
+
+YOU CAN SEE video frames in real-time.
+
+YOU HAVE THREE CONTROLS:
+- set_prompt(prompt): Change what's being generated via text description.
+- generate_target_image(image_description, prompt?, position?): Generate a target image using AI and make the video transition toward it. More powerful than text-only prompts for precise visual control. Position: 0.0=start, 0.5=middle, 1.0=end of segment.
+- reset_history(): Start fresh with no visual continuity from previous frames.
+
+WHEN TO USE EACH:
+- Use set_prompt for quick changes and general scene direction
+- Use generate_target_image when the user wants something specific/detailed, or for dramatic visual transformations
+- Use reset_history AFTER setting a new prompt/image for clean transitions
+
+GUIDELINES:
+1. When the user asks for something specific, prefer generate_target_image for best results
+2. Be creative and descriptive - describe composition, subjects, colors, lighting, style
+3. Narrate what you're creating and react to what you see
+4. For dramatic changes: set prompt/image first, then reset_history
+
+Your voice also influences the atmosphere, so speak expressively!"""
+                                }
+                            )
+                            gemini_session = await gemini_ctx.__aenter__()
+                            await websocket.send_json({"type": "gemini_connected"})
+                            tasks.extend([
+                                asyncio.create_task(send_to_gemini()),
+                                asyncio.create_task(receive_from_gemini()),
+                                asyncio.create_task(send_video_to_gemini()),
+                            ])
+                            # Only add audio conditioning task if not skipped
+                            if not state["skip_audio_conditioning"]:
+                                tasks.append(asyncio.create_task(send_audio_to_ltx()))
+                                await websocket.send_json({"type": "status", "message": "Audio conditioning enabled"})
+                        except Exception as e:
+                            await websocket.send_json({"type": "error", "message": f"Gemini: {e}"})
+
+                    elif action == "audio" and msg.get("data"):
+                        await user_audio_queue.put(msg["data"])
+
+                    elif action == "send_text_to_gemini" and gemini_session:
+                        text = msg.get("text", "")
+                        if text:
+                            print(f"Sending text to Gemini: {text}", flush=True)
+                            await websocket.send_json({"type": "transcript", "text": text, "speaker": "user"})
+                            await gemini_session.send_client_content(
+                                turns={"role": "user", "parts": [{"text": text}]},
+                                turn_complete=True
+                            )
+
+                    elif action == "update_prompt" and ltx_ws:
+                        await ltx_ws.send(json.dumps({"action": "update_prompt", "prompt": msg.get("prompt", "")}))
+
+                    elif action == "stop":
+                        break
+
+                except asyncio.TimeoutError:
+                    continue
+
+        except WebSocketDisconnect:
+            print("Client disconnected", flush=True)
+        finally:
+            should_stop = True
+            for t in tasks:
+                t.cancel()
+            if gemini_ctx:
+                try: await gemini_ctx.__aexit__(None, None, None)
+                except: pass
+            if ltx_ws:
+                try: await ltx_ws.close()
+                except: pass
+
+    return ui_app
 
 
 @app.function(timeout=60)

@@ -8261,10 +8261,30 @@ GEMINI_LIVE_HTML = """
         }
 
         // ===== Text Input to Gemini =====
-        function sendTextToGemini() {
+        async function sendTextToGemini() {
             const input = document.getElementById('promptInput');
             const text = input.value.trim();
-            if (text && ws && ws.readyState === WebSocket.OPEN) {
+            if (!text) return;
+
+            // Auto-connect to Gemini if not connected
+            if (!isGeminiConnected) {
+                try {
+                    // Connect to server if not already
+                    if (!ws || ws.readyState !== WebSocket.OPEN) {
+                        await connectServer();
+                    }
+                    // Start the session (connects Gemini server-side)
+                    await startSession();
+                    // Wait a moment for Gemini to connect
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (err) {
+                    console.error('Failed to connect:', err);
+                    showToast('Failed to connect to Gemini: ' + err.message);
+                    return;
+                }
+            }
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     action: 'send_text_to_gemini',
                     text: text

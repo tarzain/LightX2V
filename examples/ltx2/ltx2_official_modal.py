@@ -7216,6 +7216,60 @@ GEMINI_LIVE_HTML = """
             object-fit: contain;
         }
 
+        #drawingCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            cursor: crosshair;
+            touch-action: none;
+        }
+
+        .drawing-controls {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            z-index: 60;
+            background: var(--bg-secondary);
+            padding: 8px 12px;
+            border-radius: 20px;
+            opacity: 0.9;
+        }
+
+        .drawing-controls input[type="color"] {
+            width: 32px;
+            height: 32px;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .drawing-controls input[type="range"] {
+            width: 60px;
+        }
+
+        .drawing-controls button {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 12px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+
+        .drawing-controls button:hover {
+            background: var(--accent);
+        }
+
+        .drawing-controls .drawing-active {
+            background: #ff4444;
+            color: white;
+        }
+
         /* Gemini control panel */
         .gemini-panel {
             position: fixed;
@@ -7602,9 +7656,19 @@ GEMINI_LIVE_HTML = """
     </style>
 </head>
 <body>
-    <!-- Video display -->
+    <!-- Video display with drawing overlay -->
     <div class="video-wrapper">
         <canvas id="videoCanvas" width="832" height="480"></canvas>
+        <canvas id="drawingCanvas" width="832" height="480"></canvas>
+    </div>
+
+    <!-- Drawing controls -->
+    <div class="drawing-controls" id="drawingControls">
+        <input type="color" id="brushColor" value="#ff0000" title="Brush color">
+        <input type="range" id="brushSize" min="2" max="20" value="5" title="Brush size">
+        <button id="clearDrawingBtn" onclick="clearDrawing()">Clear</button>
+        <button id="undoDrawingBtn" onclick="undoDrawing()">Undo</button>
+        <span id="drawingStatus" style="font-size: 0.75rem; color: var(--text-secondary);"></span>
     </div>
 
     <!-- Status bar -->
@@ -7757,6 +7821,8 @@ GEMINI_LIVE_HTML = """
         // ===== DOM Elements =====
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
+        const drawingCanvas = document.getElementById('drawingCanvas');
+        const drawCtx = drawingCanvas.getContext('2d');
         const talkBtn = document.getElementById('talkBtn');
         const talkLabel = document.getElementById('talkLabel');
         const ltxStatus = document.getElementById('ltxStatus');
@@ -7768,12 +7834,163 @@ GEMINI_LIVE_HTML = """
         const activityLog = document.getElementById('activityLog');
         const geminiSpeaking = document.getElementById('geminiSpeaking');
 
+        // Drawing state
+        let isDrawing = false;
+        let isPaused = false;
+        let pausedFrame = null;
+        let drawingHistory = [];
+        let currentPath = [];
+
         // Stats counters
         let audioChunkCount = 0;
         let textCount = 0;
         let frameCountNum = 0;
         let framesToGeminiCount = 0;
         let speakingTimeout = null;
+
+        // ===== Drawing Functions =====
+        function initDrawing() {
+            // Sync drawing canvas size with video canvas
+            function syncCanvasSize() {
+                const rect = canvas.getBoundingClientRect();
+                drawingCanvas.style.width = rect.width + 'px';
+                drawingCanvas.style.height = rect.height + 'px';
+                drawingCanvas.style.left = rect.left + 'px';
+                drawingCanvas.style.top = rect.top + 'px';
+            }
+            syncCanvasSize();
+            window.addEventListener('resize', syncCanvasSize);
+
+            // Mouse events
+            drawingCanvas.addEventListener('mousedown', startDrawing);
+            drawingCanvas.addEventListener('mousemove', draw);
+            drawingCanvas.addEventListener('mouseup', stopDrawing);
+            drawingCanvas.addEventListener('mouseleave', stopDrawing);
+
+            // Touch events
+            drawingCanvas.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                const touch = e.touches[0];
+                startDrawing({ clientX: touch.clientX, clientY: touch.clientY });
+            });
+            drawingCanvas.addEventListener('touchmove', (e) => {
+                e.preventDefault();
+                const touch = e.touches[0];
+                draw({ clientX: touch.clientX, clientY: touch.clientY });
+            });
+            drawingCanvas.addEventListener('touchend', stopDrawing);
+        }
+
+        function getDrawingCoords(e) {
+            const rect = drawingCanvas.getBoundingClientRect();
+            const scaleX = drawingCanvas.width / rect.width;
+            const scaleY = drawingCanvas.height / rect.height;
+            return {
+                x: (e.clientX - rect.left) * scaleX,
+                y: (e.clientY - rect.top) * scaleY
+            };
+        }
+
+        function startDrawing(e) {
+            isDrawing = true;
+
+            // Pause video on first draw stroke
+            if (!isPaused && frameHistory.length > 0) {
+                isPaused = true;
+                pausedFrame = frameHistory[frameHistory.length - 1];
+                document.getElementById('drawingStatus').textContent = 'Paused - Drawing mode';
+                showToast('Video paused for drawing');
+            }
+
+            const coords = getDrawingCoords(e);
+            currentPath = [coords];
+
+            drawCtx.strokeStyle = document.getElementById('brushColor').value;
+            drawCtx.lineWidth = document.getElementById('brushSize').value;
+            drawCtx.lineCap = 'round';
+            drawCtx.lineJoin = 'round';
+            drawCtx.beginPath();
+            drawCtx.moveTo(coords.x, coords.y);
+        }
+
+        function draw(e) {
+            if (!isDrawing) return;
+            const coords = getDrawingCoords(e);
+            currentPath.push(coords);
+            drawCtx.lineTo(coords.x, coords.y);
+            drawCtx.stroke();
+        }
+
+        function stopDrawing() {
+            if (isDrawing && currentPath.length > 0) {
+                drawingHistory.push({
+                    path: currentPath,
+                    color: document.getElementById('brushColor').value,
+                    size: document.getElementById('brushSize').value
+                });
+            }
+            isDrawing = false;
+            currentPath = [];
+        }
+
+        function clearDrawing() {
+            drawCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+            drawingHistory = [];
+            if (isPaused) {
+                isPaused = false;
+                pausedFrame = null;
+                document.getElementById('drawingStatus').textContent = '';
+                showToast('Drawing cleared - video resumed');
+            }
+        }
+
+        function undoDrawing() {
+            if (drawingHistory.length === 0) return;
+            drawingHistory.pop();
+            redrawAll();
+        }
+
+        function redrawAll() {
+            drawCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+            for (const stroke of drawingHistory) {
+                if (stroke.path.length < 2) continue;
+                drawCtx.strokeStyle = stroke.color;
+                drawCtx.lineWidth = stroke.size;
+                drawCtx.lineCap = 'round';
+                drawCtx.lineJoin = 'round';
+                drawCtx.beginPath();
+                drawCtx.moveTo(stroke.path[0].x, stroke.path[0].y);
+                for (let i = 1; i < stroke.path.length; i++) {
+                    drawCtx.lineTo(stroke.path[i].x, stroke.path[i].y);
+                }
+                drawCtx.stroke();
+            }
+        }
+
+        function getCombinedImage() {
+            // Create a combined canvas with video + drawing
+            const combined = document.createElement('canvas');
+            combined.width = canvas.width;
+            combined.height = canvas.height;
+            const combCtx = combined.getContext('2d');
+
+            // Draw the current video frame (or paused frame)
+            if (pausedFrame) {
+                combCtx.drawImage(pausedFrame, 0, 0, combined.width, combined.height);
+            } else if (frameHistory.length > 0) {
+                combCtx.drawImage(frameHistory[frameHistory.length - 1], 0, 0, combined.width, combined.height);
+            }
+
+            // Draw the drawing overlay
+            combCtx.drawImage(drawingCanvas, 0, 0);
+
+            // Return as base64 JPEG
+            return combined.toDataURL('image/jpeg', 0.9).split(',')[1];
+        }
+
+        function hasDrawing() {
+            return drawingHistory.length > 0;
+        }
 
         // ===== Toast Notifications =====
         function showToast(message, duration = 3000) {
@@ -8070,6 +8287,19 @@ GEMINI_LIVE_HTML = """
         function startPlayback() {
             if (playbackInterval) clearInterval(playbackInterval);
             playbackInterval = setInterval(() => {
+                // Don't update video if paused for drawing
+                if (isPaused) {
+                    // Keep showing the paused frame
+                    if (pausedFrame) {
+                        ctx.drawImage(pausedFrame, 0, 0, canvas.width, canvas.height);
+                    }
+                    // Still consume frames to keep buffer from growing
+                    while (frameBuffer.length > 0) {
+                        frameHistory.push(frameBuffer.shift());
+                    }
+                    return;
+                }
+
                 if (frameBuffer.length > 0) {
                     const frame = frameBuffer.shift();
                     ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
@@ -8285,11 +8515,24 @@ GEMINI_LIVE_HTML = """
             }
 
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
+                const message = {
                     action: 'send_text_to_gemini',
                     text: text
-                }));
+                };
+
+                // Include drawn image if there's a drawing
+                if (hasDrawing()) {
+                    message.image = getCombinedImage();
+                    showToast('Sending message with drawing...');
+                }
+
+                ws.send(JSON.stringify(message));
                 input.value = '';
+
+                // Clear drawing and resume video after sending
+                if (hasDrawing()) {
+                    clearDrawing();
+                }
             }
         }
 
@@ -8311,6 +8554,9 @@ GEMINI_LIVE_HTML = """
 
         // ===== Initialize =====
         function init() {
+            // Initialize drawing canvas
+            initDrawing();
+
             // Load saved API key
             const savedKey = localStorage.getItem('gemini_api_key');
             if (savedKey) {
@@ -8792,11 +9038,26 @@ Your voice also influences the atmosphere, so speak expressively!"""
 
                     elif action == "send_text_to_gemini" and gemini_session:
                         text = msg.get("text", "")
+                        image_b64 = msg.get("image")  # Optional drawn image
                         if text:
                             print(f"Sending text to Gemini: {text}", flush=True)
+                            if image_b64:
+                                print("Including drawn image with message", flush=True)
+
+                            # Build parts list
+                            parts = []
+                            if image_b64:
+                                # Include the drawn image
+                                from google.genai import types as genai_types
+                                image_bytes = base64.b64decode(image_b64)
+                                parts.append(genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+                                # Also store it as the last frame for image generation conditioning
+                                state["last_frame_b64"] = image_b64
+                            parts.append({"text": text})
+
                             await websocket.send_json({"type": "transcript", "text": text, "speaker": "user"})
                             await gemini_session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": text}]},
+                                turns={"role": "user", "parts": parts},
                                 turn_complete=True
                             )
 

@@ -7226,8 +7226,9 @@ GEMINI_LIVE_HTML = """
 
         .drawing-controls {
             position: fixed;
-            top: 20px;
-            left: 20px;
+            bottom: 180px;
+            left: 50%;
+            transform: translateX(-50%);
             display: flex;
             gap: 8px;
             align-items: center;

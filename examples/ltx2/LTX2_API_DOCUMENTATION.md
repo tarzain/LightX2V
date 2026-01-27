@@ -8,7 +8,24 @@ The LTX-2 API provides multiple interfaces for video generation:
 
 1. **REST API** - Synchronous endpoints for batch video generation
 2. **WebSocket Streaming API** - Real-time video streaming with frame-by-frame delivery
-3. **Gemini Live WebSocket API** - Voice-driven video generation powered by Gemini Live
+3. **Gemini Live WebSocket API** - Voice and text-driven video generation powered by Gemini Live
+
+## Live Deployment URLs
+
+### Web UIs
+| Interface | URL | Description |
+|-----------|-----|-------------|
+| **Main Web UI** | https://tmalive--ltx2-official-distilled-web.modal.run | Full-featured generation interface |
+| **Streaming UI** | https://tmalive--ltx2-official-distilled-streaming-ui.modal.run | Real-time streaming interface |
+| **Minimal UI** | https://tmalive--ltx2-official-distilled-minimal-ui.modal.run | Simplified video-focused UI |
+| **Gemini Live UI** | https://tmalive--ltx2-official-distilled-gemini-live-ui.modal.run | Voice/text + drawing interface |
+
+### API Endpoints
+| Endpoint | URL |
+|----------|-----|
+| **REST API Base** | https://tmalive--ltx2-official-distilled-web.modal.run |
+| **WebSocket Streaming** | wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream |
+| **Gemini Live WebSocket** | wss://tmalive--ltx2-official-distilled-officialltx2engine-gemi-93f1dd.modal.run/ws/gemini-live |
 
 ## Deployment Architecture
 
@@ -24,7 +41,7 @@ The deployment runs on Modal with the following components:
 
 ### Base URL
 ```
-https://<your-modal-deployment-url>
+https://tmalive--ltx2-official-distilled-web.modal.run
 ```
 
 ---
@@ -77,7 +94,7 @@ The endpoint automatically detects the generation mode based on provided inputs:
 
 ```bash
 # Text-to-Video
-curl -X POST "https://your-deployment/api/generate" \
+curl -X POST "https://tmalive--ltx2-official-distilled-web.modal.run/api/generate" \
   -F "prompt=A majestic eagle soaring through a golden sunset sky" \
   -F "width=768" \
   -F "height=512" \
@@ -86,7 +103,7 @@ curl -X POST "https://your-deployment/api/generate" \
   --output output.mp4
 
 # Image-to-Video
-curl -X POST "https://your-deployment/api/generate" \
+curl -X POST "https://tmalive--ltx2-official-distilled-web.modal.run/api/generate" \
   -F "prompt=A person walking through a forest" \
   -F "first_frame=@input.png" \
   -F "width=768" \
@@ -94,7 +111,7 @@ curl -X POST "https://your-deployment/api/generate" \
   --output output.mp4
 
 # Audio-to-Video
-curl -X POST "https://your-deployment/api/generate" \
+curl -X POST "https://tmalive--ltx2-official-distilled-web.modal.run/api/generate" \
   -F "prompt=A music visualization" \
   -F "audio=@music.mp3" \
   -F "audio_conditioning_strength=0.3" \
@@ -227,7 +244,7 @@ curl -X POST "https://your-deployment/api/generate" \
 ### Endpoint
 
 ```
-wss://<your-modal-deployment-url>/ws/stream
+wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream
 ```
 
 The WebSocket API enables real-time video streaming with frame-by-frame delivery and dynamic control during generation.
@@ -649,7 +666,7 @@ Response to `set_next_segment`.
 ### JavaScript WebSocket Example
 
 ```javascript
-const ws = new WebSocket('wss://your-deployment/ws/stream');
+const ws = new WebSocket('wss://tmalive--ltx2-official-distilled-officialltx2engine-stre-885db4.modal.run/ws/stream');
 
 ws.onopen = () => {
   // Start generation
@@ -726,10 +743,16 @@ function stop() {
 ### Endpoint
 
 ```
-wss://<your-modal-deployment-url>/ws/gemini-live
+wss://tmalive--ltx2-official-distilled-officialltx2engine-gemi-93f1dd.modal.run/ws/gemini-live
 ```
 
-The Gemini Live API enables voice-driven video generation using Google's Gemini Live model for real-time audio conversations.
+The Gemini Live API enables voice and text-driven video generation using Google's Gemini Live model. Features include:
+
+- **Voice input**: Real-time audio conversation with Gemini
+- **Text input**: Send text messages to Gemini (auto-connects if needed)
+- **Drawing overlay**: Draw on video frames to visually communicate with Gemini
+- **Image generation**: Gemini can generate target images using `gemini-2.5-flash-image`, conditioned on current video frames
+- **Function calling**: Gemini has tools to control the video (`set_prompt`, `reset_history`, `generate_target_image`)
 
 ---
 
@@ -743,14 +766,20 @@ Begin a Gemini Live session with video generation.
 {
   "action": "start",
   "api_key": "<your_gemini_api_key>",
-  "prompt": "A beautiful abstract flowing visualization"
+  "prompt": "A beautiful abstract flowing visualization",
+  "width": 832,
+  "height": 480,
+  "skip_audio_to_ltx": true
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `api_key` | string | Yes | Your Google Gemini API key |
-| `prompt` | string | No | Initial video generation prompt |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `api_key` | string | Yes | - | Your Google Gemini API key |
+| `prompt` | string | No | "A beautiful flowing visualization" | Initial video generation prompt |
+| `width` | integer | No | 832 | Video width |
+| `height` | integer | No | 480 | Video height |
+| `skip_audio_to_ltx` | boolean | No | true | If true, Gemini audio plays directly to client; if false, audio is sent through LTX-2 for conditioning |
 
 ---
 
@@ -783,7 +812,7 @@ End the Gemini Live session.
 
 #### `update_prompt` - Update Video Prompt
 
-Change the video generation prompt.
+Change the video generation prompt (sent directly to LTX-2, bypasses Gemini).
 
 ```json
 {
@@ -791,6 +820,27 @@ Change the video generation prompt.
   "prompt": "New visualization style"
 }
 ```
+
+---
+
+#### `send_text_to_gemini` - Send Text Message to Gemini
+
+Send a text message to Gemini (like voice input, but text). Optionally include a drawn image.
+
+```json
+{
+  "action": "send_text_to_gemini",
+  "text": "Make the scene more dramatic with lightning",
+  "image": "<optional_base64_jpeg>"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `text` | string | Yes | Text message to send to Gemini |
+| `image` | string | No | Base64-encoded JPEG of video frame with drawings overlay |
+
+When an image is included (e.g., from the drawing overlay), Gemini sees both the annotated frame and your text, allowing visual communication like circling areas or drawing arrows.
 
 ---
 
@@ -845,6 +895,37 @@ Audio response from Gemini (used to condition video generation).
 #### `segment_start` / `frame` / `segment_complete`
 
 Same format as the standard WebSocket streaming API.
+
+---
+
+#### `tool_call` - Gemini Tool Execution
+
+Notification when Gemini executes a tool.
+
+```json
+{
+  "type": "tool_call",
+  "name": "set_prompt",
+  "prompt": "A serene mountain landscape"
+}
+```
+
+---
+
+### Gemini Available Tools
+
+Gemini has access to these function-calling tools:
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `set_prompt` | `prompt: string` | Update the video generation prompt |
+| `reset_history` | (none) | Clear video generation state, start fresh |
+| `generate_target_image` | `image_description: string`, `prompt?: string`, `position?: float` | Generate a target image using Gemini 2.5 Flash Image, conditioned on current video frame |
+
+**Image Generation Flow:**
+1. Gemini receives the current video frame in real-time
+2. When `generate_target_image` is called, Gemini 2.5 Flash Image generates an image based on the description + current frame
+3. The generated image is sent to LTX-2 as a target image for the video to transition toward
 
 ---
 

@@ -182,8 +182,8 @@ def streaming_ui():
     gpu="H200",
     timeout=3600,
     scaledown_window=300,  # Keep warm for 5 minutes
-    enable_memory_snapshot=False,  # Disabled for debugging
-    # experimental_options={"enable_gpu_snapshot": True},
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
     volumes={
         MODELS_DIR: model_volume,
         "/outputs": outputs_volume,
@@ -201,7 +201,7 @@ class OfficialLTX2Engine:
     - GPU state snapshotted for instant cold starts
     """
 
-    @modal.enter()  # snap=True disabled for debugging
+    @modal.enter(snap=True)
     def load_model(self):
         """Load all models into VRAM and compile for maximum performance."""
         import torch

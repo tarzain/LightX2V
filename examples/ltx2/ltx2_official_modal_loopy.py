@@ -7003,6 +7003,52 @@ IMAGE_DIRECTOR_HTML = """
             --error: #ef4444;
         }
 
+        /* Light mode - optimized for e-ink and readability */
+        body.light-mode {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f5f5f5;
+            --bg-tertiary: rgba(0, 0, 0, 0.08);
+            --text-primary: #000000;
+            --text-secondary: #444444;
+            --accent: #6d28d9;
+            --accent-glow: rgba(109, 40, 217, 0.3);
+            --success: #16a34a;
+            --warning: #d97706;
+            --error: #dc2626;
+        }
+
+        body.light-mode .video-area,
+        body.light-mode .video-wrapper {
+            background: #f0f0f0;
+        }
+
+        body.light-mode .video-section {
+            background: #f5f5f5;
+        }
+        
+        /* Don't change canvas backgrounds - video frames draw over them anyway */
+        /* Only the wrapper/section backgrounds matter for the overall look */
+
+        body.light-mode .btn {
+            border: 1px solid rgba(0, 0, 0, 0.2);
+        }
+
+        body.light-mode .input-group input,
+        body.light-mode .input-group textarea,
+        body.light-mode .input-group select {
+            background: #ffffff;
+            border: 1px solid #cccccc;
+            color: #000000;
+        }
+
+        body.light-mode .activity-log {
+            background: #f0f0f0;
+        }
+
+        body.light-mode .activity-item {
+            border-bottom: 1px solid #dddddd;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
@@ -7012,6 +7058,7 @@ IMAGE_DIRECTOR_HTML = """
             min-height: 100vh;
             display: flex;
             flex-direction: column;
+            transition: background-color 0.3s, color 0.3s;
         }
 
         /* Main layout */
@@ -7056,6 +7103,7 @@ IMAGE_DIRECTOR_HTML = """
             transform: translate(-50%, -50%);
             cursor: crosshair;
             touch-action: none;
+            background: transparent !important;
         }
 
         .drawing-controls {
@@ -7127,6 +7175,34 @@ IMAGE_DIRECTOR_HTML = """
         .generated-preview .label {
             font-size: 0.7rem;
             color: var(--accent);
+            margin-top: 4px;
+            text-align: center;
+        }
+
+        /* Reference image preview (outgoing to Gemini) */
+        .reference-preview {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: var(--bg-secondary);
+            padding: 8px;
+            border-radius: 8px;
+            display: none;
+            z-index: 10;
+            border: 2px solid var(--warning);
+        }
+
+        .reference-preview.show { display: block; }
+
+        .reference-preview img {
+            width: 120px;
+            height: auto;
+            border-radius: 4px;
+        }
+
+        .reference-preview .label {
+            font-size: 0.7rem;
+            color: var(--warning);
             margin-top: 4px;
             text-align: center;
         }
@@ -7361,6 +7437,11 @@ IMAGE_DIRECTOR_HTML = """
                     <span class="drawing-status" id="drawingStatus"></span>
                 </div>
                 
+                <div class="reference-preview" id="referencePreview">
+                    <img id="referenceImage" src="" alt="Reference">
+                    <div class="label" id="referenceLabel">Sending to Gemini...</div>
+                </div>
+                
                 <div class="generated-preview" id="generatedPreview">
                     <img id="previewImage" src="" alt="Generated">
                     <div class="label" id="previewLabel">Start Image</div>
@@ -7464,6 +7545,11 @@ IMAGE_DIRECTOR_HTML = """
                 <div class="btn-row">
                     <button class="btn btn-warning" onclick="resetHistory()">Reset History</button>
                     <button class="btn btn-danger" onclick="stopStream()">Stop</button>
+                </div>
+                <div class="btn-row" style="margin-top: 10px;">
+                    <button class="btn btn-secondary" id="themeToggle" onclick="toggleTheme()" style="width: 100%;">
+                        <span id="themeIcon">☀️</span> Light Mode (E-ink)
+                    </button>
                 </div>
             </div>
 
@@ -7682,7 +7768,13 @@ IMAGE_DIRECTOR_HTML = """
                 return;
             }
 
-            const drawnImage = hasDrawing() ? getCombinedImage() : null;
+            const hasDrawings = hasDrawing();
+            const drawnImage = hasDrawings ? getCombinedImage() : null;
+            
+            // Show reference preview if we're sending an image to Gemini
+            if (drawnImage) {
+                showReferencePreview(drawnImage, true);
+            }
 
             ws.send(JSON.stringify({
                 action: 'generate_start_image',
@@ -7696,7 +7788,7 @@ IMAGE_DIRECTOR_HTML = """
                 drawn_image: drawnImage
             }));
 
-            logActivity('status', 'Generating start image...');
+            logActivity('status', hasDrawings ? 'Generating start image (with drawing)...' : 'Generating start image...');
             clearDrawing();
         }
 
@@ -7711,7 +7803,23 @@ IMAGE_DIRECTOR_HTML = """
                 return;
             }
 
-            const drawnImage = hasDrawing() ? getCombinedImage() : null;
+            const hasDrawings = hasDrawing();
+            const drawnImage = hasDrawings ? getCombinedImage() : null;
+            
+            // Show reference preview - either the drawn image or the last frame
+            if (drawnImage) {
+                showReferencePreview(drawnImage, true);
+            } else if (frameBuffer.length > 0) {
+                // Show the last frame as reference (even without drawings)
+                const lastFrame = frameBuffer[frameBuffer.length - 1];
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = lastFrame.width;
+                tempCanvas.height = lastFrame.height;
+                const tempCtx = tempCanvas.getContext('2d');
+                tempCtx.drawImage(lastFrame, 0, 0);
+                const frameB64 = tempCanvas.toDataURL('image/jpeg', 0.9).split(',')[1];
+                showReferencePreview(frameB64, false);
+            }
 
             ws.send(JSON.stringify({
                 action: 'generate_target_image',
@@ -7723,7 +7831,7 @@ IMAGE_DIRECTOR_HTML = """
                 drawn_image: drawnImage
             }));
 
-            logActivity('status', 'Generating target image...');
+            logActivity('status', hasDrawings ? 'Generating target image (with drawing)...' : 'Generating target image...');
             clearDrawing();
         }
 
@@ -7917,7 +8025,27 @@ IMAGE_DIRECTOR_HTML = """
         }
 
         // ===== UI Helpers =====
+        function showReferencePreview(imageData, hasDrawing) {
+            const preview = document.getElementById('referencePreview');
+            const img = document.getElementById('referenceImage');
+            const label = document.getElementById('referenceLabel');
+            
+            img.src = 'data:image/jpeg;base64,' + imageData;
+            label.textContent = hasDrawing ? '📤 With Drawings → Gemini' : '📤 Frame → Gemini';
+            preview.classList.add('show');
+            
+            // Hide when we get the generated image back (or after 10s max)
+            setTimeout(() => preview.classList.remove('show'), 10000);
+        }
+        
+        function hideReferencePreview() {
+            document.getElementById('referencePreview').classList.remove('show');
+        }
+        
         function showGeneratedPreview(imageData, role, position) {
+            // Hide reference preview when we get the result
+            hideReferencePreview();
+            
             const preview = document.getElementById('generatedPreview');
             const img = document.getElementById('previewImage');
             const label = document.getElementById('previewLabel');
@@ -7973,8 +8101,33 @@ IMAGE_DIRECTOR_HTML = """
             setTimeout(() => toast.classList.remove('show'), duration);
         }
 
+        // ===== Theme Toggle =====
+        function toggleTheme() {
+            document.body.classList.toggle('light-mode');
+            const isLight = document.body.classList.contains('light-mode');
+            const btn = document.getElementById('themeToggle');
+            const icon = document.getElementById('themeIcon');
+            
+            icon.textContent = isLight ? '🌙' : '☀️';
+            btn.innerHTML = icon.outerHTML + (isLight ? ' Dark Mode' : ' Light Mode (E-ink)');
+            
+            localStorage.setItem('image_director_theme', isLight ? 'light' : 'dark');
+        }
+        
+        function loadSavedTheme() {
+            const savedTheme = localStorage.getItem('image_director_theme');
+            if (savedTheme === 'light') {
+                document.body.classList.add('light-mode');
+                const btn = document.getElementById('themeToggle');
+                const icon = document.getElementById('themeIcon');
+                icon.textContent = '🌙';
+                btn.innerHTML = icon.outerHTML + ' Dark Mode';
+            }
+        }
+
         // ===== Initialize =====
         function init() {
+            loadSavedTheme();
             initDrawing();
             updateButtons();
             updatePositionLabel();

@@ -2154,6 +2154,7 @@ class OfficialLTX2Engine:
         audio_latent: "torch.Tensor | None" = None,
         audio_conditioning_strength: float = 0.3,
         original_audio_waveform: "torch.Tensor | None" = None,
+        skip_audio_output: bool = False,
     ):
         """
         Generator that yields frames for real-time streaming.
@@ -2169,7 +2170,7 @@ class OfficialLTX2Engine:
 
         Yields:
             dict with either:
-            - {"type": "frame", "data": base64_jpeg, "index": int}
+            - {"type": "frame_chunk", "frames": [{"data": base64_jpeg, "index": int}, ...]}
             - {"type": "audio", "data": base64_wav, "sample_rate": int}
             - {"type": "segment_complete", "segment": int, "frames": int}
         """
@@ -2307,8 +2308,8 @@ class OfficialLTX2Engine:
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
             expected_frames = expected_audio_shape.frames
 
-            # Priority: provided audio_latent > previous segment audio > fresh generation
-            if audio_latent is not None:
+            # Skip audio conditioning setup when audio output is disabled
+            if not skip_audio_output and audio_latent is not None:
                 # External audio conditioning provided for this segment
                 print(f"   Streaming: Using provided audio conditioning, shape: {audio_latent.shape}", flush=True)
 
@@ -2325,9 +2326,6 @@ class OfficialLTX2Engine:
                 else:
                     audio_initial_latent = audio_latent
 
-                # Use the provided conditioning strength (controlled by UI slider)
-                # If original_audio_waveform is provided, we'll use it for output (pass-through)
-                # but the noise_scale still affects how the latent participates in denoising
                 audio_noise_scale = audio_conditioning_strength
                 if original_audio_waveform is not None:
                     print(f"   Streaming: Audio with pass-through output, noise_scale={audio_noise_scale}", flush=True)
@@ -2341,7 +2339,7 @@ class OfficialLTX2Engine:
             # Track if we need to apply audio continuity blending after denoising
             apply_audio_continuity = False
             prev_audio_overlap = None
-            if not is_first_segment and audio_latent is None:
+            if not skip_audio_output and not is_first_segment and audio_latent is None:
                 has_prev_audio = hasattr(self, '_streaming_last_audio_latent') and self._streaming_last_audio_latent is not None
                 if has_prev_audio:
                     prev_audio_overlap = self._streaming_last_audio_latent
@@ -2393,12 +2391,11 @@ class OfficialLTX2Engine:
             print(f"   Streaming: Stored last {latent_overlap} latent frame(s) ({overlap_frames} video frames) for conditioning, shape: {self._streaming_last_latent.shape}", flush=True)
 
             # Store audio latent overlap for next segment conditioning (audio continuity)
-            # Audio latent shape is [B, C, T, H] - store last N frames matching video overlap ratio
-            audio_latent_frames = audio_state.latent.shape[2]
-            # Use same overlap ratio as video (overlap_frames / segment_frames)
-            audio_overlap_frames = max(1, int(audio_latent_frames * overlap_frames / segment_frames))
-            self._streaming_last_audio_latent = audio_state.latent[:, :, -audio_overlap_frames:, :].clone()
-            print(f"   Streaming: Stored last {audio_overlap_frames}/{audio_latent_frames} audio latent frames for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
+            if not skip_audio_output:
+                audio_latent_frames = audio_state.latent.shape[2]
+                audio_overlap_frames = max(1, int(audio_latent_frames * overlap_frames / segment_frames))
+                self._streaming_last_audio_latent = audio_state.latent[:, :, -audio_overlap_frames:, :].clone()
+                print(f"   Streaming: Stored last {audio_overlap_frames}/{audio_latent_frames} audio latent frames for conditioning, shape: {self._streaming_last_audio_latent.shape}", flush=True)
 
             # Determine latent for decode
             if use_second_stage:
@@ -2454,64 +2451,60 @@ class OfficialLTX2Engine:
                 video_latent_for_decode = video_state_2.latent
                 final_audio_state = audio_state_2
                 # Update stored audio latent overlap with refined stage 2 audio
-                audio_latent_frames_2 = audio_state_2.latent.shape[2]
-                audio_overlap_frames_2 = max(1, int(audio_latent_frames_2 * overlap_frames / segment_frames))
-                self._streaming_last_audio_latent = audio_state_2.latent[:, :, -audio_overlap_frames_2:, :].clone()
+                if not skip_audio_output:
+                    audio_latent_frames_2 = audio_state_2.latent.shape[2]
+                    audio_overlap_frames_2 = max(1, int(audio_latent_frames_2 * overlap_frames / segment_frames))
+                    self._streaming_last_audio_latent = audio_state_2.latent[:, :, -audio_overlap_frames_2:, :].clone()
             else:
                 video_latent_for_decode = video_state.latent
                 final_audio_state = audio_state
 
-            # Get audio output - either pass-through original or decode from latent
-            audio_sample_rate = 24000  # Output rate (vocoder or pass-through)
+            if not skip_audio_output:
+                # Get audio output - either pass-through original or decode from latent
+                audio_sample_rate = 24000  # Output rate (vocoder or pass-through)
 
-            if original_audio_waveform is not None:
-                # Pass-through mode: use original waveform directly (no VAE round-trip)
-                print(f"   Streaming: Using original audio waveform (pass-through)", flush=True)
-                # original_audio_waveform is [2, samples] at 24kHz
-                audio_np = original_audio_waveform.cpu().numpy()
-                # Normalize to int16 range
-                audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
-            else:
-                # Traditional mode: decode audio from latent
-                print(f"   Streaming: Decoding audio...", flush=True)
-                audio_waveform = vae_decode_audio(
-                    latent=final_audio_state.latent[:1],
-                    audio_decoder=self._audio_decoder,
-                    vocoder=self._vocoder,
-                )
-                audio_np = audio_waveform.cpu().numpy()
-                audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
-
-            # Trim audio to match skipped video frames (for non-first segments)
-            if not is_first_segment and overlap_frames > 0:
-                # Calculate samples to skip based on overlap frames and frame rate
-                overlap_duration = overlap_frames / frame_rate  # seconds
-                samples_to_skip = int(overlap_duration * audio_sample_rate)
-                if audio_np.ndim > 1:
-                    # Multi-channel: shape is [channels, samples]
-                    audio_np = audio_np[:, samples_to_skip:]
+                if original_audio_waveform is not None:
+                    # Pass-through mode: use original waveform directly (no VAE round-trip)
+                    print(f"   Streaming: Using original audio waveform (pass-through)", flush=True)
+                    audio_np = original_audio_waveform.cpu().numpy()
+                    audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
                 else:
-                    # Mono: shape is [samples]
-                    audio_np = audio_np[samples_to_skip:]
-                print(f"   Streaming: Trimmed {samples_to_skip} audio samples ({overlap_duration:.2f}s) for overlap", flush=True)
+                    # Traditional mode: decode audio from latent
+                    print(f"   Streaming: Decoding audio...", flush=True)
+                    audio_waveform = vae_decode_audio(
+                        latent=final_audio_state.latent[:1],
+                        audio_decoder=self._audio_decoder,
+                        vocoder=self._vocoder,
+                    )
+                    audio_np = audio_waveform.cpu().numpy()
+                    audio_np = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
 
-            # Convert audio to base64 WAV
-            import wave
-            import struct
-            audio_buffer = BytesIO()
-            with wave.open(audio_buffer, 'wb') as wav_file:
-                wav_file.setnchannels(2 if audio_np.ndim > 1 and audio_np.shape[0] == 2 else 1)
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(audio_sample_rate)
-                # Interleave stereo channels if needed
-                if audio_np.ndim > 1 and audio_np.shape[0] == 2:
-                    audio_interleaved = audio_np.T.flatten()
-                else:
-                    audio_interleaved = audio_np.flatten()
-                wav_file.writeframes(audio_interleaved.tobytes())
+                # Trim audio to match skipped video frames (for non-first segments)
+                if not is_first_segment and overlap_frames > 0:
+                    overlap_duration = overlap_frames / frame_rate
+                    samples_to_skip = int(overlap_duration * audio_sample_rate)
+                    if audio_np.ndim > 1:
+                        audio_np = audio_np[:, samples_to_skip:]
+                    else:
+                        audio_np = audio_np[samples_to_skip:]
+                    print(f"   Streaming: Trimmed {samples_to_skip} audio samples ({overlap_duration:.2f}s) for overlap", flush=True)
 
-            audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
-            yield {"type": "audio", "data": audio_base64, "sample_rate": audio_sample_rate}
+                # Convert audio to base64 WAV
+                import wave
+                import struct
+                audio_buffer = BytesIO()
+                with wave.open(audio_buffer, 'wb') as wav_file:
+                    wav_file.setnchannels(2 if audio_np.ndim > 1 and audio_np.shape[0] == 2 else 1)
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(audio_sample_rate)
+                    if audio_np.ndim > 1 and audio_np.shape[0] == 2:
+                        audio_interleaved = audio_np.T.flatten()
+                    else:
+                        audio_interleaved = audio_np.flatten()
+                    wav_file.writeframes(audio_interleaved.tobytes())
+
+                audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
+                yield {"type": "audio", "data": audio_base64, "sample_rate": audio_sample_rate}
 
             # Decode video - yields frame chunks
             print(f"   Streaming: Decoding video frames...", flush=True)
@@ -2520,54 +2513,55 @@ class OfficialLTX2Engine:
                 latent=video_latent_for_decode[:1],
             )
 
-            # Collect all chunks and process
-            all_frames = []
+            # Process and yield frames in chunks as the VAE decoder produces them
+            skip_frames = 0 if is_first_segment else overlap_frames
+            global_frame_idx = 0  # Counts all frames (including skipped)
+            output_frame_idx = 0  # Counts only yielded frames
+
             for chunk in video_iterator:
                 if isinstance(chunk, torch.Tensor):
-                    all_frames.append(chunk)
+                    chunk_np = chunk.cpu().numpy()
                 else:
-                    all_frames.append(torch.tensor(chunk))
-
-            if len(all_frames) > 0:
-                video_tensor = torch.cat(all_frames, dim=0) if len(all_frames) > 1 else all_frames[0]
-                video = video_tensor.cpu().numpy()
+                    chunk_np = np.array(chunk)
 
                 # Remove batch dimension if present
-                while len(video.shape) > 4:
-                    video = video.squeeze(0)
+                while len(chunk_np.shape) > 4:
+                    chunk_np = chunk_np.squeeze(0)
 
                 # Handle tensor format
-                if len(video.shape) == 4:
-                    if video.shape[0] == 3:  # [C, T, H, W]
-                        video = np.transpose(video, (1, 2, 3, 0))
-                    elif video.shape[1] == 3:  # [T, C, H, W]
-                        video = np.transpose(video, (0, 2, 3, 1))
+                if len(chunk_np.shape) == 4:
+                    if chunk_np.shape[0] == 3:  # [C, T, H, W]
+                        chunk_np = np.transpose(chunk_np, (1, 2, 3, 0))
+                    elif chunk_np.shape[1] == 3:  # [T, C, H, W]
+                        chunk_np = np.transpose(chunk_np, (0, 2, 3, 1))
 
                 # Normalize to 0-255
-                if video.max() <= 1.0:
-                    video = video * 255
-                video = np.clip(video, 0, 255).astype(np.uint8)
+                if chunk_np.max() <= 1.0:
+                    chunk_np = chunk_np * 255
+                chunk_np = np.clip(chunk_np, 0, 255).astype(np.uint8)
 
-                # Skip overlap frames for non-first segments (they overlap with previous segment)
-                skip_frames = 0 if is_first_segment else overlap_frames
-                actual_frames = video.shape[0] - skip_frames
-                print(f"   Streaming: Yielding {actual_frames} frames (skipping first {skip_frames} overlap frames)...", flush=True)
-
-                # Yield each frame as base64 JPEG (skipping overlap)
-                frame_idx = 0
-                for i in range(video.shape[0]):
-                    # Skip overlap frames for non-first segments
-                    if i < skip_frames:
+                # Encode non-skipped frames in this chunk as JPEG
+                chunk_frames = []
+                for i in range(chunk_np.shape[0]):
+                    if global_frame_idx < skip_frames:
+                        global_frame_idx += 1
                         continue
+                    global_frame_idx += 1
 
-                    frame = video[i]
+                    frame = chunk_np[i]
                     img = Image.fromarray(frame)
                     buffer = BytesIO()
                     img.save(buffer, format='JPEG', quality=85)
-                    frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                    yield {"type": "frame", "data": frame_base64, "index": frame_idx}
-                    frame_idx += 1
+                    chunk_frames.append({
+                        "data": base64.b64encode(buffer.getvalue()).decode('utf-8'),
+                        "index": output_frame_idx,
+                    })
+                    output_frame_idx += 1
 
+                if chunk_frames:
+                    yield {"type": "frame_chunk", "frames": chunk_frames}
+
+            print(f"   Streaming: Yielded {output_frame_idx} frames (skipped first {skip_frames} overlap frames)", flush=True)
             yield {"type": "segment_complete", "segment": 1, "frames": segment_frames}
 
             gc.collect()
@@ -3029,7 +3023,8 @@ class OfficialLTX2Engine:
                             frame_rate = msg.get("frame_rate", 24.0)
                             use_second_stage = msg.get("use_second_stage", False)
                             max_segments = msg.get("max_segments", 10)
-                            
+                            skip_audio_output = msg.get("skip_audio", False)
+
                             # Loopy mode: loop on current image until target arrives
                             loopy_mode = msg.get("loopy_mode", False)
 
@@ -3332,6 +3327,7 @@ class OfficialLTX2Engine:
                                             audio_latent=_audio_latent,
                                             audio_conditioning_strength=_audio_strength,
                                             original_audio_waveform=_original_audio_waveform,
+                                            skip_audio_output=skip_audio_output,
                                         ):
                                             asyncio.run_coroutine_threadsafe(frame_queue.put(item), loop)
                                     except Exception as e:
@@ -3352,8 +3348,8 @@ class OfficialLTX2Engine:
                                             break
                                         if should_stop:
                                             break
-                                        # Add segment number to frame messages for debugging
-                                        if item.get("type") == "frame":
+                                        # Add segment number to frame chunk messages for debugging
+                                        if item.get("type") == "frame_chunk":
                                             item["segment"] = segment_count
                                         await websocket.send_json(item)
 
@@ -4181,7 +4177,7 @@ def web():
         - {"action": "stop"}
 
         Server sends:
-        - {"type": "frame", "data": base64_jpeg, "index": int}
+        - {"type": "frame_chunk", "frames": [{"data": base64_jpeg, "index": int}, ...]}
         - {"type": "audio", "data": base64_wav, "sample_rate": int}
         - {"type": "segment_complete", "segment": int, "frames": int}
         - {"type": "error", "message": str}
@@ -5222,14 +5218,16 @@ STREAMING_HTML = """
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
 
-                if (msg.type === 'frame') {
-                    // Add frame to buffer with segment info
-                    frameBuffer.push({
-                        data: msg.data,
-                        segment: msg.segment || 0,
-                        index: msg.index || 0
-                    });
-                    receivedFrames++;
+                if (msg.type === 'frame_chunk') {
+                    // Add all frames from chunk to buffer
+                    for (const frame of msg.frames) {
+                        frameBuffer.push({
+                            data: frame.data,
+                            segment: msg.segment || 0,
+                            index: frame.index || 0
+                        });
+                        receivedFrames++;
+                    }
                     updateStats();
                 }
                 else if (msg.type === 'audio') {
@@ -6603,8 +6601,10 @@ MINIMAL_HTML = """
             const msg = JSON.parse(event.data);
 
             switch (msg.type) {
-                case 'frame':
-                    handleFrame(msg);
+                case 'frame_chunk':
+                    for (const frame of msg.frames) {
+                        handleFrame(frame);
+                    }
                     break;
                 case 'audio':
                     // Play audio chunk from segment
@@ -7691,14 +7691,16 @@ IMAGE_DIRECTOR_HTML = """
                     updateButtons();
                     break;
 
-                case 'frame':
-                    const img = new Image();
-                    img.onload = () => {
-                        frameBuffer.push(img);
-                        if (!isPaused) pausedFrame = img;
-                    };
-                    img.src = 'data:image/jpeg;base64,' + msg.data;
-                    frameCount++;
+                case 'frame_chunk':
+                    for (const frame of msg.frames) {
+                        const img = new Image();
+                        img.onload = () => {
+                            frameBuffer.push(img);
+                            if (!isPaused) pausedFrame = img;
+                        };
+                        img.src = 'data:image/jpeg;base64,' + frame.data;
+                        frameCount++;
+                    }
                     document.getElementById('frameCount').textContent = frameCount;
                     break;
 
@@ -8384,10 +8386,11 @@ def image_director_ui():
                         
                         await websocket.send_json(parsed)
                         # Store latest frame for image generation conditioning
-                        if msg_type == "frame" and parsed.get("data"):
-                            state["last_frame_b64"] = parsed["data"]
-                            frame_count += 1
-                            if frame_count % 100 == 0:
+                        if msg_type == "frame_chunk" and parsed.get("frames"):
+                            last_frame = parsed["frames"][-1]
+                            state["last_frame_b64"] = last_frame["data"]
+                            frame_count += len(parsed["frames"])
+                            if frame_count % 100 < len(parsed["frames"]):
                                 print(f"CPU-WS: Forwarded {frame_count} frames", flush=True)
                     except websockets.exceptions.ConnectionClosed as e:
                         print(f"CPU-WS: Connection closed: {e}", flush=True)
@@ -8477,9 +8480,10 @@ def image_director_ui():
             # Resize to target dimensions (match LTX-2 generation resolution)
             img_resized = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
-            # Encode as JPEG for smaller payload
+            # Encode as JPEG - lower quality adds compression artifacts that give
+            # the LTX-2 encoder texture/noise to work with for animation
             buffer = io.BytesIO()
-            img_resized.save(buffer, format="JPEG", quality=85)
+            img_resized.save(buffer, format="JPEG", quality=97)
             new_bytes = buffer.getvalue()
             new_size = len(new_bytes)
 
@@ -8566,28 +8570,9 @@ def image_director_ui():
                         # Send generated image preview to client
                         await websocket.send_json({"type": "generated_image", "data": image_b64, "role": "start"})
                         
-                        # Start LTX-2 stream - send start message first (small), then image separately
-                        await websocket.send_json({"type": "status", "message": "Connecting to LTX-2 and starting stream..."})
-                        
-                        # First, send the start message WITHOUT the large image
-                        ok, err = await send_to_ltx({
-                            "action": "start",
-                            "prompt": ltx_prompt,
-                            "height": height,
-                            "width": width,
-                            "seed": seed,
-                            "num_frames": 49,
-                            "frame_rate": 24,
-                            "max_segments": 1000,
-                            "loopy_mode": True,  # Loop on current image until target arrives
-                            # NOTE: start_image sent separately to avoid WebSocket message size limits
-                        }, "start")
-                        if not ok:
-                            await websocket.send_json({"type": "error", "message": err})
-                            continue
-                        
-                        # Now send the start image in a separate message
-                        await websocket.send_json({"type": "status", "message": "Sending start image..."})
+                        # Send start image BEFORE start so it's ready when generation begins
+                        await websocket.send_json({"type": "status", "message": "Connecting to LTX-2 and sending start image..."})
+
                         ok, err = await send_to_ltx({
                             "action": "set_start_image",
                             "image": image_b64,
@@ -8597,6 +8582,24 @@ def image_director_ui():
                         if not ok:
                             await websocket.send_json({"type": "error", "message": f"Failed to send start image: {err}"})
                             # Continue anyway, streaming will work without start image
+
+                        # Now start the stream - start_image_latent is already set on GPU
+                        await websocket.send_json({"type": "status", "message": "Starting LTX-2 stream..."})
+                        ok, err = await send_to_ltx({
+                            "action": "start",
+                            "prompt": ltx_prompt,
+                            "height": height,
+                            "width": width,
+                            "seed": seed,
+                            "num_frames": 49,
+                            "frame_rate": 24,
+                            "max_segments": 1000,
+                            "loopy_mode": True,
+                            "skip_audio": True,
+                        }, "start")
+                        if not ok:
+                            await websocket.send_json({"type": "error", "message": err})
+                            continue
                         
                         state["is_streaming"] = True
                         tasks.append(asyncio.create_task(receive_from_ltx()))

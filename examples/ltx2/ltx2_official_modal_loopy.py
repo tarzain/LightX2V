@@ -2155,6 +2155,7 @@ class OfficialLTX2Engine:
         audio_conditioning_strength: float = 0.3,
         original_audio_waveform: "torch.Tensor | None" = None,
         skip_audio_output: bool = False,
+        mirror_frames: bool = False,
     ):
         """
         Generator that yields frames for real-time streaming.
@@ -7526,7 +7527,7 @@ IMAGE_DIRECTOR_HTML = """
                 <h3>🎨 Image Generation</h3>
                 <div class="input-group">
                     <label>Image Description</label>
-                    <textarea id="imageDescription" placeholder="Describe the image you want to generate...">A majestic mountain landscape at sunset with dramatic clouds and a serene lake reflection</textarea>
+                    <textarea id="imageDescription" placeholder="Describe the image you want to generate...">A butterfly on a flower</textarea>
                 </div>
                 <div class="btn-row">
                     <button class="btn btn-success" id="btnGenerateStart" onclick="generateStartImage()" disabled>Generate Start</button>
@@ -7543,7 +7544,7 @@ IMAGE_DIRECTOR_HTML = """
                 <h3>🎬 Video Prompt</h3>
                 <div class="input-group">
                     <label>Video Generation Prompt</label>
-                    <textarea id="ltxPrompt" placeholder="Describe the video motion and style...">Cinematic slow motion, dramatic lighting, smooth camera movement, high quality</textarea>
+                    <textarea id="ltxPrompt" placeholder="Describe the video motion and style...">Seamless continuous perfect loop, natural motion, movement, cinematic lighting, high quality</textarea>
                 </div>
                 <button class="btn btn-secondary" style="width: 100%;" onclick="updatePrompt()">Update Prompt</button>
             </div>
@@ -8522,7 +8523,7 @@ def image_director_ui():
             # Encode as JPEG - lower quality adds compression artifacts that give
             # the LTX-2 encoder texture/noise to work with for animation
             buffer = io.BytesIO()
-            img_resized.save(buffer, format="JPEG", quality=97)
+            img_resized.save(buffer, format="JPEG", quality=60)
             new_bytes = buffer.getvalue()
             new_size = len(new_bytes)
 

@@ -6988,7 +6988,7 @@ IMAGE_DIRECTOR_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Image Director × LTX-2</title>
+    <title>Image Director</title>
     <style>
         :root {
             --bg-primary: #0a0a0f;
@@ -7181,7 +7181,7 @@ IMAGE_DIRECTOR_HTML = """
             text-align: center;
         }
 
-        /* Reference image preview (outgoing to Gemini) */
+        /* Reference image preview (outgoing to image model) */
         .reference-preview {
             position: absolute;
             top: 10px;
@@ -7441,7 +7441,7 @@ IMAGE_DIRECTOR_HTML = """
                 
                 <div class="reference-preview" id="referencePreview">
                     <img id="referenceImage" src="" alt="Reference">
-                    <div class="label" id="referenceLabel">Sending to Gemini...</div>
+                    <div class="label" id="referenceLabel">Sending reference...</div>
                 </div>
                 
                 <div class="generated-preview" id="generatedPreview">
@@ -7453,11 +7453,11 @@ IMAGE_DIRECTOR_HTML = """
             <div class="status-bar" style="margin-top: 10px;">
                 <div class="status-item">
                     <span class="status-dot" id="ltxStatus"></span>
-                    <span>LTX-2</span>
+                    <span>Video</span>
                 </div>
                 <div class="status-item">
                     <span class="status-dot" id="geminiStatus"></span>
-                    <span>Gemini</span>
+                    <span>Image</span>
                 </div>
                 <div class="status-item">
                     <span>Frames:</span>
@@ -7473,12 +7473,12 @@ IMAGE_DIRECTOR_HTML = """
             <div class="panel-section">
                 <h3>⚙️ Settings</h3>
                 <div class="input-group">
-                    <label>Gemini API Key</label>
-                    <input type="password" id="apiKey" placeholder="Enter your Gemini API key">
+                    <label>API Key</label>
+                    <input type="password" id="apiKey" placeholder="Enter your API key">
                 </div>
                 <div class="input-row">
                     <div class="input-group">
-                        <label>LTX-2 Resolution</label>
+                        <label>Resolution</label>
                         <input type="text" id="resolutionDisplay" value="1344x768" readonly>
                     </div>
                     <div class="input-group">
@@ -7497,14 +7497,14 @@ IMAGE_DIRECTOR_HTML = """
                     </div>
                 </div>
                 <div class="input-group" style="margin-top: 10px;">
-                    <label>Gemini Model</label>
+                    <label>Image Model</label>
                     <select id="geminiModel">
-                        <option value="gemini-2.5-flash-image" selected>Gemini 2.5 Flash Image (fast)</option>
-                        <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (higher quality)</option>
+                        <option value="gemini-2.5-flash-image" selected>Flash (fast)</option>
+                        <option value="gemini-3-pro-image-preview">Pro (higher quality)</option>
                     </select>
                 </div>
                 <div class="input-group" style="margin-top: 10px;">
-                    <label>Gemini Aspect Ratio</label>
+                    <label>Aspect Ratio</label>
                     <select id="geminiAspectRatio">
                         <option value="1:1">1:1 (1024x1024)</option>
                         <option value="2:3">2:3 (832x1216)</option>
@@ -7518,12 +7518,12 @@ IMAGE_DIRECTOR_HTML = """
                         <option value="21:9">21:9 (1536x640)</option>
                     </select>
                 </div>
-                <button class="btn btn-secondary" style="width: 100%; margin-top: 8px;" onclick="initializeGemini()">Initialize Gemini</button>
+                <button class="btn btn-secondary" style="width: 100%; margin-top: 8px;" onclick="initializeGemini()">Initialize</button>
             </div>
 
             <!-- Image Generation -->
             <div class="panel-section">
-                <h3>🎨 Image Generation (Gemini)</h3>
+                <h3>🎨 Image Generation</h3>
                 <div class="input-group">
                     <label>Image Description</label>
                     <textarea id="imageDescription" placeholder="Describe the image you want to generate...">A majestic mountain landscape at sunset with dramatic clouds and a serene lake reflection</textarea>
@@ -7538,9 +7538,9 @@ IMAGE_DIRECTOR_HTML = """
                 </div>
             </div>
 
-            <!-- LTX-2 Prompt -->
+            <!-- Video Prompt -->
             <div class="panel-section">
-                <h3>🎬 Video Prompt (LTX-2)</h3>
+                <h3>🎬 Video Prompt</h3>
                 <div class="input-group">
                     <label>Video Generation Prompt</label>
                     <textarea id="ltxPrompt" placeholder="Describe the video motion and style...">Cinematic slow motion, dramatic lighting, smooth camera movement, high quality</textarea>
@@ -7679,7 +7679,7 @@ IMAGE_DIRECTOR_HTML = """
                 case 'initialized':
                     isGeminiReady = true;
                     geminiStatus.classList.add('connected');
-                    logActivity('success', 'Gemini client ready');
+                    logActivity('success', 'Image model ready');
                     updateButtons();
                     break;
 
@@ -7747,7 +7747,7 @@ IMAGE_DIRECTOR_HTML = """
         async function initializeGemini() {
             const apiKey = document.getElementById('apiKey').value.trim();
             if (!apiKey) {
-                showToast('Please enter your Gemini API key');
+                showToast('Please enter your API key');
                 return;
             }
 
@@ -7764,7 +7764,7 @@ IMAGE_DIRECTOR_HTML = """
                 
                 // Save API key
                 localStorage.setItem('gemini_api_key', apiKey);
-                logActivity('status', 'Initializing Gemini...');
+                logActivity('status', 'Initializing...');
             } catch (err) {
                 logActivity('error', 'Failed to connect: ' + err.message);
             }
@@ -7786,7 +7786,7 @@ IMAGE_DIRECTOR_HTML = """
             const hasDrawings = hasDrawing();
             const drawnImage = hasDrawings ? getCombinedImage() : null;
             
-            // Show reference preview if we're sending an image to Gemini
+            // Show reference preview if we're sending an image to the image model
             if (drawnImage) {
                 showReferencePreview(drawnImage, true);
             }
@@ -8057,7 +8057,7 @@ IMAGE_DIRECTOR_HTML = """
             const label = document.getElementById('referenceLabel');
             
             img.src = 'data:image/jpeg;base64,' + imageData;
-            label.textContent = hasDrawing ? '📤 With Drawings → Gemini' : '📤 Frame → Gemini';
+            label.textContent = hasDrawing ? '📤 With Drawings → Image Model' : '📤 Frame → Image Model';
             preview.classList.add('show');
             
             // Hide when we get the generated image back (or after 10s max)
@@ -8568,10 +8568,10 @@ def image_director_ui():
 
                         try:
                             genai_client = genai.Client(api_key=api_key)
-                            await websocket.send_json({"type": "initialized", "message": f"Gemini client ready ({gemini_model})"})
+                            await websocket.send_json({"type": "initialized", "message": "Image model ready"})
                             print(f"Gemini client initialized with model: {gemini_model}", flush=True)
                         except Exception as e:
-                            await websocket.send_json({"type": "error", "message": f"Failed to initialize Gemini: {e}"})
+                            await websocket.send_json({"type": "error", "message": f"Failed to initialize: {e}"})
 
                     elif action == "generate_start_image":
                         # Generate initial image and start LTX-2 stream
@@ -8613,7 +8613,7 @@ def image_director_ui():
                         await websocket.send_json({"type": "generated_image", "data": image_b64, "role": "start"})
                         
                         # Send start image BEFORE start so it's ready when generation begins
-                        await websocket.send_json({"type": "status", "message": "Connecting to LTX-2 and sending start image..."})
+                        await websocket.send_json({"type": "status", "message": "Connecting and sending start image..."})
 
                         ok, err = await send_to_ltx({
                             "action": "set_start_image",
@@ -8626,7 +8626,7 @@ def image_director_ui():
                             # Continue anyway, streaming will work without start image
 
                         # Now start the stream - start_image_latent is already set on GPU
-                        await websocket.send_json({"type": "status", "message": "Starting LTX-2 stream..."})
+                        await websocket.send_json({"type": "status", "message": "Starting video stream..."})
                         ok, err = await send_to_ltx({
                             "action": "start",
                             "prompt": ltx_prompt,
@@ -8725,7 +8725,7 @@ def image_director_ui():
                     # Check if LTX connection died while we were waiting
                     if state["is_streaming"] and (not ltx_ws or is_ws_closed(ltx_ws)):
                         print("LTX connection lost during streaming, notifying client", flush=True)
-                        await websocket.send_json({"type": "error", "message": "LTX-2 connection lost"})
+                        await websocket.send_json({"type": "error", "message": "Video connection lost"})
                         await websocket.send_json({"type": "ltx_disconnected"})
                         state["is_streaming"] = False
                     continue

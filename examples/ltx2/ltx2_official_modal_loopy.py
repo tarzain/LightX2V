@@ -3298,8 +3298,13 @@ class OfficialLTX2Engine:
                                 _audio_strength = audio_conditioning_strength  # Capture for this segment
                                 _original_audio_waveform = original_audio_waveform  # Capture for pass-through
                                 _mirror = mirror_segment  # Capture mirror flag for this segment
-                                # Start image only applies to first segment
-                                _start_latent = start_image_latent if _is_first else None
+                                # In mirror/loop mode, every segment starts fresh from the loop image
+                                # to prevent drift. Otherwise, start image only on first segment.
+                                if mirror_segment and loop_image_latent is not None:
+                                    _start_latent = loop_image_latent
+                                    _is_first = True  # Force first-segment mode to use start latent, not previous output
+                                else:
+                                    _start_latent = start_image_latent if _is_first else None
 
                                 # In loopy mode, log the mode we're in
                                 if loopy_mode:

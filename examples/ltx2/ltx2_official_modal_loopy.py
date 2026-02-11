@@ -7547,8 +7547,11 @@ IMAGE_DIRECTOR_HTML = """
                     <button class="btn btn-danger" onclick="stopStream()">Stop</button>
                 </div>
                 <div class="btn-row" style="margin-top: 10px;">
-                    <button class="btn btn-secondary" id="themeToggle" onclick="toggleTheme()" style="width: 100%;">
-                        <span id="themeIcon">☀️</span> Light Mode (E-ink)
+                    <button class="btn btn-secondary" id="themeToggle" onclick="toggleTheme()" style="width: 50%;">
+                        <span id="themeIcon">☀️</span> Light
+                    </button>
+                    <button class="btn btn-secondary" id="fullscreenToggle" onclick="toggleFullscreen()" style="width: 50%;">
+                        <span id="fullscreenIcon">⛶</span> Fullscreen
                     </button>
                 </div>
             </div>
@@ -8109,7 +8112,7 @@ IMAGE_DIRECTOR_HTML = """
             const icon = document.getElementById('themeIcon');
             
             icon.textContent = isLight ? '🌙' : '☀️';
-            btn.innerHTML = icon.outerHTML + (isLight ? ' Dark Mode' : ' Light Mode (E-ink)');
+            btn.innerHTML = icon.outerHTML + (isLight ? ' Dark' : ' Light');
             
             localStorage.setItem('image_director_theme', isLight ? 'light' : 'dark');
         }
@@ -8121,9 +8124,44 @@ IMAGE_DIRECTOR_HTML = """
                 const btn = document.getElementById('themeToggle');
                 const icon = document.getElementById('themeIcon');
                 icon.textContent = '🌙';
-                btn.innerHTML = icon.outerHTML + ' Dark Mode';
+                btn.innerHTML = icon.outerHTML + ' Dark';
             }
         }
+
+        // ===== Fullscreen Toggle =====
+        function toggleFullscreen() {
+            const icon = document.getElementById('fullscreenIcon');
+            const btn = document.getElementById('fullscreenToggle');
+            
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().then(() => {
+                    icon.textContent = '⛶';
+                    btn.innerHTML = icon.outerHTML + ' Exit';
+                }).catch(err => {
+                    showToast('Fullscreen failed: ' + err.message, 3000);
+                });
+            } else {
+                document.exitFullscreen().then(() => {
+                    icon.textContent = '⛶';
+                    btn.innerHTML = icon.outerHTML + ' Fullscreen';
+                }).catch(err => {
+                    showToast('Exit fullscreen failed: ' + err.message, 3000);
+                });
+            }
+        }
+        
+        // Listen for fullscreen changes (e.g., user presses Escape)
+        document.addEventListener('fullscreenchange', () => {
+            const icon = document.getElementById('fullscreenIcon');
+            const btn = document.getElementById('fullscreenToggle');
+            if (document.fullscreenElement) {
+                icon.textContent = '⛶';
+                btn.innerHTML = icon.outerHTML + ' Exit';
+            } else {
+                icon.textContent = '⛶';
+                btn.innerHTML = icon.outerHTML + ' Fullscreen';
+            }
+        });
 
         // ===== Initialize =====
         function init() {

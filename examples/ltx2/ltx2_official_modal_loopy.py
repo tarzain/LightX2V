@@ -7091,16 +7091,18 @@ IMAGE_DIRECTOR_HTML = """
         }
 
         #videoCanvas {
-            max-width: 100%;
-            max-height: 100%;
+            width: 100%;
+            height: 100%;
             object-fit: contain;
         }
 
         #drawingCanvas {
             position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
             cursor: crosshair;
             touch-action: none;
             background: transparent !important;
@@ -7495,6 +7497,13 @@ IMAGE_DIRECTOR_HTML = """
                     </div>
                 </div>
                 <div class="input-group" style="margin-top: 10px;">
+                    <label>Gemini Model</label>
+                    <select id="geminiModel">
+                        <option value="gemini-2.5-flash-image" selected>Gemini 2.5 Flash Image (fast)</option>
+                        <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (higher quality)</option>
+                    </select>
+                </div>
+                <div class="input-group" style="margin-top: 10px;">
                     <label>Gemini Aspect Ratio</label>
                     <select id="geminiAspectRatio">
                         <option value="1:1">1:1 (1024x1024)</option>
@@ -7749,7 +7758,8 @@ IMAGE_DIRECTOR_HTML = """
 
                 ws.send(JSON.stringify({
                     action: 'init',
-                    api_key: apiKey
+                    api_key: apiKey,
+                    model: document.getElementById('geminiModel').value
                 }));
                 
                 // Save API key
@@ -7790,7 +7800,8 @@ IMAGE_DIRECTOR_HTML = """
                 seed: parseInt(document.getElementById('seed').value),
                 num_frames: numFrames,
                 aspect_ratio: aspectRatio,
-                drawn_image: drawnImage
+                drawn_image: drawnImage,
+                model: document.getElementById('geminiModel').value
             }));
 
             logActivity('status', hasDrawings ? 'Generating start image (with drawing)...' : 'Generating start image...');
@@ -7833,7 +7844,8 @@ IMAGE_DIRECTOR_HTML = """
                 height: height,
                 width: width,
                 aspect_ratio: aspectRatio,
-                drawn_image: drawnImage
+                drawn_image: drawnImage,
+                model: document.getElementById('geminiModel').value
             }));
 
             logActivity('status', hasDrawings ? 'Generating target image (with drawing)...' : 'Generating target image...');
@@ -7907,14 +7919,6 @@ IMAGE_DIRECTOR_HTML = """
 
         // ===== Drawing Functions =====
         function initDrawing() {
-            function syncCanvasSize() {
-                const rect = canvas.getBoundingClientRect();
-                drawingCanvas.style.width = rect.width + 'px';
-                drawingCanvas.style.height = rect.height + 'px';
-            }
-            syncCanvasSize();
-            window.addEventListener('resize', syncCanvasSize);
-
             drawingCanvas.addEventListener('mousedown', startDrawing);
             drawingCanvas.addEventListener('mousemove', draw);
             drawingCanvas.addEventListener('mouseup', stopDrawingStroke);
@@ -7934,12 +7938,29 @@ IMAGE_DIRECTOR_HTML = """
         }
 
         function getDrawingCoords(e) {
+            // Account for object-fit: contain letterboxing
             const rect = drawingCanvas.getBoundingClientRect();
-            const scaleX = drawingCanvas.width / rect.width;
-            const scaleY = drawingCanvas.height / rect.height;
+            const canvasAspect = drawingCanvas.width / drawingCanvas.height;
+            const rectAspect = rect.width / rect.height;
+
+            let renderW, renderH, offsetX, offsetY;
+            if (rectAspect > canvasAspect) {
+                // Letterboxed on sides (pillarboxing)
+                renderH = rect.height;
+                renderW = rect.height * canvasAspect;
+                offsetX = (rect.width - renderW) / 2;
+                offsetY = 0;
+            } else {
+                // Letterboxed on top/bottom
+                renderW = rect.width;
+                renderH = rect.width / canvasAspect;
+                offsetX = 0;
+                offsetY = (rect.height - renderH) / 2;
+            }
+
             return {
-                x: (e.clientX - rect.left) * scaleX,
-                y: (e.clientY - rect.top) * scaleY
+                x: ((e.clientX - rect.left - offsetX) / renderW) * drawingCanvas.width,
+                y: ((e.clientY - rect.top - offsetY) / renderH) * drawingCanvas.height
             };
         }
 
@@ -8013,14 +8034,14 @@ IMAGE_DIRECTOR_HTML = """
 
         function getCombinedImage() {
             const combined = document.createElement('canvas');
-            combined.width = canvas.width;
-            combined.height = canvas.height;
+            combined.width = drawingCanvas.width;
+            combined.height = drawingCanvas.height;
             const combCtx = combined.getContext('2d');
 
             if (pausedFrame) {
                 combCtx.drawImage(pausedFrame, 0, 0, combined.width, combined.height);
             }
-            combCtx.drawImage(drawingCanvas, 0, 0);
+            combCtx.drawImage(drawingCanvas, 0, 0, combined.width, combined.height);
 
             return combined.toDataURL('image/jpeg', 0.9).split(',')[1];
         }
@@ -8236,6 +8257,7 @@ def image_director_ui():
 
         ltx_ws = None
         genai_client = None
+        gemini_model = "gemini-2.5-flash-image"
         should_stop = False
         state = {"last_frame_b64": None, "is_streaming": False}
         tasks = []
@@ -8422,14 +8444,16 @@ def image_director_ui():
                 state["is_streaming"] = False
                 print("CPU-WS: Connection cleaned up, ready for new connection", flush=True)
 
-        async def generate_image(description: str, reference_image_b64: str = None, aspect_ratio: str = "16:9"):
-            """Generate an image using Gemini Flash-Image."""
+        async def generate_image(description: str, reference_image_b64: str = None, aspect_ratio: str = "16:9", model_override: str = None):
+            """Generate an image using the selected Gemini model."""
             if not genai_client:
                 return None, "Gemini client not initialized"
-            
+
+            model = model_override or gemini_model
+
             try:
                 from google.genai import types as genai_types
-                
+
                 # Build contents with optional reference image
                 if reference_image_b64:
                     image_bytes = base64.b64decode(reference_image_b64)
@@ -8437,32 +8461,47 @@ def image_director_ui():
                         genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                         f"Based on this image, generate a new image: {description}"
                     ]
-                    print(f"Generating image with reference: {description[:50]}...", flush=True)
+                    print(f"[{model}] Generating image with reference: {description[:50]}...", flush=True)
                 else:
                     contents = [description]
-                    print(f"Generating image from text: {description[:50]}...", flush=True)
-                
-                response = await genai_client.aio.models.generate_content(
-                    model="gemini-2.5-flash-image",
-                    contents=contents,
-                    config=genai_types.GenerateContentConfig(
+                    print(f"[{model}] Generating image from text: {description[:50]}...", flush=True)
+
+                # Build config based on model
+                if model == "gemini-3-pro-image-preview":
+                    config = genai_types.GenerateContentConfig(
                         response_modalities=["IMAGE", "TEXT"],
                         image_config=genai_types.ImageConfig(
-                            aspect_ratio=aspect_ratio
+                            aspect_ratio=aspect_ratio,
+                            image_size="1K",
                         ),
-                    ),
+                        system_instruction=[
+                            genai_types.Part.from_text(text="do not think just produce the image immediately"),
+                        ],
+                    )
+                else:
+                    config = genai_types.GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"],
+                        image_config=genai_types.ImageConfig(
+                            aspect_ratio=aspect_ratio,
+                        ),
+                    )
+
+                response = await genai_client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
                 )
-                
+
                 # Extract image data
                 for part in response.candidates[0].content.parts:
                     if part.inline_data:
                         image_b64 = base64.b64encode(part.inline_data.data).decode()
-                        print(f"Image generated successfully", flush=True)
+                        print(f"[{model}] Image generated successfully", flush=True)
                         return image_b64, None
-                
+
                 return None, "No image in response"
             except Exception as e:
-                print(f"Image generation error: {e}", flush=True)
+                print(f"[{model}] Image generation error: {e}", flush=True)
                 return None, str(e)
 
         def encode_image_as_jpeg(image_b64: str, target_width: int, target_height: int) -> str:
@@ -8519,16 +8558,18 @@ def image_director_ui():
                     action = msg.get("action")
 
                     if action == "init":
-                        # Initialize Gemini client with API key
+                        # Initialize Gemini client with API key and model selection
                         api_key = msg.get("api_key")
                         if not api_key:
                             await websocket.send_json({"type": "error", "message": "API key required"})
                             continue
-                        
+
+                        gemini_model = msg.get("model", "gemini-2.5-flash-image")
+
                         try:
                             genai_client = genai.Client(api_key=api_key)
-                            await websocket.send_json({"type": "initialized", "message": "Gemini client ready"})
-                            print("Gemini client initialized", flush=True)
+                            await websocket.send_json({"type": "initialized", "message": f"Gemini client ready ({gemini_model})"})
+                            print(f"Gemini client initialized with model: {gemini_model}", flush=True)
                         except Exception as e:
                             await websocket.send_json({"type": "error", "message": f"Failed to initialize Gemini: {e}"})
 
@@ -8559,11 +8600,12 @@ def image_director_ui():
                         await websocket.send_json({"type": "status", "message": "Generating start image..."})
                         
                         # Generate image (use drawn image as reference if provided)
-                        image_b64, error = await generate_image(description, drawn_image, aspect_ratio)
+                        model = msg.get("model")
+                        image_b64, error = await generate_image(description, drawn_image, aspect_ratio, model_override=model)
                         if error:
                             await websocket.send_json({"type": "error", "message": f"Image generation failed: {error}"})
                             continue
-                        
+
                         # Resize to LTX-2 resolution and encode as JPEG
                         image_b64 = encode_image_as_jpeg(image_b64, width, height)
 
@@ -8628,7 +8670,8 @@ def image_director_ui():
                         
                         # Use drawn image or current frame as reference
                         reference = drawn_image or state.get("last_frame_b64")
-                        image_b64, error = await generate_image(description, reference, aspect_ratio)
+                        model = msg.get("model")
+                        image_b64, error = await generate_image(description, reference, aspect_ratio, model_override=model)
                         if error:
                             await websocket.send_json({"type": "error", "message": f"Image generation failed: {error}"})
                             continue

@@ -7497,16 +7497,16 @@ IMAGE_DIRECTOR_HTML = """
                 <div class="input-group" style="margin-top: 10px;">
                     <label>Gemini Aspect Ratio</label>
                     <select id="geminiAspectRatio">
-                        <option value="1:1">1:1 (512x512)</option>
-                        <option value="2:3">2:3 (384x576)</option>
-                        <option value="3:2">3:2 (576x384)</option>
-                        <option value="3:4">3:4 (384x512)</option>
-                        <option value="4:3">4:3 (512x384)</option>
-                        <option value="4:5">4:5 (448x576)</option>
-                        <option value="5:4">5:4 (576x448)</option>
-                        <option value="9:16">9:16 (384x704)</option>
-                        <option value="16:9" selected>16:9 (704x384)</option>
-                        <option value="21:9">21:9 (768x320)</option>
+                        <option value="1:1">1:1 (1024x1024)</option>
+                        <option value="2:3">2:3 (832x1216)</option>
+                        <option value="3:2">3:2 (1216x832)</option>
+                        <option value="3:4">3:4 (832x1152)</option>
+                        <option value="4:3">4:3 (1152x832)</option>
+                        <option value="4:5">4:5 (896x1152)</option>
+                        <option value="5:4">5:4 (1152x896)</option>
+                        <option value="9:16">9:16 (768x1344)</option>
+                        <option value="16:9" selected>16:9 (1344x768)</option>
+                        <option value="21:9">21:9 (1536x640)</option>
                     </select>
                 </div>
                 <button class="btn btn-secondary" style="width: 100%; margin-top: 8px;" onclick="initializeGemini()">Initialize Gemini</button>
@@ -8462,44 +8462,43 @@ def image_director_ui():
                 print(f"Image generation error: {e}", flush=True)
                 return None, str(e)
 
-        def downscale_image_b64(image_b64: str, target_width: int, target_height: int) -> str:
-            """Downscale a base64 image to target dimensions."""
+        def encode_image_as_jpeg(image_b64: str, target_width: int, target_height: int) -> str:
+            """Resize image to target dimensions and encode as JPEG for efficient transfer."""
             from PIL import Image
             import io
-            
+
             # Decode base64 to image
             image_bytes = base64.b64decode(image_b64)
             img = Image.open(io.BytesIO(image_bytes))
-            
+
             original_size = len(image_bytes)
-            print(f"Downscaling image from {img.size} to ({target_width}, {target_height})", flush=True)
-            
-            # Resize to target dimensions
+            print(f"Resizing image from {img.size} to ({target_width}, {target_height}) and encoding as JPEG", flush=True)
+
+            # Resize to target dimensions (match LTX-2 generation resolution)
             img_resized = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-            
-            # Encode back to JPEG with reasonable quality
+
+            # Encode as JPEG for smaller payload
             buffer = io.BytesIO()
             img_resized.save(buffer, format="JPEG", quality=85)
             new_bytes = buffer.getvalue()
             new_size = len(new_bytes)
-            
-            print(f"Image size reduced: {original_size/1024:.1f}KB -> {new_size/1024:.1f}KB ({new_size/original_size*100:.1f}%)", flush=True)
-            
+
+            print(f"Image size: {original_size/1024:.1f}KB -> {new_size/1024:.1f}KB", flush=True)
+
             return base64.b64encode(new_bytes).decode()
 
-        # Half-scale LTX-2 resolutions (all divisible by 64)
-        # These are smaller to reduce WebSocket payload size
+        # Full-scale LTX-2 resolutions (all divisible by 64)
         ASPECT_RATIO_RESOLUTIONS = {
-            "1:1": (512, 512),      # Was 1024x1024
-            "2:3": (384, 576),      # Was 832x1216
-            "3:2": (576, 384),      # Was 1216x832
-            "3:4": (384, 512),      # Was 832x1152
-            "4:3": (512, 384),      # Was 1152x832
-            "4:5": (448, 576),      # Was 896x1152
-            "5:4": (576, 448),      # Was 1152x896
-            "9:16": (384, 704),     # Was 768x1344
-            "16:9": (704, 384),     # Was 1344x768
-            "21:9": (768, 320),     # Was 1536x640
+            "1:1": (1024, 1024),
+            "2:3": (832, 1216),
+            "3:2": (1216, 832),
+            "3:4": (832, 1152),
+            "4:3": (1152, 832),
+            "4:5": (896, 1152),
+            "5:4": (1152, 896),
+            "9:16": (768, 1344),
+            "16:9": (1344, 768),
+            "21:9": (1536, 640),
         }
 
         def resolve_dimensions(aspect_ratio: str, fallback_w: int, fallback_h: int):
@@ -8561,10 +8560,10 @@ def image_director_ui():
                             await websocket.send_json({"type": "error", "message": f"Image generation failed: {error}"})
                             continue
                         
-                        # Downscale image to LTX-2 resolution for smaller payload
-                        image_b64 = downscale_image_b64(image_b64, width, height)
-                        
-                        # Send generated image preview to client (downscaled version)
+                        # Resize to LTX-2 resolution and encode as JPEG
+                        image_b64 = encode_image_as_jpeg(image_b64, width, height)
+
+                        # Send generated image preview to client
                         await websocket.send_json({"type": "generated_image", "data": image_b64, "role": "start"})
                         
                         # Start LTX-2 stream - send start message first (small), then image separately
@@ -8631,10 +8630,10 @@ def image_director_ui():
                             await websocket.send_json({"type": "error", "message": f"Image generation failed: {error}"})
                             continue
                         
-                        # Downscale image to LTX-2 resolution for smaller payload
-                        image_b64 = downscale_image_b64(image_b64, width, height)
-                        
-                        # Send generated image preview to client (downscaled version)
+                        # Resize to LTX-2 resolution and encode as JPEG
+                        image_b64 = encode_image_as_jpeg(image_b64, width, height)
+
+                        # Send generated image preview to client
                         await websocket.send_json({"type": "generated_image", "data": image_b64, "role": "target", "position": position})
                         
                         # Send to LTX-2 as target image

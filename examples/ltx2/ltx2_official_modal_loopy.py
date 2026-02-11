@@ -2519,6 +2519,9 @@ class OfficialLTX2Engine:
             global_frame_idx = 0  # Counts all frames (including skipped)
             output_frame_idx = 0  # Counts only yielded frames
 
+            # When mirroring, collect all encoded frames so we can append them reversed
+            mirror_buffer = [] if mirror_frames else None
+
             for chunk in video_iterator:
                 if isinstance(chunk, torch.Tensor):
                     chunk_np = chunk.cpu().numpy()
@@ -2553,16 +2556,33 @@ class OfficialLTX2Engine:
                     img = Image.fromarray(frame)
                     buffer = BytesIO()
                     img.save(buffer, format='JPEG', quality=85)
+                    frame_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
                     chunk_frames.append({
-                        "data": base64.b64encode(buffer.getvalue()).decode('utf-8'),
+                        "data": frame_b64,
                         "index": output_frame_idx,
                     })
+                    if mirror_buffer is not None:
+                        mirror_buffer.append(frame_b64)
                     output_frame_idx += 1
 
                 if chunk_frames:
                     yield {"type": "frame_chunk", "frames": chunk_frames}
 
-            print(f"   Streaming: Yielded {output_frame_idx} frames (skipped first {skip_frames} overlap frames)", flush=True)
+            forward_count = output_frame_idx
+
+            # Yield reversed frames (excluding first and last to avoid duplicates at seams)
+            if mirror_buffer and len(mirror_buffer) > 2:
+                reversed_frames = []
+                for frame_b64 in reversed(mirror_buffer[1:-1]):
+                    reversed_frames.append({
+                        "data": frame_b64,
+                        "index": output_frame_idx,
+                    })
+                    output_frame_idx += 1
+                yield {"type": "frame_chunk", "frames": reversed_frames}
+                print(f"   Streaming: Mirrored {len(reversed_frames)} frames for seamless loop", flush=True)
+
+            print(f"   Streaming: Yielded {output_frame_idx} frames ({forward_count} forward{f' + {output_frame_idx - forward_count} mirrored' if mirror_frames else ''}, skipped first {skip_frames} overlap)", flush=True)
             yield {"type": "segment_complete", "segment": 1, "frames": segment_frames}
 
             gc.collect()
@@ -3232,18 +3252,20 @@ class OfficialLTX2Engine:
                                 # Handle loopy mode vs normal mode for target image selection
                                 pending_loop_update = None  # Will be set if we need to update loop_image_latent after segment
                                 
+                                mirror_segment = False
                                 if loopy_mode and loop_image_latent is not None:
-                                    # Loopy mode: either transition to new target or loop on current image
+                                    # Loopy mode: either transition to new target or mirror for seamless loop
                                     if target_image_queue:
                                         # Transition mode: use target from queue, then it becomes the new loop image
                                         target_image_latent, target_frame_position = target_image_queue.pop(0)
                                         pending_loop_update = target_image_latent  # Update loop image after this segment
                                         print(f"   WebSocket: LOOPY TRANSITION - using target from queue, will become new loop image (remaining: {len(target_image_queue)})", flush=True)
                                     else:
-                                        # Loop mode: use loop_image_latent as end frame to create seamless loop
-                                        target_image_latent = loop_image_latent
-                                        target_frame_position = 1.0  # Always at end for looping
-                                        print(f"   WebSocket: LOOPY MODE - looping on current image (A->A)", flush=True)
+                                        # Loop mode: only constrain start, let model generate freely,
+                                        # then mirror frames for a seamless A->B->A loop
+                                        target_image_latent = None
+                                        mirror_segment = True
+                                        print(f"   WebSocket: LOOPY MODE - free generation + mirror (A->B->A)", flush=True)
                                 else:
                                     # Normal mode: pop from queues if available
                                     if target_image_queue:
@@ -3275,13 +3297,14 @@ class OfficialLTX2Engine:
                                 _audio_latent = audio_latent  # Capture for this segment
                                 _audio_strength = audio_conditioning_strength  # Capture for this segment
                                 _original_audio_waveform = original_audio_waveform  # Capture for pass-through
+                                _mirror = mirror_segment  # Capture mirror flag for this segment
                                 # Start image only applies to first segment
                                 _start_latent = start_image_latent if _is_first else None
-                                
+
                                 # In loopy mode, log the mode we're in
                                 if loopy_mode:
-                                    mode_str = "TRANSITION" if pending_loop_update is not None else "LOOP"
-                                    print(f"   WebSocket: Starting segment {segment_count} [{mode_str}], is_first={_is_first}, has_start_image={_start_latent is not None}, has_end_image={_target_latent is not None}, target_pos={_target_position:.2f}", flush=True)
+                                    mode_str = "MIRROR" if mirror_segment else ("TRANSITION" if pending_loop_update is not None else "LOOP")
+                                    print(f"   WebSocket: Starting segment {segment_count} [{mode_str}], is_first={_is_first}, has_start_image={_start_latent is not None}, has_end_image={_target_latent is not None}, mirror={_mirror}", flush=True)
                                 else:
                                     print(f"   WebSocket: Starting segment {segment_count}, is_first={_is_first}, has_start_image={_start_latent is not None}, has_audio={_audio_latent is not None}, target_pos={_target_position:.2f}", flush=True)
 
@@ -3329,6 +3352,7 @@ class OfficialLTX2Engine:
                                             audio_conditioning_strength=_audio_strength,
                                             original_audio_waveform=_original_audio_waveform,
                                             skip_audio_output=skip_audio_output,
+                                            mirror_frames=_mirror,
                                         ):
                                             asyncio.run_coroutine_threadsafe(frame_queue.put(item), loop)
                                     except Exception as e:
